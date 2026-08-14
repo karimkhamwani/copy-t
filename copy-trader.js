@@ -33,6 +33,7 @@ const {
   SIGNATURE_TYPE = "1",
   POLL_INTERVAL_MS = "30000",
   MAX_BET_USDC = "1",
+  MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
 } = process.env;
@@ -43,6 +44,8 @@ const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, d
 
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
+const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
+let tradesPlaced = 0;
 
 /** Normalize wallet entries: lowercase addresses, drop empties, dedupe by address. */
 function normalizeWallets(list) {
@@ -232,6 +235,7 @@ async function pollUser(wallet, state) {
   fresh.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
   for (const trade of fresh) {
+    if (maxTrades && tradesPlaced >= maxTrades) return;
     const amount = betAmount();
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
@@ -241,6 +245,14 @@ async function pollUser(wallet, state) {
       await placeMarketBuy(trade, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
+      tradesPlaced++;
+      if (maxTrades && tradesPlaced >= maxTrades) {
+        log(
+          `MAX_TRADES limit reached (${tradesPlaced}/${maxTrades}) — stopping. ` +
+            `Check the position on Polymarket, then raise/remove MAX_TRADES and restart.`,
+        );
+        process.exit(0);
+      }
     } catch (err) {
       log(
         `${tag} FAILED to place order for ${tradeKey(trade)}:`,
@@ -289,7 +301,8 @@ async function main() {
       .map((w) => `${w.category}:${w.address}`)
       .join(
         ", ",
-      )}] interval=${pollInterval}ms bet=$${BET_USDC} (fixed) dryRun=${isDryRun}`,
+      )}] interval=${pollInterval}ms bet=$${BET_USDC} (fixed) dryRun=${isDryRun} ` +
+      `maxTrades=${maxTrades || "unlimited"}`,
   );
 
   const state = loadState();
