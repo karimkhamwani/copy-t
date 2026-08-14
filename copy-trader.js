@@ -111,16 +111,49 @@ function tradeKey(t) {
 // Activity API
 // ---------------------------------------------------------------------------
 
+/** GET a JSON URL. Uses global fetch (Node 18+) or falls back to http/https (Node 16). */
+function getJson(url) {
+  if (typeof fetch === "function") {
+    return fetch(url, {
+      headers: { accept: "application/json, text/plain, */*" },
+    }).then((res) => {
+      if (!res.ok) throw new Error(`activity API ${res.status} ${res.statusText}`);
+      return res.json();
+    });
+  }
+  return new Promise((resolve, reject) => {
+    const lib = url.startsWith("https:") ? require("https") : require("http");
+    const req = lib.get(
+      url,
+      { headers: { accept: "application/json, text/plain, */*" } },
+      (res) => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          res.resume();
+          return reject(new Error(`activity API ${res.statusCode} ${res.statusMessage}`));
+        }
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => (body += chunk));
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(body));
+          } catch (err) {
+            reject(new Error(`activity API returned invalid JSON: ${err.message}`));
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.setTimeout(15000, () => req.destroy(new Error("activity API timeout")));
+  });
+}
+
 async function fetchActivity(user) {
   const url =
     `${DATA_API_HOST}/activity?limit=100&offset=0` +
     `&excludeDepositsWithdrawals=true&sortBy=TIMESTAMP&sortDirection=DESC` +
     `&user=${user}`;
-  const res = await fetch(url, {
-    headers: { accept: "application/json, text/plain, */*" },
-  });
-  if (!res.ok) throw new Error(`activity API ${res.status} ${res.statusText}`);
-  const data = await res.json();
+  const data = await getJson(url);
   if (!Array.isArray(data)) throw new Error("activity API returned non-array");
   return data;
 }
