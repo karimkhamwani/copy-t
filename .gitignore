@@ -1,0 +1,12 @@
+# Secrets — never commit (holds PRIVATE_KEY)
+.env
+
+# Dependencies
+node_modules/
+
+# Runtime state
+seen-trades.json
+
+# Misc
+.DS_Store
+npm-debug.log*
