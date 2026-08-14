@@ -18,7 +18,7 @@ const {
   DASHBOARD_PORT = "3210",
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
   STATUS_FILE = path.join(__dirname, "status.json"),
-  GAMMA_API_HOST = "https://gamma-api.polymarket.com",
+  CLOB_API_HOST = "https://clob.polymarket.com",
 } = process.env;
 
 const STATIC_FILES = {
@@ -47,13 +47,47 @@ function readJson(file, fallback) {
 }
 
 // ---------------------------------------------------------------------------
-// Win/loss resolution via the gamma markets API.
+// Win/loss resolution via the CLOB markets API (GET /markets/{condition_id}).
+// The gamma API stops returning fast markets (5-minute up/down) once they close,
+// so resolved ones would stay "pending" forever there. The CLOB API keeps them
+// and flags the winning token directly: tokens[].winner.
 // Resolved markets are cached forever; unresolved ones are re-checked every 60s.
 // ---------------------------------------------------------------------------
 
-const resolutionCache = new Map(); // conditionId -> { resolved, prices, checkedAt }
+const resolutionCache = new Map(); // conditionId -> { resolved, tokens, checkedAt }
 const PENDING_RECHECK_MS = 60000;
-const MAX_LOOKUPS_PER_REQUEST = 40;
+const MAX_LOOKUPS_PER_REQUEST = 10;
+
+async function fetchResolution(conditionId) {
+  const now = Date.now();
+  try {
+    const res = await fetch(`${CLOB_API_HOST}/markets/${conditionId}`, {
+      headers: { accept: "application/json" },
+    });
+    if (!res.ok) throw new Error(`clob API ${res.status}`);
+    const m = await res.json();
+    const tokens = (m.tokens || []).map((t) => ({
+      tokenId: t.token_id,
+      outcome: t.outcome,
+      winner: Boolean(t.winner),
+    }));
+    resolutionCache.set(conditionId, {
+      // resolved once a winner is flagged (closed alone isn't enough)
+      resolved: Boolean(m.closed) && tokens.some((t) => t.winner),
+      tokens,
+      checkedAt: now,
+    });
+  } catch {
+    // offline/blocked/unknown market -> stays "pending", re-checked later
+    if (!resolutionCache.get(conditionId)?.resolved) {
+      resolutionCache.set(conditionId, {
+        resolved: false,
+        tokens: [],
+        checkedAt: now,
+      });
+    }
+  }
+}
 
 async function refreshResolutions(entries) {
   const now = Date.now();
@@ -69,51 +103,26 @@ async function refreshResolutions(entries) {
     ),
   ].slice(0, MAX_LOOKUPS_PER_REQUEST);
   if (need.length === 0) return;
+  await Promise.all(need.map(fetchResolution));
+}
 
-  // Whatever happens, don't re-ask for these ids for a while
-  const markChecked = () => {
-    for (const id of need) {
-      if (!resolutionCache.get(id)?.resolved) {
-        resolutionCache.set(id, { resolved: false, prices: [], checkedAt: now });
-      }
-    }
-  };
-
-  try {
-    const qs = need.map((id) => `condition_ids=${id}`).join("&");
-    const res = await fetch(`${GAMMA_API_HOST}/markets?${qs}`, {
-      headers: { accept: "application/json" },
-    });
-    if (!res.ok) throw new Error(`gamma API ${res.status}`);
-    const markets = await res.json();
-    markChecked();
-    for (const m of Array.isArray(markets) ? markets : []) {
-      let prices = [];
-      try {
-        prices = JSON.parse(m.outcomePrices || "[]").map(Number);
-      } catch {
-        /* ignore malformed prices */
-      }
-      resolutionCache.set(m.conditionId, {
-        resolved: Boolean(m.closed) && prices.length > 0,
-        prices,
-        checkedAt: now,
-      });
-    }
-  } catch {
-    markChecked(); // offline/blocked -> everything stays "pending"
-  }
+/** The outcome token this entry bought (journal id is "txHash:asset"). */
+function entryTokenId(entry) {
+  return entry.asset || String(entry.id || "").split(":")[1] || "";
 }
 
 /** win | loss | pending for a successfully copied trade, undefined otherwise. */
 function resultFor(entry) {
   if (!entry.copy || entry.status !== "success") return undefined;
   const c = entry.conditionId && resolutionCache.get(entry.conditionId);
-  if (!c || !c.resolved || entry.outcomeIndex == null) return "pending";
-  const p = c.prices[entry.outcomeIndex];
-  if (p >= 0.99) return "win";
-  if (p <= 0.01) return "loss";
-  return "pending"; // market closed but not fully resolved yet
+  if (!c || !c.resolved) return "pending";
+  const mine = c.tokens.find((t) => t.tokenId === entryTokenId(entry));
+  if (mine) return mine.winner ? "win" : "loss";
+  // fall back to outcomeIndex if the token id didn't match
+  if (entry.outcomeIndex != null && c.tokens[entry.outcomeIndex]) {
+    return c.tokens[entry.outcomeIndex].winner ? "win" : "loss";
+  }
+  return "pending";
 }
 
 const server = http.createServer(async (req, res) => {

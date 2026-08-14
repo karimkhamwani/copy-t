@@ -372,6 +372,7 @@ function observedEntry(trade, wallet, status) {
     outcome: trade.outcome || "",
     outcomeIndex: trade.outcomeIndex ?? null,
     conditionId: trade.conditionId || "",
+    asset: trade.asset || "",
     slug: trade.slug || trade.eventSlug || "",
     theirPrice: trade.price,
     theirUsdc: trade.usdcSize,
