@@ -188,7 +188,8 @@ let clobClient = null;
 async function getClobClient() {
   if (clobClient) return clobClient;
 
-  const { ClobClient, Side, OrderType } = require("@polymarket/clob-client");
+  // clob-client v5+ is ESM-only and requires Node >= 20.10
+  const { ClobClient, Side, OrderType } = await import("@polymarket/clob-client");
   const { Wallet } = require("@ethersproject/wallet");
 
   const signer = new Wallet(PRIVATE_KEY);
@@ -319,6 +320,14 @@ async function main() {
   if (!isDryRun && (!PRIVATE_KEY || !FUNDER_ADDRESS)) {
     console.error(
       "PRIVATE_KEY and FUNDER_ADDRESS are required unless DRY_RUN=1",
+    );
+    process.exit(1);
+  }
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  if (!isDryRun && nodeMajor < 20) {
+    console.error(
+      `Node ${process.versions.node} is too old for live orders — ` +
+        `@polymarket/clob-client v5 requires Node >= 20.10. Please upgrade Node.`,
     );
     process.exit(1);
   }

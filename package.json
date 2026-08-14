@@ -4,13 +4,16 @@
   "private": true,
   "description": "Polls Polymarket activity API for a target user's BUY trades and mirrors them as market orders",
   "main": "copy-trader.js",
+  "engines": {
+    "node": ">=20.10"
+  },
   "scripts": {
     "start": "node copy-trader.js",
     "test": "node test.js"
   },
   "dependencies": {
     "@ethersproject/wallet": "^5.7.0",
-    "@polymarket/clob-client": "^4.14.0",
+    "@polymarket/clob-client": "^5.8.1",
     "dotenv": "^16.4.5"
   }
 }
