@@ -19,8 +19,8 @@ const path = require("path");
 
 const TARGET_WALLETS = [
   {
-    address: "0x30c7ac0158499ddc6761047f7f69bcf7d036ac3b",
-    category: "esports",
+    address: "0x0cb038487586d1119b165466072e9baf666f3a90",
+    category: "crypto",
   },
 ];
 
