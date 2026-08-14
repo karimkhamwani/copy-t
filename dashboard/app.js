@@ -291,10 +291,18 @@ const COPIED_FILTERS = {
   },
 };
 
+/** Net $ value of a copied bet: win profit, loss as negative, else 0. */
+function betValue(t) {
+  if (t.result === "win") return (t.copy?.shares || 0) - (t.copy?.spentUsdc || 0);
+  if (t.result === "loss") return -(t.copy?.spentUsdc || 0);
+  return 0;
+}
+
 function App() {
   const [trades, setTrades] = useState([]);
   const [status, setStatus] = useState(null);
   const [copiedFilter, setCopiedFilter] = useState("all");
+  const [copiedSort, setCopiedSort] = useState("none");
 
   useEffect(() => {
     let alive = true;
@@ -327,7 +335,12 @@ function App() {
   const failures = copied.filter((t) => t.status === "failed").length;
   const wins = copied.filter((t) => t.result === "win").length;
   const losses = copied.filter((t) => t.result === "loss").length;
-  const filteredCopied = copied.filter(COPIED_FILTERS[copiedFilter].match);
+  let filteredCopied = copied.filter(COPIED_FILTERS[copiedFilter].match);
+  if (copiedFilter !== "all" && copiedSort !== "none") {
+    filteredCopied = [...filteredCopied].sort((a, b) =>
+      copiedSort === "asc" ? betValue(a) - betValue(b) : betValue(b) - betValue(a)
+    );
+  }
 
   return html`
     <div>
@@ -365,6 +378,17 @@ function App() {
         <div className="panel">
           <h2>
             Copied trades (${filteredCopied.length}${copiedFilter !== "all" ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            ${copiedFilter !== "all" &&
+            html`<select
+              className="filter"
+              value=${copiedSort}
+              onChange=${(e) => setCopiedSort(e.target.value)}
+              aria-label="Sort copied trades by bet win value"
+            >
+              <option value="none">Sort: none</option>
+              <option value="asc">Win value ↑</option>
+              <option value="desc">Win value ↓</option>
+            </select>`}
             <select
               className="filter"
               value=${copiedFilter}
