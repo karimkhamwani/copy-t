@@ -19,14 +19,14 @@ const path = require("path");
 
 const TARGET_WALLETS = [
   // {
-  //   address: "0x0c7c5204404e9d5402d258fedac59c7212bae4cb",
+  //   address: "0xb55fa1296e6ec55d0ce53d93b9237389f11764d4",
   //   category: "crypto",
   //   sub_category: ["btc"],
   // },
   {
-    address: "0xb55fa1296e6ec55d0ce53d93b9237389f11764d4",
+    address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
     category: "crypto",
-    sub_category: ["sol"],
+    sub_category: ["btc"],
   },
 ];
 
