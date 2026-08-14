@@ -1,6 +1,6 @@
 /** Offline tests for the copy-trader logic (no network needed). */
 const assert = require("assert");
-const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale } = require("./copy-trader");
+const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory } = require("./copy-trader");
 
 const sample = [
   { type: "TRADE", side: "BUY", transactionHash: "0xaaa", asset: "111", usdcSize: 50, price: 0.42, timestamp: 100, title: "Market A", outcome: "Yes" },
@@ -39,8 +39,8 @@ assert.deepStrictEqual(
     { address: "" },
   ]),
   [
-    { address: "0xabc", category: "esports" },
-    { address: "0xdef", category: "uncategorized" },
+    { address: "0xabc", category: "esports", subCategories: [] },
+    { address: "0xdef", category: "uncategorized", subCategories: [] },
   ]
 );
 assert.deepStrictEqual(normalizeWallets(undefined), []);
@@ -55,6 +55,22 @@ assert.deepStrictEqual(normalizeWallets(undefined), []);
   );
   assert.deepStrictEqual(copyable.map((t) => t.transactionHash), ["0x1"]);
   assert.deepStrictEqual(stale.map((t) => t.transactionHash), ["0x2", "0x3"]);
+}
+
+// 7. Sub-category filter: slug contains any keyword, empty list = allow all
+{
+  const btcTrade = { slug: "btc-updown-5m-1786686900", eventSlug: "btc-updown-5m-1786686900" };
+  const ethTrade = { slug: "eth-updown-5m-1786686900" };
+  const nbaTrade = { slug: "nba-lal-bos-2026-08-14" };
+  assert.strictEqual(matchesSubCategory(btcTrade, ["btc"]), true);
+  assert.strictEqual(matchesSubCategory(ethTrade, ["btc"]), false);
+  assert.strictEqual(matchesSubCategory(ethTrade, ["btc", "eth"]), true);
+  assert.strictEqual(matchesSubCategory(nbaTrade, ["btc"]), false);
+  assert.strictEqual(matchesSubCategory(nbaTrade, []), true); // empty = all
+  assert.strictEqual(matchesSubCategory({ slug: "will-btc-hit-150k-2026" }, ["btc"]), true); // keyword anywhere in slug
+  // normalizeWallets carries sub_category through, lowercased
+  const [w] = normalizeWallets([{ address: "0xA", category: "crypto", sub_category: [" BTC ", ""] }]);
+  assert.deepStrictEqual(w.subCategories, ["btc"]);
 }
 
 console.log("all tests passed");

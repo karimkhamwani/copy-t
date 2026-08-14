@@ -31,9 +31,18 @@ Target wallets live in the script itself (`TARGET_WALLETS` in copy-trader.js):
 
 ```js
 const TARGET_WALLETS = [
-  { address: "0x30c7ac0158499ddc6761047f7f69bcf7d036ac3b", category: "esports" },
+  {
+    address: "0x0cb038487586d1119b165466072e9baf666f3a90",
+    category: "crypto",
+    sub_category: ["btc"], // slug prefixes to copy; empty/omitted = copy everything
+  },
 ];
 ```
+
+`sub_category` filters by keywords in the market slug: `["btc"]` copies any market
+whose slug contains `btc` anywhere (e.g. `btc-updown-5m-...`, `will-btc-hit-150k`)
+and ignores everything else that wallet trades. Add more keywords to widen it
+(e.g. `["btc", "eth"]`). Empty/omitted = copy everything.
 
 | Var | Meaning |
 | --- | --- |

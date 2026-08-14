@@ -21,6 +21,7 @@ const TARGET_WALLETS = [
   {
     address: "0x0cb038487586d1119b165466072e9baf666f3a90",
     category: "crypto",
+    sub_category: ["btc"],
   },
 ];
 
@@ -59,7 +60,14 @@ function normalizeWallets(list) {
       .toLowerCase();
     if (!address || seen.has(address)) continue;
     seen.add(address);
-    out.push({ address, category: w.category || "uncategorized" });
+    out.push({
+      address,
+      category: w.category || "uncategorized",
+      // sub_category: slug keywords to copy, e.g. ["btc"]. Empty = copy everything.
+      subCategories: (w.sub_category || w.subCategories || [])
+        .map((s) => String(s).trim().toLowerCase())
+        .filter(Boolean),
+    });
   }
   return out;
 }
@@ -119,7 +127,8 @@ function getJson(url) {
     return fetch(url, {
       headers: { accept: "application/json, text/plain, */*" },
     }).then((res) => {
-      if (!res.ok) throw new Error(`activity API ${res.status} ${res.statusText}`);
+      if (!res.ok)
+        throw new Error(`activity API ${res.status} ${res.statusText}`);
       return res.json();
     });
   }
@@ -131,7 +140,9 @@ function getJson(url) {
       (res) => {
         if (res.statusCode < 200 || res.statusCode >= 300) {
           res.resume();
-          return reject(new Error(`activity API ${res.statusCode} ${res.statusMessage}`));
+          return reject(
+            new Error(`activity API ${res.statusCode} ${res.statusMessage}`),
+          );
         }
         let body = "";
         res.setEncoding("utf8");
@@ -140,7 +151,9 @@ function getJson(url) {
           try {
             resolve(JSON.parse(body));
           } catch (err) {
-            reject(new Error(`activity API returned invalid JSON: ${err.message}`));
+            reject(
+              new Error(`activity API returned invalid JSON: ${err.message}`),
+            );
           }
         });
       },
@@ -176,6 +189,19 @@ function pickNewTrades(buys, seen) {
   return buys.filter((t) => !seen.has(tradeKey(t)));
 }
 
+/**
+ * True when the trade's market slug contains any of the wallet's sub-category
+ * keywords (e.g. keyword "btc" matches slug "btc-updown-5m-..." or "...-btc-...").
+ * An empty sub-category list means copy everything.
+ */
+function matchesSubCategory(trade, subCategories) {
+  if (!subCategories || subCategories.length === 0) return true;
+  const slugs = [trade.slug, trade.eventSlug]
+    .filter(Boolean)
+    .map((s) => String(s).toLowerCase());
+  return subCategories.some((sub) => slugs.some((slug) => slug.includes(sub)));
+}
+
 /** Split trades into { copyable, stale } by age — stale ones are too old to chase. */
 function splitStale(trades, nowSec, maxAgeSec) {
   const copyable = [];
@@ -202,9 +228,8 @@ async function getClobClient() {
 
   // CLOB v2: Polymarket archived @polymarket/clob-client — orders from it are
   // rejected with "invalid order version". clob-client-v2 requires Node >= 20.10.
-  const { ClobClient, Side, OrderType } = await import(
-    "@polymarket/clob-client-v2"
-  );
+  const { ClobClient, Side, OrderType } =
+    await import("@polymarket/clob-client-v2");
   const { Wallet } = require("@ethersproject/wallet");
 
   const signer = new Wallet(PRIVATE_KEY);
@@ -268,7 +293,10 @@ async function pollUser(wallet, state) {
   const { address, category } = wallet;
   const tag = `[${category}:${address}]`;
   const activity = await fetchActivity(address);
-  const buys = filterBuys(activity);
+  const allBuys = filterBuys(activity);
+  const buys = allBuys.filter((t) =>
+    matchesSubCategory(t, wallet.subCategories),
+  );
   const fresh = pickNewTrades(buys, state.seen);
 
   if (!state.baselined.has(address)) {
@@ -294,7 +322,9 @@ async function pollUser(wallet, state) {
   }
 
   if (copyable.length === 0) {
-    log(`${tag} no new BUY trades (${buys.length} buys in window)`);
+    log(
+      `${tag} no new BUY trades (${buys.length}/${allBuys.length} buys in window match sub-categories)`,
+    );
     return;
   }
 
@@ -373,7 +403,11 @@ async function main() {
 
   log(
     `copy-trader started: targets=[${targetWallets
-      .map((w) => `${w.category}:${w.address}`)
+      .map(
+        (w) =>
+          `${w.category}:${w.address}` +
+          (w.subCategories.length ? ` (subs: ${w.subCategories.join("|")})` : ""),
+      )
       .join(
         ", ",
       )}] interval=${pollInterval}ms bet=$${BET_USDC} (fixed) dryRun=${isDryRun} ` +
@@ -400,5 +434,6 @@ module.exports = {
   tradeKey,
   normalizeWallets,
   splitStale,
+  matchesSubCategory,
   TARGET_WALLETS,
 };
