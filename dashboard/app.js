@@ -197,9 +197,11 @@ function Analytics({ copied }) {
   const losses = ok.filter((t) => t.result === "loss");
   const resolved = wins.length + losses.length;
   const winRate = resolved ? Math.round((wins.length / resolved) * 100) : null;
-  const pnl =
-    wins.reduce((s, t) => s + ((t.copy?.shares || 0) - (t.copy?.spentUsdc || 0)), 0) -
-    losses.reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
+  // lifetime totals: copied trades are never evicted from the journal
+  const totalProfit = wins.reduce(
+    (s, t) => s + ((t.copy?.shares || 0) - (t.copy?.spentUsdc || 0)), 0);
+  const totalLoss = losses.reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
+  const pnl = totalProfit - totalLoss;
   const totalSpent = ok.reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
   // money still riding on unresolved markets
   const active = ok
@@ -215,6 +217,8 @@ function Analytics({ copied }) {
         <${StatTile} label="Losses" value=${losses.length} tone=${C_LOSS} />
         <${StatTile} label="Win rate" value=${winRate == null ? "—" : winRate + "%"} />
         <${StatTile} label="Net P/L (resolved)" value=${`${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)}`} tone=${resolved ? (pnl >= 0 ? C_WIN : C_LOSS) : null} />
+        <${StatTile} label="Lifetime profit" value=${`+$${totalProfit.toFixed(2)}`} tone=${totalProfit > 0 ? C_WIN : null} />
+        <${StatTile} label="Lifetime loss" value=${`-$${totalLoss.toFixed(2)}`} tone=${totalLoss > 0 ? C_LOSS : null} />
         <${StatTile} label="Total spent" value=${`$${totalSpent.toFixed(2)}`} />
         <${StatTile} label="Active in trading" value=${`$${active.toFixed(2)}`} tone=${active > 0 ? "#4c9aff" : null} />
       </div>
