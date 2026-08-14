@@ -93,6 +93,13 @@ function log(...args) {
 // Seen-trade persistence (so restarts don't re-place old trades)
 // ---------------------------------------------------------------------------
 
+/** Write JSON atomically (tmp file + rename) so a mid-write crash can't corrupt it. */
+function writeJsonAtomic(file, data) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+}
+
 function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(SEEN_FILE, "utf8"));
@@ -110,14 +117,10 @@ function loadState() {
 }
 
 function saveState(state) {
-  fs.writeFileSync(
-    SEEN_FILE,
-    JSON.stringify(
-      { seen: [...state.seen], baselined: [...state.baselined] },
-      null,
-      2,
-    ),
-  );
+  writeJsonAtomic(SEEN_FILE, {
+    seen: [...state.seen],
+    baselined: [...state.baselined],
+  });
 }
 
 function tradeKey(t) {
@@ -134,7 +137,20 @@ function loadJournal() {
   try {
     const arr = JSON.parse(fs.readFileSync(TRADES_LOG_FILE, "utf8"));
     return Array.isArray(arr) ? arr : [];
-  } catch {
+  } catch (err) {
+    // If a journal file EXISTS but can't be parsed, don't silently start empty
+    // (the next save would wipe the trade history) — back it up first.
+    if (fs.existsSync(TRADES_LOG_FILE)) {
+      const backup = `${TRADES_LOG_FILE}.corrupt-${Date.now()}`;
+      try {
+        fs.copyFileSync(TRADES_LOG_FILE, backup);
+        console.error(
+          `trades log unreadable (${err.message}) — backed up to ${backup}`,
+        );
+      } catch {
+        /* best effort */
+      }
+    }
     return [];
   }
 }
@@ -143,7 +159,7 @@ const journal = loadJournal(); // newest first
 const journalIds = new Set(journal.map((e) => e.id));
 
 function saveJournal() {
-  fs.writeFileSync(TRADES_LOG_FILE, JSON.stringify(journal, null, 2));
+  writeJsonAtomic(TRADES_LOG_FILE, journal);
 }
 
 /** Record a newly observed target trade (id = tradeKey). No-op if already logged. */
@@ -178,22 +194,15 @@ function journalUpdate(id, patch) {
 /** Heartbeat + config snapshot so the dashboard knows the engine is alive. */
 function writeStatus() {
   try {
-    fs.writeFileSync(
-      STATUS_FILE,
-      JSON.stringify(
-        {
-          mode: isDryRun ? "dry" : "live",
-          betUsdc: BET_USDC,
-          pollIntervalMs: pollInterval,
-          maxTrades,
-          tradesPlaced,
-          targets: targetWallets,
-          updatedAt: Date.now(),
-        },
-        null,
-        2,
-      ),
-    );
+    writeJsonAtomic(STATUS_FILE, {
+      mode: isDryRun ? "dry" : "live",
+      betUsdc: BET_USDC,
+      pollIntervalMs: pollInterval,
+      maxTrades,
+      tradesPlaced,
+      targets: targetWallets,
+      updatedAt: Date.now(),
+    });
   } catch (err) {
     log("failed to write status file:", err.message);
   }
