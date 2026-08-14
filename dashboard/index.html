@@ -55,6 +55,12 @@
   .tooltip { background: #0a0d12; border: 1px solid var(--border); color: var(--text);
              font-size: 12px; padding: 5px 9px; border-radius: 6px; pointer-events: none;
              white-space: nowrap; z-index: 10; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+  .filters { float: right; display: inline-flex; gap: 4px; }
+  .filters button { background: var(--bg); border: 1px solid var(--border); color: var(--dim);
+                    font-size: 11px; padding: 2px 9px; border-radius: 999px; cursor: pointer;
+                    text-transform: capitalize; }
+  .filters button:hover { color: var(--text); }
+  .filters button.on { background: rgba(76,154,255,.15); border-color: var(--blue); color: var(--blue); }
 </style>
 </head>
 <body>

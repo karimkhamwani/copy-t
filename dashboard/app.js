@@ -298,9 +298,29 @@ function App() {
     status?.updatedAt &&
     Date.now() - status.updatedAt < Math.max(15000, (status.pollIntervalMs || 5000) * 3);
 
+  const [copyFilter, setCopyFilter] = useState("all");
+
   const copied = trades.filter((t) => t.copy);
   const successes = copied.filter((t) => t.status === "success").length;
   const failures = copied.filter((t) => t.status === "failed").length;
+  const copyFilterFn = {
+    all: () => true,
+    win: (t) => t.result === "win",
+    loss: (t) => t.result === "loss",
+    pending: (t) => t.status === "success" && t.result === "pending",
+    failed: (t) => t.status === "failed",
+  };
+  const [copySort, setCopySort] = useState("recent"); // recent | bet-desc | bet-asc
+  const nextSort = { recent: "bet-desc", "bet-desc": "bet-asc", "bet-asc": "recent" };
+  const sortLabel = { recent: "recent", "bet-desc": "bet ↓", "bet-asc": "bet ↑" };
+
+  const shownCopied = copied
+    .filter(copyFilterFn[copyFilter] || copyFilterFn.all)
+    .sort((a, b) => {
+      if (copySort === "bet-desc") return (b.copy?.spentUsdc || 0) - (a.copy?.spentUsdc || 0);
+      if (copySort === "bet-asc") return (a.copy?.spentUsdc || 0) - (b.copy?.spentUsdc || 0);
+      return (b.copy?.copiedAt || b.observedAt || 0) - (a.copy?.copiedAt || a.observedAt || 0);
+    });
   const wins = copied.filter((t) => t.result === "win").length;
   const losses = copied.filter((t) => t.result === "loss").length;
 
@@ -337,10 +357,29 @@ function App() {
         </div>
 
         <div className="panel">
-          <h2>Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}</h2>
+          <h2>
+            Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            <span className="filters">
+              ${["all", "win", "loss", "pending", "failed"].map(
+                (f) => html`<button
+                  key=${f}
+                  className=${copyFilter === f ? "on" : ""}
+                  onClick=${() => setCopyFilter(f)}
+                >${f}</button>`,
+              )}
+              <button
+                className=${copySort === "recent" ? "" : "on"}
+                title="Sort: newest first / bet value high-low / bet value low-high"
+                onClick=${() => setCopySort(nextSort[copySort])}
+              >sort: ${sortLabel[copySort]}</button>
+            </span>
+          </h2>
           <div className="list">
-            ${copied.length === 0 && html`<div className="empty">Nothing copied yet</div>`}
-            ${copied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} />`)}
+            ${shownCopied.length === 0 &&
+            html`<div className="empty">
+              ${copied.length === 0 ? "Nothing copied yet" : `No ${copyFilter} trades`}
+            </div>`}
+            ${shownCopied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} />`)}
           </div>
         </div>
       </div>
