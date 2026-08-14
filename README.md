@@ -25,6 +25,23 @@ npm start
    `MAX_BET_USDC` (env, default $1 — Polymarket's minimum), regardless of the
    target's trade size. Failed orders are retried on the next poll.
 
+## Dashboard
+
+```bash
+npm run dashboard
+```
+
+Opens at http://localhost:3210 (React, no build step, works offline). Left panel:
+every BUY the target wallets make, with status (COPIED / FAILED / FILTERED / STALE /
+BASELINE / PENDING). Right panel: our copied trades — market name, outcome, price
+paid, shares received, USDC spent, DRY/LIVE mode, success or failure (with the error),
+and a Polygonscan link for live fills. Header shows engine mode, heartbeat
+(online/offline), bet size, poll interval, and per-wallet sub-category filters.
+
+The trader writes `trades-log.json` (journal, capped at 500 entries) and
+`status.json` (heartbeat) next to the script; the dashboard server just reads them,
+so it works identically in dry and live mode. Run both processes side by side.
+
 ## Env vars
 
 Target wallets live in the script itself (`TARGET_WALLETS` in copy-trader.js):
@@ -50,7 +67,8 @@ and ignores everything else that wallet trades. Add more keywords to widen it
 | `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1) |
 | `MAX_TRADES` | Stop after this many placed trades (0 = unlimited). Use `1` for the first live run |
 | `MAX_TRADE_AGE_SEC` | Skip trades older than this (default 120s) — avoids chasing expired fast markets |
-| `POLL_INTERVAL_MS` | Poll interval, default 30000 |
+| `POLL_INTERVAL_MS` | Poll interval, default 5000 (5s) |
+| `DASHBOARD_PORT` | Dashboard server port, default 3210 |
 | `DRY_RUN` | `1` = log orders instead of placing (default in .env.example) |
 | `PRIVATE_KEY` | Your signing key (only needed when `DRY_RUN=0`) |
 | `FUNDER_ADDRESS` | Your Polymarket proxy wallet holding USDC |

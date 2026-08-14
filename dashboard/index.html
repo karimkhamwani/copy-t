@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Polymarket Copy-Trader</title>
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b24; --border: #232a36;
+    --text: #dbe2ee; --dim: #7d8899;
+    --green: #2ecc71; --red: #e74c5b; --blue: #4c9aff; --orange: #f0a13a; --gray: #5c6675;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 -apple-system, "Segoe UI", Roboto, sans-serif; }
+  #root { max-width: 1400px; margin: 0 auto; padding: 16px; }
+  .header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .header h1 { font-size: 18px; margin: 0 12px 0 0; }
+  .pill { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+          border: 1px solid var(--border); color: var(--dim); }
+  .pill.live { background: rgba(231,76,91,.15); color: var(--red); border-color: var(--red); }
+  .pill.dry { background: rgba(76,154,255,.15); color: var(--blue); border-color: var(--blue); }
+  .pill.on { background: rgba(46,204,113,.12); color: var(--green); border-color: var(--green); }
+  .pill.off { background: rgba(231,76,91,.12); color: var(--red); border-color: var(--red); }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .panel h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim);
+              margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--border); }
+  .list { max-height: 78vh; overflow-y: auto; }
+  .row { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .row:last-child { border-bottom: none; }
+  .row .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .row .title { font-weight: 600; }
+  .row .meta { color: var(--dim); font-size: 12px; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 5px; white-space: nowrap; }
+  .b-success { background: rgba(46,204,113,.15); color: var(--green); }
+  .b-failed { background: rgba(231,76,91,.15); color: var(--red); }
+  .b-pending { background: rgba(76,154,255,.15); color: var(--blue); }
+  .b-filtered, .b-baseline { background: rgba(92,102,117,.2); color: var(--gray); }
+  .b-stale { background: rgba(240,161,58,.15); color: var(--orange); }
+  .outcome { color: var(--blue); font-weight: 600; }
+  .err { color: var(--red); font-size: 12px; margin-top: 4px; word-break: break-word; }
+  .empty { color: var(--dim); padding: 24px; text-align: center; }
+  .stats { display: flex; gap: 14px; font-size: 12px; color: var(--dim); flex-wrap: wrap; }
+  a { color: var(--blue); text-decoration: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="/vendor/react.js"></script>
+<script src="/vendor/react-dom.js"></script>
+<script src="/vendor/htm.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

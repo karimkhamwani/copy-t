@@ -6,6 +6,8 @@ node_modules/
 
 # Runtime state
 seen-trades.json
+trades-log.json
+status.json
 
 # Misc
 .DS_Store

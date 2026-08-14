@@ -37,12 +37,14 @@ const {
   PRIVATE_KEY,
   FUNDER_ADDRESS,
   SIGNATURE_TYPE = "1",
-  POLL_INTERVAL_MS = "30000",
+  POLL_INTERVAL_MS = "5000",
   MAX_BET_USDC = "1",
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
   MAX_TRADE_AGE_SEC = "120", // skip trades older than this (avoids expired fast markets)
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
+  TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
+  STATUS_FILE = path.join(__dirname, "status.json"),
 } = process.env;
 
 const CHAIN_ID = 137; // Polygon mainnet
@@ -120,6 +122,70 @@ function saveState(state) {
 
 function tradeKey(t) {
   return `${t.transactionHash}:${t.asset}`;
+}
+
+// ---------------------------------------------------------------------------
+// Trade journal + status (read by the dashboard)
+// ---------------------------------------------------------------------------
+
+const MAX_JOURNAL_ENTRIES = 500;
+
+function loadJournal() {
+  try {
+    const arr = JSON.parse(fs.readFileSync(TRADES_LOG_FILE, "utf8"));
+    return Array.isArray(arr) ? arr : [];
+  } catch {
+    return [];
+  }
+}
+
+const journal = loadJournal(); // newest first
+const journalIds = new Set(journal.map((e) => e.id));
+
+function saveJournal() {
+  fs.writeFileSync(TRADES_LOG_FILE, JSON.stringify(journal, null, 2));
+}
+
+/** Record a newly observed target trade (id = tradeKey). No-op if already logged. */
+function journalAdd(entry) {
+  if (journalIds.has(entry.id)) return;
+  journal.unshift(entry);
+  journalIds.add(entry.id);
+  while (journal.length > MAX_JOURNAL_ENTRIES) {
+    journalIds.delete(journal.pop().id);
+  }
+  saveJournal();
+}
+
+function journalUpdate(id, patch) {
+  const e = journal.find((e) => e.id === id);
+  if (!e) return;
+  Object.assign(e, patch);
+  saveJournal();
+}
+
+/** Heartbeat + config snapshot so the dashboard knows the engine is alive. */
+function writeStatus() {
+  try {
+    fs.writeFileSync(
+      STATUS_FILE,
+      JSON.stringify(
+        {
+          mode: isDryRun ? "dry" : "live",
+          betUsdc: BET_USDC,
+          pollIntervalMs: pollInterval,
+          maxTrades,
+          tradesPlaced,
+          targets: targetWallets,
+          updatedAt: Date.now(),
+        },
+        null,
+        2,
+      ),
+    );
+  } catch (err) {
+    log("failed to write status file:", err.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +360,25 @@ async function placeMarketBuy(trade, amountUsdc) {
 // Main loop
 // ---------------------------------------------------------------------------
 
+/** Base journal entry for an observed target trade. */
+function observedEntry(trade, wallet, status) {
+  return {
+    id: tradeKey(trade),
+    observedAt: Date.now(),
+    tradedAt: (trade.timestamp || 0) * 1000,
+    wallet: wallet.address,
+    category: wallet.category,
+    title: trade.title || "",
+    outcome: trade.outcome || "",
+    slug: trade.slug || trade.eventSlug || "",
+    theirPrice: trade.price,
+    theirUsdc: trade.usdcSize,
+    theirShares: trade.size,
+    status, // baseline | filtered | stale | pending | success | failed
+    copy: null, // filled in when we attempt the copy
+  };
+}
+
 async function pollUser(wallet, state) {
   const { address, category } = wallet;
   const tag = `[${category}:${address}]`;
@@ -310,8 +395,18 @@ async function pollUser(wallet, state) {
     fresh.forEach((t) => state.seen.add(tradeKey(t)));
     state.baselined.add(address);
     saveState(state);
+    allBuys.forEach((t) => journalAdd(observedEntry(t, wallet, "baseline")));
     log(`${tag} baseline: marked ${fresh.length} existing BUY trades as seen`);
     return;
+  }
+
+  // Journal every newly observed buy, including ones we won't copy
+  for (const t of allBuys) {
+    if (journalIds.has(tradeKey(t))) continue;
+    const status = matchesSubCategory(t, wallet.subCategories)
+      ? "pending"
+      : "filtered";
+    journalAdd(observedEntry(t, wallet, status));
   }
 
   const nowSec = Math.floor(Date.now() / 1000);
@@ -319,7 +414,10 @@ async function pollUser(wallet, state) {
 
   // Too old to chase (fast markets expire) — mark seen so we never retry them
   if (stale.length > 0) {
-    stale.forEach((t) => state.seen.add(tradeKey(t)));
+    stale.forEach((t) => {
+      state.seen.add(tradeKey(t));
+      journalUpdate(tradeKey(t), { status: "stale" });
+    });
     saveState(state);
     log(
       `${tag} skipped ${stale.length} stale trade(s) older than ${maxTradeAgeSec}s`,
@@ -344,15 +442,34 @@ async function pollUser(wallet, state) {
         `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
     );
     try {
-      await placeMarketBuy(trade, amount);
+      const resp = await placeMarketBuy(trade, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
       tradesPlaced++;
+      const spent = resp.dryRun ? amount : Number(resp.makingAmount) || amount;
+      const shares = resp.dryRun
+        ? trade.price > 0
+          ? amount / trade.price
+          : 0
+        : Number(resp.takingAmount) || 0;
+      journalUpdate(tradeKey(trade), {
+        status: "success",
+        copy: {
+          mode: isDryRun ? "dry" : "live",
+          copiedAt: Date.now(),
+          spentUsdc: Number(spent.toFixed(6)),
+          shares: Number(shares.toFixed(4)),
+          price: shares > 0 ? Number((spent / shares).toFixed(4)) : trade.price,
+          orderID: resp.orderID || null,
+          txHashes: resp.transactionsHashes || [],
+        },
+      });
       if (maxTrades && tradesPlaced >= maxTrades) {
         log(
           `MAX_TRADES limit reached (${tradesPlaced}/${maxTrades}) — stopping. ` +
             `Check the position on Polymarket, then raise/remove MAX_TRADES and restart.`,
         );
+        writeStatus();
         process.exit(0);
       }
     } catch (err) {
@@ -360,7 +477,15 @@ async function pollUser(wallet, state) {
         `${tag} FAILED to place order for ${tradeKey(trade)}:`,
         err.message || err,
       );
-      // not marked seen -> retried next poll
+      journalUpdate(tradeKey(trade), {
+        status: "failed",
+        copy: {
+          mode: isDryRun ? "dry" : "live",
+          copiedAt: Date.now(),
+          error: String(err.message || err),
+        },
+      });
+      // not marked seen -> retried next poll (until it goes stale)
     }
   }
 }
@@ -420,10 +545,12 @@ async function main() {
   );
 
   const state = loadState();
+  writeStatus();
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
     await pollOnce(state);
+    writeStatus();
     await new Promise((r) => setTimeout(r, pollInterval));
   }
 }
