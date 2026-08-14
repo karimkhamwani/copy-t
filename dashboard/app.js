@@ -68,7 +68,11 @@ function CopiedTradeRow({ t }) {
   return html`
     <div className="row">
       <div className="top">
-        <span className="title">${t.title || t.slug}</span>
+        <span className="title">
+          ${t.slug
+            ? html`<a href=${`https://polymarket.com/event/${t.slug}`} target="_blank" rel="noreferrer">${t.title || t.slug}</a>`
+            : t.title}
+        </span>
         <span style=${{ display: "inline-flex", gap: 6 }}>
           <span className=${`badge ${c.mode === "live" ? "b-failed" : "b-pending"}`}>
             ${(c.mode || "?").toUpperCase()}
