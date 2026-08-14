@@ -26,7 +26,7 @@ const TARGET_WALLETS = [
   {
     address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
     category: "crypto",
-    sub_category: ["btc"],
+    sub_category: ["btc-updown-5m"],
   },
 ];
 
