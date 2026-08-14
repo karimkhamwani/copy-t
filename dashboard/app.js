@@ -191,6 +191,69 @@ function WinLossChart({ copied }) {
     </div>`;
 }
 
+/** Cumulative net P/L line over resolved copied trades, in copy order. */
+function PnlChart({ copied }) {
+  const [tip, setTip] = useState(null);
+  const resolved = copied
+    .filter((t) => t.status === "success" && (t.result === "win" || t.result === "loss"))
+    .sort((a, b) => (a.copy?.copiedAt || 0) - (b.copy?.copiedAt || 0));
+  if (resolved.length < 2)
+    return html`<div className="empty">Need at least 2 resolved bets to chart P/L</div>`;
+
+  let cum = 0;
+  const pts = resolved.map((t) => {
+    const delta = t.result === "win"
+      ? (t.copy?.shares || 0) - (t.copy?.spentUsdc || 0)
+      : -(t.copy?.spentUsdc || 0);
+    cum += delta;
+    return { t, delta, cum, at: t.copy?.copiedAt };
+  });
+
+  const W = 640, H = 150, padL = 40, padR = 10, padT = 12, padB = 18;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const lo = Math.min(0, ...pts.map((p) => p.cum));
+  const hi = Math.max(0, ...pts.map((p) => p.cum));
+  const span = hi - lo || 1;
+  const x = (i) => padL + (pts.length === 1 ? plotW / 2 : (i / (pts.length - 1)) * plotW);
+  const y = (v) => padT + plotH - ((v - lo) / span) * plotH;
+  const path = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.cum).toFixed(1)}`).join(" ");
+  const last = pts[pts.length - 1];
+  const lineColor = "#4c9aff";
+  const labelEvery = Math.max(1, Math.ceil(pts.length / 8));
+
+  return html`
+    <div style=${{ position: "relative" }}>
+      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>Net P/L over time (cumulative, resolved bets)</div>
+      <svg viewBox=${`0 0 ${W} ${H}`} style=${{ width: "100%", display: "block" }}>
+        ${[lo, (lo + hi) / 2, hi].map((v, i) => html`<g key=${"g" + i}>
+          <line x1=${padL} x2=${W - padR} y1=${y(v)} y2=${y(v)} stroke="var(--border)" strokeWidth="1" />
+          <text x=${padL - 6} y=${y(v) + 3} textAnchor="end" fontSize="9" fill="var(--dim)">$${v.toFixed(v % 1 ? 2 : 0)}</text>
+        </g>`)}
+        ${lo < 0 && hi > 0 &&
+        html`<line x1=${padL} x2=${W - padR} y1=${y(0)} y2=${y(0)} stroke="var(--gray)" strokeWidth="1" strokeDasharray="3 3" />`}
+        <path d=${path} fill="none" stroke=${lineColor} strokeWidth="2" strokeLinejoin="round" />
+        ${pts.map((p, i) => html`<g key=${"p" + i}>
+          <circle cx=${x(i)} cy=${y(p.cum)} r="2.5" fill=${lineColor} stroke="var(--panel)" strokeWidth="1.5" />
+          <circle cx=${x(i)} cy=${y(p.cum)} r="9" fill="transparent"
+            onMouseEnter=${(e) => setTip({
+              x: e.clientX, y: e.clientY,
+              text: `${new Date(p.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} — ${p.t.result === "win" ? "win" : "loss"} ${p.delta >= 0 ? "+" : "-"}$${Math.abs(p.delta).toFixed(2)} → total ${p.cum >= 0 ? "+" : "-"}$${Math.abs(p.cum).toFixed(2)}`,
+            })}
+            onMouseLeave=${() => setTip(null)} />
+          ${i % labelEvery === 0 &&
+          html`<text x=${x(i)} y=${H - 5} textAnchor="middle" fontSize="9" fill="var(--dim)">
+            ${new Date(p.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
+          </text>`}
+        </g>`)}
+        <text x=${x(pts.length - 1)} y=${y(last.cum) - 8} textAnchor="end" fontSize="10" fontWeight="700"
+          fill=${last.cum >= 0 ? C_WIN : C_LOSS}>
+          ${last.cum >= 0 ? "+" : "-"}$${Math.abs(last.cum).toFixed(2)}
+        </text>
+      </svg>
+      ${tip && html`<div className="tooltip" style=${{ left: 0, top: 0, position: "fixed", transform: `translate(${tip.x + 12}px, ${tip.y + 12}px)` }}>${tip.text}</div>`}
+    </div>`;
+}
+
 function Analytics({ copied }) {
   const ok = copied.filter((t) => t.status === "success");
   const wins = ok.filter((t) => t.result === "win");
@@ -224,6 +287,7 @@ function Analytics({ copied }) {
       </div>
       <div style=${{ padding: "0 14px 12px" }}>
         <${WinLossChart} copied=${copied} />
+        <${PnlChart} copied=${copied} />
       </div>
     </div>`;
 }
