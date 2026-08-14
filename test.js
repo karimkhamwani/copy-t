@@ -1,6 +1,6 @@
 /** Offline tests for the copy-trader logic (no network needed). */
 const assert = require("assert");
-const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets } = require("./copy-trader");
+const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale } = require("./copy-trader");
 
 const sample = [
   { type: "TRADE", side: "BUY", transactionHash: "0xaaa", asset: "111", usdcSize: 50, price: 0.42, timestamp: 100, title: "Market A", outcome: "Yes" },
@@ -44,5 +44,17 @@ assert.deepStrictEqual(
   ]
 );
 assert.deepStrictEqual(normalizeWallets(undefined), []);
+
+// 6. Staleness split: trades older than maxAge go to stale, missing timestamp = stale
+{
+  const now = 1000;
+  const { copyable, stale } = splitStale(
+    [{ transactionHash: "0x1", timestamp: 950 }, { transactionHash: "0x2", timestamp: 700 }, { transactionHash: "0x3" }],
+    now,
+    120
+  );
+  assert.deepStrictEqual(copyable.map((t) => t.transactionHash), ["0x1"]);
+  assert.deepStrictEqual(stale.map((t) => t.transactionHash), ["0x2", "0x3"]);
+}
 
 console.log("all tests passed");

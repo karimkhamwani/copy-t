@@ -34,6 +34,7 @@ const {
   POLL_INTERVAL_MS = "30000",
   MAX_BET_USDC = "1",
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
+  MAX_TRADE_AGE_SEC = "120", // skip trades older than this (avoids expired fast markets)
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
 } = process.env;
@@ -45,6 +46,7 @@ const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, d
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
+const maxTradeAgeSec = Number(MAX_TRADE_AGE_SEC) || 120;
 let tradesPlaced = 0;
 
 /** Normalize wallet entries: lowercase addresses, drop empties, dedupe by address. */
@@ -174,6 +176,16 @@ function pickNewTrades(buys, seen) {
   return buys.filter((t) => !seen.has(tradeKey(t)));
 }
 
+/** Split trades into { copyable, stale } by age — stale ones are too old to chase. */
+function splitStale(trades, nowSec, maxAgeSec) {
+  const copyable = [];
+  const stale = [];
+  for (const t of trades) {
+    (nowSec - (t.timestamp || 0) > maxAgeSec ? stale : copyable).push(t);
+  }
+  return { copyable, stale };
+}
+
 /** Fixed bet per copied trade: MAX_BET_USDC from env (ignores their trade size). */
 function betAmount() {
   return BET_USDC;
@@ -188,31 +200,33 @@ let clobClient = null;
 async function getClobClient() {
   if (clobClient) return clobClient;
 
-  // clob-client v5+ is ESM-only and requires Node >= 20.10
-  const { ClobClient, Side, OrderType } = await import("@polymarket/clob-client");
+  // CLOB v2: Polymarket archived @polymarket/clob-client — orders from it are
+  // rejected with "invalid order version". clob-client-v2 requires Node >= 20.10.
+  const { ClobClient, Side, OrderType } = await import(
+    "@polymarket/clob-client-v2"
+  );
   const { Wallet } = require("@ethersproject/wallet");
 
   const signer = new Wallet(PRIVATE_KEY);
   const sigType = Number(SIGNATURE_TYPE);
 
   // First client only to derive API creds, then the real one with creds
-  const bootstrap = new ClobClient(
-    CLOB_API_HOST,
-    CHAIN_ID,
+  const bootstrap = new ClobClient({
+    host: CLOB_API_HOST,
+    chain: CHAIN_ID,
     signer,
-    undefined,
-    sigType,
-    FUNDER_ADDRESS,
-  );
+    signatureType: sigType,
+    funderAddress: FUNDER_ADDRESS,
+  });
   const creds = await bootstrap.createOrDeriveApiKey();
-  clobClient = new ClobClient(
-    CLOB_API_HOST,
-    CHAIN_ID,
+  clobClient = new ClobClient({
+    host: CLOB_API_HOST,
+    chain: CHAIN_ID,
     signer,
     creds,
-    sigType,
-    FUNDER_ADDRESS,
-  );
+    signatureType: sigType,
+    funderAddress: FUNDER_ADDRESS,
+  });
   clobClient._Side = Side;
   clobClient._OrderType = OrderType;
   return clobClient;
@@ -236,6 +250,13 @@ async function placeMarketBuy(trade, amountUsdc) {
   });
   const resp = await client.postOrder(order, client._OrderType.FOK);
   log("order response:", JSON.stringify(resp));
+  // The client can return API errors as a normal response instead of throwing —
+  // a rejected order must NOT count as placed or be marked seen.
+  if (!resp || resp.error || resp.success === false) {
+    throw new Error(
+      `order rejected: ${resp?.error || resp?.errorMsg || "unknown error"}`,
+    );
+  }
   return resp;
 }
 
@@ -260,15 +281,27 @@ async function pollUser(wallet, state) {
     return;
   }
 
-  if (fresh.length === 0) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const { copyable, stale } = splitStale(fresh, nowSec, maxTradeAgeSec);
+
+  // Too old to chase (fast markets expire) — mark seen so we never retry them
+  if (stale.length > 0) {
+    stale.forEach((t) => state.seen.add(tradeKey(t)));
+    saveState(state);
+    log(
+      `${tag} skipped ${stale.length} stale trade(s) older than ${maxTradeAgeSec}s`,
+    );
+  }
+
+  if (copyable.length === 0) {
     log(`${tag} no new BUY trades (${buys.length} buys in window)`);
     return;
   }
 
   // Oldest first so we copy in the order they traded
-  fresh.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  copyable.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
 
-  for (const trade of fresh) {
+  for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
     const amount = betAmount();
     log(
@@ -327,7 +360,7 @@ async function main() {
   if (!isDryRun && nodeMajor < 20) {
     console.error(
       `Node ${process.versions.node} is too old for live orders — ` +
-        `@polymarket/clob-client v5 requires Node >= 20.10. Please upgrade Node.`,
+        `@polymarket/clob-client-v2 requires Node >= 20.10. Please upgrade Node.`,
     );
     process.exit(1);
   }
@@ -366,5 +399,6 @@ module.exports = {
   betAmount,
   tradeKey,
   normalizeWallets,
+  splitStale,
   TARGET_WALLETS,
 };

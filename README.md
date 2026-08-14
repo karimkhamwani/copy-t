@@ -40,6 +40,7 @@ const TARGET_WALLETS = [
 | `TARGET_USERS` | Optional override: comma-separated addresses (mainly for tests) |
 | `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1) |
 | `MAX_TRADES` | Stop after this many placed trades (0 = unlimited). Use `1` for the first live run |
+| `MAX_TRADE_AGE_SEC` | Skip trades older than this (default 120s) — avoids chasing expired fast markets |
 | `POLL_INTERVAL_MS` | Poll interval, default 30000 |
 | `DRY_RUN` | `1` = log orders instead of placing (default in .env.example) |
 | `PRIVATE_KEY` | Your signing key (only needed when `DRY_RUN=0`) |
