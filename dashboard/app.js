@@ -241,6 +241,64 @@ function PnlChart({ copied }) {
     </div>`;
 }
 
+/** Market close time (ms) parsed from up/down slugs like "btc-updown-5m-1786744800". */
+function parseMarketEnd(t) {
+  const m = /-(\d+)m-(\d{10})$/.exec(t.slug || "");
+  if (!m) return null;
+  return (Number(m[2]) + Number(m[1]) * 60) * 1000;
+}
+
+/** Step chart of $ actively at risk: +spent at copy time, -spent at market close once resolved. */
+function ActiveChart({ copied }) {
+  const events = [];
+  for (const t of copied) {
+    if (t.status !== "success" || !t.copy?.copiedAt) continue;
+    const spent = t.copy?.spentUsdc || 0;
+    if (!spent) continue;
+    events.push({ ts: t.copy.copiedAt, delta: spent });
+    if (t.result === "win" || t.result === "loss") {
+      // exposure ends when the market closes; fall back to entry time if unparseable
+      const end = parseMarketEnd(t);
+      events.push({ ts: Math.max(end || 0, t.copy.copiedAt), delta: -spent });
+    }
+  }
+  if (events.length === 0)
+    return html`<div className="empty">No copies to chart exposure yet</div>`;
+
+  events.sort((a, b) => a.ts - b.ts);
+  let cur = 0;
+  const pts = events.map((e) => {
+    cur += e.delta;
+    return {
+      label: new Date(e.ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+      active: Number(cur.toFixed(2)),
+    };
+  });
+  // extend the line to "now" so current exposure is visible at the right edge
+  pts.push({
+    label: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+    active: Number(cur.toFixed(2)),
+  });
+
+  return html`
+    <div>
+      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
+        Active in trading over time ($ at risk) — currently${" "}
+        <b style=${{ color: cur > 0 ? "#4c9aff" : "var(--dim)" }}>$${cur.toFixed(2)}</b>
+      </div>
+      <${ResponsiveContainer} width="100%" height=${160}>
+        <${LineChart} data=${pts} margin=${{ top: 10, right: 12, left: -16, bottom: 0 }}>
+          <${CartesianGrid} vertical=${false} stroke=${CH.grid} />
+          <${XAxis} dataKey="label" tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} interval="preserveStartEnd" minTickGap=${30} />
+          <${YAxis} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false} tickFormatter=${(v) => `$${v}`} allowDecimals=${false} domain=${[0, "auto"]} />
+          <${Tooltip} ...${TIP_STYLE} formatter=${(v) => [`$${Number(v).toFixed(2)}`, "At risk"]} />
+          <${Line} type="stepAfter" dataKey="active" name="At risk" stroke="#4c9aff" strokeWidth=${2}
+            dot=${false} activeDot=${{ r: 4 }} isAnimationActive=${false} />
+        <//>
+      <//>
+    </div>`;
+}
+
 function Analytics({ copied }) {
   const ok = copied.filter((t) => t.status === "success");
   const wins = ok.filter((t) => t.result === "win");
@@ -275,6 +333,7 @@ function Analytics({ copied }) {
       <div style=${{ padding: "0 14px 12px" }}>
         <${WinLossChart} copied=${copied} />
         <${PnlChart} copied=${copied} />
+        <${ActiveChart} copied=${copied} />
       </div>
     </div>`;
 }
