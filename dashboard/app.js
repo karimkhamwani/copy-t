@@ -87,7 +87,7 @@ function CopiedTradeRow({ t }) {
         html`
           <span>price ${c.price}</span>
           <span>${c.shares} shares</span>
-          <span>spent ${money(c.spentUsdc)}</span>
+          <span>trader ${money(t.theirUsdc)} → us ${money(c.spentUsdc)}</span>
         `}
         <span>${timeAgo(c.copiedAt)}</span>
         ${c.orderID && html`<span>order ${c.orderID.slice(0, 10)}…</span>`}
