@@ -10,6 +10,8 @@
   "scripts": {
     "start": "node copy-trader.js",
     "dashboard": "node dashboard-server.js",
+    "up": "pm2 start ecosystem.config.js",
+    "down": "pm2 delete ecosystem.config.js",
     "reset": "node -e \"['trades-log.json','seen-trades.json','status.json'].forEach(f=>{try{require('fs').unlinkSync(f)}catch{}}); console.log('state reset — restart the trader to re-baseline')\"",
     "test": "node test.js"
   },
@@ -20,5 +22,8 @@
     "htm": "^3.1.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "pm2": "^7.0.3"
   }
 }
