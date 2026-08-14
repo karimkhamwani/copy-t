@@ -47,6 +47,21 @@ function TargetTradeRow({ t }) {
     </div>`;
 }
 
+function ResultBadge({ result, copy }) {
+  if (!result) return null;
+  if (result === "win") {
+    const profit = copy?.shares != null && copy?.spentUsdc != null
+      ? ` +$${(copy.shares - copy.spentUsdc).toFixed(2)}`
+      : "";
+    return html`<span className="badge b-success">WIN${profit}</span>`;
+  }
+  if (result === "loss") {
+    const lost = copy?.spentUsdc != null ? ` -$${Number(copy.spentUsdc).toFixed(2)}` : "";
+    return html`<span className="badge b-failed">LOSS${lost}</span>`;
+  }
+  return html`<span className="badge b-filtered">PENDING</span>`;
+}
+
 function CopiedTradeRow({ t }) {
   const c = t.copy || {};
   const ok = t.status === "success";
@@ -54,11 +69,12 @@ function CopiedTradeRow({ t }) {
     <div className="row">
       <div className="top">
         <span className="title">${t.title || t.slug}</span>
-        <span>
-          <span className=${`badge ${c.mode === "live" ? "b-failed" : "b-pending"}`} style=${{ marginRight: 6 }}>
+        <span style=${{ display: "inline-flex", gap: 6 }}>
+          <span className=${`badge ${c.mode === "live" ? "b-failed" : "b-pending"}`}>
             ${(c.mode || "?").toUpperCase()}
           </span>
           <${Badge} status=${ok ? "success" : "failed"} />
+          ${ok && html`<${ResultBadge} result=${t.result} copy=${c} />`}
         </span>
       </div>
       <div className="meta">
@@ -111,6 +127,8 @@ function App() {
   const copied = trades.filter((t) => t.copy);
   const successes = copied.filter((t) => t.status === "success").length;
   const failures = copied.filter((t) => t.status === "failed").length;
+  const wins = copied.filter((t) => t.result === "win").length;
+  const losses = copied.filter((t) => t.result === "loss").length;
 
   return html`
     <div>
@@ -143,7 +161,7 @@ function App() {
         </div>
 
         <div className="panel">
-          <h2>Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures}</h2>
+          <h2>Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}</h2>
           <div className="list">
             ${copied.length === 0 && html`<div className="empty">Nothing copied yet</div>`}
             ${copied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} />`)}

@@ -35,7 +35,10 @@ Opens at http://localhost:3210 (React, no build step, works offline). Left panel
 every BUY the target wallets make, with status (COPIED / FAILED / FILTERED / STALE /
 BASELINE / PENDING). Right panel: our copied trades — market name, outcome, price
 paid, shares received, USDC spent, DRY/LIVE mode, success or failure (with the error),
-and a Polygonscan link for live fills. Header shows engine mode, heartbeat
+a WIN/LOSS/PENDING badge once the market resolves (with profit/loss amount),
+and a Polygonscan link for live fills. Resolution is looked up from the gamma
+markets API by conditionId, cached server-side (resolved markets are never
+re-fetched; pending ones re-check every 60s). Header shows engine mode, heartbeat
 (online/offline), bet size, poll interval, and per-wallet sub-category filters.
 
 The trader writes `trades-log.json` (journal, capped at 500 entries) and
