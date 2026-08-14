@@ -268,9 +268,22 @@ function Analytics({ copied }) {
     </div>`;
 }
 
+const COPIED_FILTERS = {
+  all: { label: "All", match: () => true },
+  success: { label: "Copied", match: (t) => t.status === "success" },
+  failed: { label: "Failed", match: (t) => t.status !== "success" },
+  win: { label: "Win", match: (t) => t.result === "win" },
+  loss: { label: "Loss", match: (t) => t.result === "loss" },
+  pending: {
+    label: "Pending",
+    match: (t) => t.status === "success" && t.result !== "win" && t.result !== "loss",
+  },
+};
+
 function App() {
   const [trades, setTrades] = useState([]);
   const [status, setStatus] = useState(null);
+  const [copiedFilter, setCopiedFilter] = useState("all");
 
   useEffect(() => {
     let alive = true;
@@ -303,6 +316,7 @@ function App() {
   const failures = copied.filter((t) => t.status === "failed").length;
   const wins = copied.filter((t) => t.result === "win").length;
   const losses = copied.filter((t) => t.result === "loss").length;
+  const filteredCopied = copied.filter(COPIED_FILTERS[copiedFilter].match);
 
   return html`
     <div>
@@ -337,10 +351,24 @@ function App() {
         </div>
 
         <div className="panel">
-          <h2>Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}</h2>
+          <h2>
+            Copied trades (${filteredCopied.length}${copiedFilter !== "all" ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            <select
+              className="filter"
+              value=${copiedFilter}
+              onChange=${(e) => setCopiedFilter(e.target.value)}
+              aria-label="Filter copied trades by status"
+            >
+              ${Object.entries(COPIED_FILTERS).map(
+                ([k, f]) => html`<option key=${k} value=${k}>${f.label}</option>`
+              )}
+            </select>
+          </h2>
           <div className="list">
             ${copied.length === 0 && html`<div className="empty">Nothing copied yet</div>`}
-            ${copied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} />`)}
+            ${copied.length > 0 && filteredCopied.length === 0 &&
+            html`<div className="empty">No copied trades match this filter</div>`}
+            ${filteredCopied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} />`)}
           </div>
         </div>
       </div>
