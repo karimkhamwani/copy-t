@@ -94,6 +94,125 @@ function CopiedTradeRow({ t }) {
     </div>`;
 }
 
+// Win/loss chart colors — validated for the dark surface (#161b24):
+// lightness band, chroma, contrast >=3:1, CVD separation with gaps+legend+labels.
+const C_WIN = "#29a75e";
+const C_LOSS = "#c04a5c";
+const C_PENDING = "#5c6675";
+
+function StatTile({ label, value, tone }) {
+  return html`
+    <div className="tile">
+      <div className="tile-label">${label}</div>
+      <div className="tile-value" style=${tone ? { color: tone } : null}>${value}</div>
+    </div>`;
+}
+
+/** Hourly buckets of copied trades: { label, win, loss, pending }. */
+function bucketize(copied) {
+  const byHour = new Map();
+  for (const t of copied) {
+    if (t.status !== "success") continue;
+    const ts = t.copy?.copiedAt || t.observedAt;
+    if (!ts) continue;
+    const d = new Date(ts);
+    const key = new Date(d.getFullYear(), d.getMonth(), d.getDate(), d.getHours()).getTime();
+    if (!byHour.has(key)) byHour.set(key, { key, win: 0, loss: 0, pending: 0 });
+    const b = byHour.get(key);
+    if (t.result === "win") b.win++;
+    else if (t.result === "loss") b.loss++;
+    else b.pending++;
+  }
+  return [...byHour.values()]
+    .sort((a, b) => a.key - b.key)
+    .slice(-24)
+    .map((b) => ({
+      ...b,
+      total: b.win + b.loss + b.pending,
+      label: new Date(b.key).toLocaleTimeString([], { hour: "numeric" }),
+    }));
+}
+
+function WinLossChart({ copied }) {
+  const [tip, setTip] = useState(null);
+  const buckets = bucketize(copied);
+  if (buckets.length === 0)
+    return html`<div className="empty">No resolved copies to chart yet</div>`;
+
+  const W = 640, H = 170, padL = 28, padB = 20, padT = 14;
+  const plotW = W - padL - 6, plotH = H - padT - padB;
+  const maxY = Math.max(...buckets.map((b) => b.total), 1);
+  const yTicks = maxY <= 4 ? maxY : 4;
+  const bw = Math.min(28, (plotW / buckets.length) * 0.6);
+  const step = plotW / buckets.length;
+  const y = (n) => padT + plotH - (n / maxY) * plotH;
+
+  const seg = (b, i, from, count, color, name) => {
+    if (!count) return null;
+    const x = padL + i * step + (step - bw) / 2;
+    const y0 = y(from), y1 = y(from + count);
+    return html`<rect
+      key=${name + i} x=${x} y=${y1} width=${bw} height=${Math.max(1, y0 - y1)}
+      rx="2" fill=${color} stroke="var(--panel)" strokeWidth="2"
+      onMouseEnter=${(e) => setTip({ x: e.clientX, y: e.clientY, text: `${b.label} — ${name}: ${count} (total ${b.total})` })}
+      onMouseLeave=${() => setTip(null)}
+    />`;
+  };
+
+  return html`
+    <div style=${{ position: "relative" }}>
+      <svg viewBox=${`0 0 ${W} ${H}`} style=${{ width: "100%", display: "block" }}>
+        ${Array.from({ length: yTicks + 1 }, (_, i) => {
+          const v = Math.round((maxY / yTicks) * i);
+          return html`<g key=${"t" + i}>
+            <line x1=${padL} x2=${W - 6} y1=${y(v)} y2=${y(v)} stroke="var(--border)" strokeWidth="1" />
+            <text x=${padL - 6} y=${y(v) + 3} textAnchor="end" fontSize="9" fill="var(--dim)">${v}</text>
+          </g>`;
+        })}
+        ${buckets.map((b, i) => html`<g key=${"b" + i}>
+          ${seg(b, i, 0, b.win, C_WIN, "wins")}
+          ${seg(b, i, b.win, b.loss, C_LOSS, "losses")}
+          ${seg(b, i, b.win + b.loss, b.pending, C_PENDING, "pending")}
+          ${b.total > 0 && html`<text x=${padL + i * step + step / 2} y=${y(b.total) - 4}
+            textAnchor="middle" fontSize="9" fill="var(--dim)">${b.total}</text>`}
+          <text x=${padL + i * step + step / 2} y=${H - 6} textAnchor="middle" fontSize="9" fill="var(--dim)">${b.label}</text>
+        </g>`)}
+      </svg>
+      <div className="legend">
+        <span><i style=${{ background: C_WIN }}></i>Wins</span>
+        <span><i style=${{ background: C_LOSS }}></i>Losses</span>
+        <span><i style=${{ background: C_PENDING }}></i>Pending</span>
+      </div>
+      ${tip && html`<div className="tooltip" style=${{ left: 0, top: 0, position: "fixed", transform: `translate(${tip.x + 12}px, ${tip.y + 12}px)` }}>${tip.text}</div>`}
+    </div>`;
+}
+
+function Analytics({ copied }) {
+  const ok = copied.filter((t) => t.status === "success");
+  const wins = ok.filter((t) => t.result === "win");
+  const losses = ok.filter((t) => t.result === "loss");
+  const resolved = wins.length + losses.length;
+  const winRate = resolved ? Math.round((wins.length / resolved) * 100) : null;
+  const pnl =
+    wins.reduce((s, t) => s + ((t.copy?.shares || 0) - (t.copy?.spentUsdc || 0)), 0) -
+    losses.reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
+
+  return html`
+    <div className="panel" style=${{ marginBottom: 16 }}>
+      <h2>Analytics</h2>
+      <div className="tiles">
+        <${StatTile} label="Copied trades" value=${ok.length} />
+        <${StatTile} label="Wins" value=${wins.length} tone=${C_WIN} />
+        <${StatTile} label="Losses" value=${losses.length} tone=${C_LOSS} />
+        <${StatTile} label="Win rate" value=${winRate == null ? "—" : winRate + "%"} />
+        <${StatTile} label="Net P/L (resolved)" value=${`${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)}`} tone=${resolved ? (pnl >= 0 ? C_WIN : C_LOSS) : null} />
+      </div>
+      <div style=${{ padding: "0 14px 12px" }}>
+        <${WinLossChart} copied=${copied} />
+      </div>
+    </div>`;
+}
+
 function App() {
   const [trades, setTrades] = useState([]);
   const [status, setStatus] = useState(null);
@@ -150,6 +269,8 @@ function App() {
             </span>
           </span>`}
       </div>
+
+      <${Analytics} copied=${copied} />
 
       <div className="cols">
         <div className="panel">

@@ -44,6 +44,17 @@
   .empty { color: var(--dim); padding: 24px; text-align: center; }
   .stats { display: flex; gap: 14px; font-size: 12px; color: var(--dim); flex-wrap: wrap; }
   a { color: var(--blue); text-decoration: none; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+           gap: 10px; padding: 12px 14px; }
+  .tile { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; }
+  .tile-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  .tile-value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--dim); padding: 6px 2px 0; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+              margin-right: 5px; vertical-align: -1px; }
+  .tooltip { background: #0a0d12; border: 1px solid var(--border); color: var(--text);
+             font-size: 12px; padding: 5px 9px; border-radius: 6px; pointer-events: none;
+             white-space: nowrap; z-index: 10; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
 </style>
 </head>
 <body>

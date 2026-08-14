@@ -31,7 +31,10 @@ npm start
 npm run dashboard
 ```
 
-Opens at http://localhost:3210 (React, no build step, works offline). Left panel:
+Opens at http://localhost:3210 (React, no build step, works offline). Top: an
+analytics panel — stat tiles (copied trades, wins, losses, win rate, net P/L on
+resolved bets) and an hourly stacked bar chart of wins vs losses vs pending, with
+hover tooltips and per-bar totals. Left panel:
 every BUY the target wallets make, with status (COPIED / FAILED / FILTERED / STALE /
 BASELINE / PENDING). Right panel: our copied trades — market name, outcome, price
 paid, shares received, USDC spent, DRY/LIVE mode, success or failure (with the error),
