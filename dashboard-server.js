@@ -71,6 +71,7 @@ async function fetchResolution(conditionId) {
   try {
     const res = await fetch(`${CLOB_API_HOST}/markets/${conditionId}`, {
       headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(10000), // a hung request must not stall /api/trades
     });
     if (!res.ok) throw new Error(`clob API ${res.status}`);
     const m = await res.json();
@@ -152,7 +153,12 @@ const server = http.createServer(async (req, res) => {
 
   const entry = STATIC_FILES[url];
   if (entry && fs.existsSync(entry.file)) {
-    res.writeHead(200, { "content-type": entry.type });
+    res.writeHead(200, {
+      "content-type": entry.type,
+      // Never let the browser cache the UI — after a code update + pm2 restart,
+      // a plain refresh must always load the new dashboard.
+      "cache-control": "no-store",
+    });
     return res.end(fs.readFileSync(entry.file));
   }
 

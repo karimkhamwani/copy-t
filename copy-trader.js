@@ -133,7 +133,10 @@ function tradeKey(t) {
 // Trade journal + status (read by the dashboard)
 // ---------------------------------------------------------------------------
 
-const MAX_JOURNAL_ENTRIES = 500;
+// Rows WITHOUT a copy attempt (baseline/filtered/stale/pending) rotate in a
+// small pool so observation churn can't bloat the journal. Rows WITH a copy
+// attempt are NEVER evicted — the full lifetime copy history is kept.
+const MAX_OBSERVED_ENTRIES = 300;
 
 function loadJournal() {
   try {
@@ -164,32 +167,42 @@ function saveJournal() {
   writeJsonAtomic(TRADES_LOG_FILE, journal);
 }
 
+/** Evict oldest observed-only rows past the cap. Copied rows are never evicted. */
+function trimJournal() {
+  const isObserved = (e) => !e.copy;
+  let count = journal.reduce((n, e) => n + (isObserved(e) ? 1 : 0), 0);
+  for (let i = journal.length - 1; i >= 0 && count > MAX_OBSERVED_ENTRIES; i--) {
+    if (isObserved(journal[i])) {
+      journalIds.delete(journal[i].id);
+      journal.splice(i, 1);
+      count--;
+    }
+  }
+}
+
 /** Record a newly observed target trade (id = tradeKey). No-op if already logged. */
 function journalAdd(entry) {
   if (journalIds.has(entry.id)) return;
   journal.unshift(entry);
   journalIds.add(entry.id);
-  // Cap the journal, but never evict copied trades — the dashboard must keep
-  // showing every copy attempt across restarts. Only observed-but-not-copied
-  // rows (baseline/filtered/stale/pending) are dropped, oldest first.
-  while (journal.length > MAX_JOURNAL_ENTRIES) {
-    let dropIdx = -1;
-    for (let i = journal.length - 1; i >= 0; i--) {
-      if (!journal[i].copy) {
-        dropIdx = i;
-        break;
-      }
-    }
-    if (dropIdx === -1) break; // everything left is a copied trade — keep all
-    journalIds.delete(journal.splice(dropIdx, 1)[0].id);
-  }
+  trimJournal();
   saveJournal();
 }
 
-function journalUpdate(id, patch) {
-  const e = journal.find((e) => e.id === id);
+/**
+ * Patch a journal entry. If the row was evicted in the meantime (observed-pool
+ * churn), `base` re-inserts it so a copy attempt is NEVER lost from the journal.
+ */
+function journalUpdate(id, patch, base) {
+  let e = journal.find((e) => e.id === id);
+  if (!e && base) {
+    e = base;
+    journal.unshift(e);
+    journalIds.add(e.id);
+  }
   if (!e) return;
   Object.assign(e, patch);
+  trimJournal();
   saveJournal();
 }
 
@@ -486,18 +499,22 @@ async function pollUser(wallet, state) {
           ? amount / trade.price
           : 0
         : Number(resp.takingAmount) || 0;
-      journalUpdate(tradeKey(trade), {
-        status: "success",
-        copy: {
-          mode: isDryRun ? "dry" : "live",
-          copiedAt: Date.now(),
-          spentUsdc: Number(spent.toFixed(6)),
-          shares: Number(shares.toFixed(4)),
-          price: shares > 0 ? Number((spent / shares).toFixed(4)) : trade.price,
-          orderID: resp.orderID || null,
-          txHashes: resp.transactionsHashes || [],
+      journalUpdate(
+        tradeKey(trade),
+        {
+          status: "success",
+          copy: {
+            mode: isDryRun ? "dry" : "live",
+            copiedAt: Date.now(),
+            spentUsdc: Number(spent.toFixed(6)),
+            shares: Number(shares.toFixed(4)),
+            price: shares > 0 ? Number((spent / shares).toFixed(4)) : trade.price,
+            orderID: resp.orderID || null,
+            txHashes: resp.transactionsHashes || [],
+          },
         },
-      });
+        observedEntry(trade, wallet, "success"),
+      );
       if (maxTrades && tradesPlaced >= maxTrades) {
         log(
           `MAX_TRADES limit reached (${tradesPlaced}/${maxTrades}) — stopping. ` +
@@ -511,14 +528,18 @@ async function pollUser(wallet, state) {
         `${tag} FAILED to place order for ${tradeKey(trade)}:`,
         err.message || err,
       );
-      journalUpdate(tradeKey(trade), {
-        status: "failed",
-        copy: {
-          mode: isDryRun ? "dry" : "live",
-          copiedAt: Date.now(),
-          error: String(err.message || err),
+      journalUpdate(
+        tradeKey(trade),
+        {
+          status: "failed",
+          copy: {
+            mode: isDryRun ? "dry" : "live",
+            copiedAt: Date.now(),
+            error: String(err.message || err),
+          },
         },
-      });
+        observedEntry(trade, wallet, "failed"),
+      );
       // not marked seen -> retried next poll (until it goes stale)
     }
   }
