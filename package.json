@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node copy-trader.js",
     "dashboard": "node dashboard-server.js",
+    "reset": "node -e \"['trades-log.json','seen-trades.json','status.json'].forEach(f=>{try{require('fs').unlinkSync(f)}catch{}}); console.log('state reset — restart the trader to re-baseline')\"",
     "test": "node test.js"
   },
   "dependencies": {
