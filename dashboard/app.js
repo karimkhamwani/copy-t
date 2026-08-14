@@ -196,6 +196,11 @@ function Analytics({ copied }) {
   const pnl =
     wins.reduce((s, t) => s + ((t.copy?.shares || 0) - (t.copy?.spentUsdc || 0)), 0) -
     losses.reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
+  const totalSpent = ok.reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
+  // money still riding on unresolved markets
+  const active = ok
+    .filter((t) => t.result !== "win" && t.result !== "loss")
+    .reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
 
   return html`
     <div className="panel" style=${{ marginBottom: 16 }}>
@@ -206,6 +211,8 @@ function Analytics({ copied }) {
         <${StatTile} label="Losses" value=${losses.length} tone=${C_LOSS} />
         <${StatTile} label="Win rate" value=${winRate == null ? "—" : winRate + "%"} />
         <${StatTile} label="Net P/L (resolved)" value=${`${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)}`} tone=${resolved ? (pnl >= 0 ? C_WIN : C_LOSS) : null} />
+        <${StatTile} label="Total spent" value=${`$${totalSpent.toFixed(2)}`} />
+        <${StatTile} label="Active in trading" value=${`$${active.toFixed(2)}`} tone=${active > 0 ? "#4c9aff" : null} />
       </div>
       <div style=${{ padding: "0 14px 12px" }}>
         <${WinLossChart} copied=${copied} />

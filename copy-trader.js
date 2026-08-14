@@ -151,8 +151,19 @@ function journalAdd(entry) {
   if (journalIds.has(entry.id)) return;
   journal.unshift(entry);
   journalIds.add(entry.id);
+  // Cap the journal, but never evict copied trades — the dashboard must keep
+  // showing every copy attempt across restarts. Only observed-but-not-copied
+  // rows (baseline/filtered/stale/pending) are dropped, oldest first.
   while (journal.length > MAX_JOURNAL_ENTRIES) {
-    journalIds.delete(journal.pop().id);
+    let dropIdx = -1;
+    for (let i = journal.length - 1; i >= 0; i--) {
+      if (!journal[i].copy) {
+        dropIdx = i;
+        break;
+      }
+    }
+    if (dropIdx === -1) break; // everything left is a copied trade — keep all
+    journalIds.delete(journal.splice(dropIdx, 1)[0].id);
   }
   saveJournal();
 }
