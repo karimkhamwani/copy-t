@@ -22,6 +22,17 @@ function timeAgo(ms) {
   return new Date(ms).toLocaleString();
 }
 
+function uptime(ms) {
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s % 60}s`;
+  return `${s}s`;
+}
+
 function money(n) {
   return n == null ? "—" : `$${Number(n).toFixed(2)}`;
 }
@@ -325,6 +336,7 @@ function App() {
         ${status?.mode &&
         html`<span className=${`pill ${status.mode}`}>${status.mode === "dry" ? "DRY RUN" : "LIVE"}</span>`}
         <span className=${`pill ${online ? "on" : "off"}`}>${online ? "ENGINE ONLINE" : "ENGINE OFFLINE"}</span>
+        ${online && status?.startedAt && html`<span className="pill">up ${uptime(status.startedAt)}</span>`}
         ${status && html`
           <span className="stats">
             <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>

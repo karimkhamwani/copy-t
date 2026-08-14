@@ -207,6 +207,7 @@ function journalUpdate(id, patch, base) {
 }
 
 /** Heartbeat + config snapshot so the dashboard knows the engine is alive. */
+const engineStartedAt = Date.now();
 function writeStatus() {
   try {
     writeJsonAtomic(STATUS_FILE, {
@@ -217,6 +218,7 @@ function writeStatus() {
       maxTrades,
       tradesPlaced,
       targets: targetWallets,
+      startedAt: engineStartedAt,
       updatedAt: Date.now(),
     });
   } catch (err) {
