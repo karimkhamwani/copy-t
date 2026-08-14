@@ -137,63 +137,57 @@ function bucketize(copied) {
     }));
 }
 
+/* global Recharts */
+const {
+  ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis,
+  CartesianGrid, Tooltip, Legend, ReferenceLine, LabelList,
+} = Recharts;
+
+// Hardcoded theme colors for chart internals (SVG attributes can't use CSS vars)
+const CH = { grid: "#232a36", ink: "#7d8899", surface: "#161b24", tipBg: "#0a0d12" };
+const TIP_STYLE = {
+  contentStyle: { background: CH.tipBg, border: `1px solid ${CH.grid}`, borderRadius: 6, fontSize: 12 },
+  labelStyle: { color: "#dbe2ee" },
+  cursor: { fill: "rgba(125,136,153,0.08)" },
+};
+
 function WinLossChart({ copied }) {
-  const [tip, setTip] = useState(null);
   const buckets = bucketize(copied);
   if (buckets.length === 0)
     return html`<div className="empty">No resolved copies to chart yet</div>`;
 
-  const W = 640, H = 170, padL = 28, padB = 20, padT = 14;
-  const plotW = W - padL - 6, plotH = H - padT - padB;
-  const maxY = Math.max(...buckets.map((b) => b.total), 1);
-  const yTicks = maxY <= 4 ? maxY : 4;
-  const bw = Math.min(28, (plotW / buckets.length) * 0.6);
-  const step = plotW / buckets.length;
-  const y = (n) => padT + plotH - (n / maxY) * plotH;
-
-  const seg = (b, i, from, count, color, name) => {
-    if (!count) return null;
-    const x = padL + i * step + (step - bw) / 2;
-    const y0 = y(from), y1 = y(from + count);
-    return html`<rect
-      key=${name + i} x=${x} y=${y1} width=${bw} height=${Math.max(1, y0 - y1)}
-      rx="2" fill=${color} stroke="var(--panel)" strokeWidth="2"
-      onMouseEnter=${(e) => setTip({ x: e.clientX, y: e.clientY, text: `${b.label} — ${name}: ${count} (total ${b.total})` })}
-      onMouseLeave=${() => setTip(null)}
-    />`;
-  };
-
   return html`
-    <div style=${{ position: "relative" }}>
-      <svg viewBox=${`0 0 ${W} ${H}`} style=${{ width: "100%", display: "block" }}>
-        ${Array.from({ length: yTicks + 1 }, (_, i) => {
-          const v = Math.round((maxY / yTicks) * i);
-          return html`<g key=${"t" + i}>
-            <line x1=${padL} x2=${W - 6} y1=${y(v)} y2=${y(v)} stroke="var(--border)" strokeWidth="1" />
-            <text x=${padL - 6} y=${y(v) + 3} textAnchor="end" fontSize="9" fill="var(--dim)">${v}</text>
-          </g>`;
-        })}
-        ${buckets.map((b, i) => html`<g key=${"b" + i}>
-          ${seg(b, i, 0, b.win, C_WIN, "wins")}
-          ${seg(b, i, b.win, b.loss, C_LOSS, "losses")}
-          ${seg(b, i, b.win + b.loss, b.pending, C_PENDING, "pending")}
-          ${b.total > 0 && html`<text x=${padL + i * step + step / 2} y=${y(b.total) - 4}
-            textAnchor="middle" fontSize="9" fill="var(--dim)">${b.total}</text>`}
-          <text x=${padL + i * step + step / 2} y=${H - 6} textAnchor="middle" fontSize="9" fill="var(--dim)">${b.label}</text>
-        </g>`)}
-      </svg>
-      <div className="legend">
-        <span><i style=${{ background: C_WIN }}></i>Wins</span>
-        <span><i style=${{ background: C_LOSS }}></i>Losses</span>
-        <span><i style=${{ background: C_PENDING }}></i>Pending</span>
-      </div>
-      ${tip && html`<div className="tooltip" style=${{ left: 0, top: 0, position: "fixed", transform: `translate(${tip.x + 12}px, ${tip.y + 12}px)` }}>${tip.text}</div>`}
+    <${ResponsiveContainer} width="100%" height=${200}>
+      <${BarChart} data=${buckets} margin=${{ top: 14, right: 8, left: -24, bottom: 0 }} barCategoryGap="35%">
+        <${CartesianGrid} vertical=${false} stroke=${CH.grid} />
+        <${XAxis} dataKey="label" tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} />
+        <${YAxis} allowDecimals=${false} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false} />
+        <${Tooltip} ...${TIP_STYLE} />
+        <${Legend} wrapperStyle=${{ fontSize: 12 }} />
+        <${Bar} dataKey="win" name="Wins" stackId="a" fill=${C_WIN} stroke=${CH.surface} strokeWidth=${1} />
+        <${Bar} dataKey="loss" name="Losses" stackId="a" fill=${C_LOSS} stroke=${CH.surface} strokeWidth=${1} />
+        <${Bar} dataKey="pending" name="Pending" stackId="a" fill=${C_PENDING} stroke=${CH.surface} strokeWidth=${1}>
+          <${LabelList} dataKey="total" position="top" style=${{ fontSize: 10, fill: CH.ink }} />
+        <//>
+      <//>
+    <//>`;
+}
+
+function fmtMoney(v) {
+  return `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(2)}`;
+}
+
+function PnlTooltip({ active, payload }) {
+  if (!active || !payload || !payload.length) return null;
+  const p = payload[0].payload;
+  return html`
+    <div className="tooltip">
+      ${p.label} — ${p.result} ${fmtMoney(p.delta)} → total ${fmtMoney(p.cum)}
     </div>`;
 }
 
 /** Cumulative net P/L line over resolved copied trades, in copy order. */
 function PnlChart({ copied }) {
-  const [tip, setTip] = useState(null);
   const resolved = copied
     .filter((t) => t.status === "success" && (t.result === "win" || t.result === "loss"))
     .sort((a, b) => (a.copy?.copiedAt || 0) - (b.copy?.copiedAt || 0));
@@ -206,51 +200,33 @@ function PnlChart({ copied }) {
       ? (t.copy?.shares || 0) - (t.copy?.spentUsdc || 0)
       : -(t.copy?.spentUsdc || 0);
     cum += delta;
-    return { t, delta, cum, at: t.copy?.copiedAt };
+    return {
+      label: new Date(t.copy?.copiedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+      result: t.result,
+      delta: Number(delta.toFixed(2)),
+      cum: Number(cum.toFixed(2)),
+    };
   });
-
-  const W = 640, H = 150, padL = 40, padR = 10, padT = 12, padB = 18;
-  const plotW = W - padL - padR, plotH = H - padT - padB;
-  const lo = Math.min(0, ...pts.map((p) => p.cum));
-  const hi = Math.max(0, ...pts.map((p) => p.cum));
-  const span = hi - lo || 1;
-  const x = (i) => padL + (pts.length === 1 ? plotW / 2 : (i / (pts.length - 1)) * plotW);
-  const y = (v) => padT + plotH - ((v - lo) / span) * plotH;
-  const path = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.cum).toFixed(1)}`).join(" ");
   const last = pts[pts.length - 1];
-  const lineColor = "#4c9aff";
-  const labelEvery = Math.max(1, Math.ceil(pts.length / 8));
 
   return html`
-    <div style=${{ position: "relative" }}>
-      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>Net P/L over time (cumulative, resolved bets)</div>
-      <svg viewBox=${`0 0 ${W} ${H}`} style=${{ width: "100%", display: "block" }}>
-        ${[lo, (lo + hi) / 2, hi].map((v, i) => html`<g key=${"g" + i}>
-          <line x1=${padL} x2=${W - padR} y1=${y(v)} y2=${y(v)} stroke="var(--border)" strokeWidth="1" />
-          <text x=${padL - 6} y=${y(v) + 3} textAnchor="end" fontSize="9" fill="var(--dim)">$${v.toFixed(v % 1 ? 2 : 0)}</text>
-        </g>`)}
-        ${lo < 0 && hi > 0 &&
-        html`<line x1=${padL} x2=${W - padR} y1=${y(0)} y2=${y(0)} stroke="var(--gray)" strokeWidth="1" strokeDasharray="3 3" />`}
-        <path d=${path} fill="none" stroke=${lineColor} strokeWidth="2" strokeLinejoin="round" />
-        ${pts.map((p, i) => html`<g key=${"p" + i}>
-          <circle cx=${x(i)} cy=${y(p.cum)} r="2.5" fill=${lineColor} stroke="var(--panel)" strokeWidth="1.5" />
-          <circle cx=${x(i)} cy=${y(p.cum)} r="9" fill="transparent"
-            onMouseEnter=${(e) => setTip({
-              x: e.clientX, y: e.clientY,
-              text: `${new Date(p.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} — ${p.t.result === "win" ? "win" : "loss"} ${p.delta >= 0 ? "+" : "-"}$${Math.abs(p.delta).toFixed(2)} → total ${p.cum >= 0 ? "+" : "-"}$${Math.abs(p.cum).toFixed(2)}`,
-            })}
-            onMouseLeave=${() => setTip(null)} />
-          ${i % labelEvery === 0 &&
-          html`<text x=${x(i)} y=${H - 5} textAnchor="middle" fontSize="9" fill="var(--dim)">
-            ${new Date(p.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
-          </text>`}
-        </g>`)}
-        <text x=${x(pts.length - 1)} y=${y(last.cum) - 8} textAnchor="end" fontSize="10" fontWeight="700"
-          fill=${last.cum >= 0 ? C_WIN : C_LOSS}>
-          ${last.cum >= 0 ? "+" : "-"}$${Math.abs(last.cum).toFixed(2)}
-        </text>
-      </svg>
-      ${tip && html`<div className="tooltip" style=${{ left: 0, top: 0, position: "fixed", transform: `translate(${tip.x + 12}px, ${tip.y + 12}px)` }}>${tip.text}</div>`}
+    <div>
+      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
+        Net P/L over time (cumulative, resolved bets) —${" "}
+        <b style=${{ color: last.cum >= 0 ? C_WIN : C_LOSS }}>${fmtMoney(last.cum)}</b>
+      </div>
+      <${ResponsiveContainer} width="100%" height=${180}>
+        <${LineChart} data=${pts} margin=${{ top: 10, right: 12, left: -16, bottom: 0 }}>
+          <${CartesianGrid} vertical=${false} stroke=${CH.grid} />
+          <${XAxis} dataKey="label" tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} interval="preserveStartEnd" minTickGap=${30} />
+          <${YAxis} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false} tickFormatter=${(v) => `$${v}`} domain=${["auto", "auto"]} />
+          <${Tooltip} content=${html`<${PnlTooltip} />`} cursor=${{ stroke: CH.ink, strokeDasharray: "3 3" }} />
+          <${ReferenceLine} y=${0} stroke=${CH.ink} strokeDasharray="3 3" />
+          <${Line} type="monotone" dataKey="cum" name="Net P/L" stroke="#4c9aff" strokeWidth=${2}
+            dot=${{ r: 2.5, fill: "#4c9aff", stroke: CH.surface, strokeWidth: 1.5 }}
+            activeDot=${{ r: 5 }} isAnimationActive=${false} />
+        <//>
+      <//>
     </div>`;
 }
 

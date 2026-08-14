@@ -36,6 +36,14 @@ const STATIC_FILES = {
     file: path.join(__dirname, "node_modules", "htm", "dist", "htm.js"),
     type: "text/javascript",
   },
+  "/vendor/prop-types.js": {
+    file: path.join(__dirname, "node_modules", "prop-types", "prop-types.min.js"),
+    type: "text/javascript",
+  },
+  "/vendor/recharts.js": {
+    file: path.join(__dirname, "node_modules", "recharts", "umd", "Recharts.js"),
+    type: "text/javascript",
+  },
 };
 
 function readJson(file, fallback) {
