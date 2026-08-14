@@ -21,9 +21,9 @@ npm start
 3. Dedupe by `transactionHash:asset`, persisted in `seen-trades.json` so restarts
    don't re-place old trades. Each wallet is baselined independently the first time
    it's watched — adding a new wallet later never copies its old history.
-4. For each new trade, place a market BUY on the same token with a fixed **$1**
-   test bet (hardcoded as `BET_USDC` in copy-trader.js — Polymarket's minimum),
-   regardless of the target's trade size. Failed orders are retried on the next poll.
+4. For each new trade, place a market BUY on the same token spending a fixed
+   `MAX_BET_USDC` (env, default $1 — Polymarket's minimum), regardless of the
+   target's trade size. Failed orders are retried on the next poll.
 
 ## Env vars
 
@@ -38,6 +38,7 @@ const TARGET_WALLETS = [
 | Var | Meaning |
 | --- | --- |
 | `TARGET_USERS` | Optional override: comma-separated addresses (mainly for tests) |
+| `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1) |
 | `POLL_INTERVAL_MS` | Poll interval, default 30000 |
 | `DRY_RUN` | `1` = log orders instead of placing (default in .env.example) |
 | `PRIVATE_KEY` | Your signing key (only needed when `DRY_RUN=0`) |

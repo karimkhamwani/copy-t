@@ -5,7 +5,7 @@
  * - Filters to BUY trades only
  * - Dedupes by transactionHash + asset (persisted to seen-trades.json)
  * - Mirrors each new trade as a FOK market BUY order via the CLOB client
- * - Every copied bet is a fixed $1 (BET_USDC), regardless of their trade size
+ * - Every copied bet spends a fixed MAX_BET_USDC (env, default $1), regardless of their trade size
  * - DRY_RUN=1 logs orders instead of placing them
  */
 
@@ -18,8 +18,10 @@ const path = require("path");
 // ---------------------------------------------------------------------------
 
 const TARGET_WALLETS = [
-  { address: "0x30c7ac0158499ddc6761047f7f69bcf7d036ac3b", category: "esports" },
-  { address: "0x0cb038487586d1119b165466072e9baf666f3a90", category: "esports" },
+  {
+    address: "0x30c7ac0158499ddc6761047f7f69bcf7d036ac3b",
+    category: "esports",
+  },
 ];
 
 const {
@@ -30,12 +32,14 @@ const {
   FUNDER_ADDRESS,
   SIGNATURE_TYPE = "1",
   POLL_INTERVAL_MS = "30000",
+  MAX_BET_USDC = "1",
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
 } = process.env;
 
 const CHAIN_ID = 137; // Polygon mainnet
-const BET_USDC = 1; // hardcoded $1 per copied test bet (also Polymarket's minimum)
+const MIN_ORDER_USDC = 1; // Polymarket minimum for market orders
+const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, default $1)
 
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
@@ -45,7 +49,9 @@ function normalizeWallets(list) {
   const out = [];
   const seen = new Set();
   for (const w of list || []) {
-    const address = String(w.address || "").trim().toLowerCase();
+    const address = String(w.address || "")
+      .trim()
+      .toLowerCase();
     if (!address || seen.has(address)) continue;
     seen.add(address);
     out.push({ address, category: w.category || "uncategorized" });
@@ -56,7 +62,7 @@ function normalizeWallets(list) {
 const targetWallets = normalizeWallets(
   TARGET_USERS
     ? TARGET_USERS.split(",").map((a) => ({ address: a, category: "env" }))
-    : TARGET_WALLETS
+    : TARGET_WALLETS,
 );
 
 function log(...args) {
@@ -74,7 +80,10 @@ function loadState() {
       // legacy format: plain array of seen keys, no per-wallet baseline info
       return { seen: new Set(raw), baselined: new Set() };
     }
-    return { seen: new Set(raw.seen || []), baselined: new Set(raw.baselined || []) };
+    return {
+      seen: new Set(raw.seen || []),
+      baselined: new Set(raw.baselined || []),
+    };
   } catch {
     return { seen: new Set(), baselined: new Set() };
   }
@@ -83,7 +92,11 @@ function loadState() {
 function saveState(state) {
   fs.writeFileSync(
     SEEN_FILE,
-    JSON.stringify({ seen: [...state.seen], baselined: [...state.baselined] }, null, 2)
+    JSON.stringify(
+      { seen: [...state.seen], baselined: [...state.baselined] },
+      null,
+      2,
+    ),
   );
 }
 
@@ -116,7 +129,7 @@ function filterBuys(activity) {
       (a.type === undefined || String(a.type).toUpperCase() === "TRADE") &&
       String(a.side || "").toUpperCase() === "BUY" &&
       a.asset &&
-      a.transactionHash
+      a.transactionHash,
   );
 }
 
@@ -125,7 +138,7 @@ function pickNewTrades(buys, seen) {
   return buys.filter((t) => !seen.has(tradeKey(t)));
 }
 
-/** Fixed $1 test bet for every copied trade (ignores their trade size). */
+/** Fixed bet per copied trade: MAX_BET_USDC from env (ignores their trade size). */
 function betAmount() {
   return BET_USDC;
 }
@@ -146,9 +159,23 @@ async function getClobClient() {
   const sigType = Number(SIGNATURE_TYPE);
 
   // First client only to derive API creds, then the real one with creds
-  const bootstrap = new ClobClient(CLOB_API_HOST, CHAIN_ID, signer, undefined, sigType, FUNDER_ADDRESS);
+  const bootstrap = new ClobClient(
+    CLOB_API_HOST,
+    CHAIN_ID,
+    signer,
+    undefined,
+    sigType,
+    FUNDER_ADDRESS,
+  );
   const creds = await bootstrap.createOrDeriveApiKey();
-  clobClient = new ClobClient(CLOB_API_HOST, CHAIN_ID, signer, creds, sigType, FUNDER_ADDRESS);
+  clobClient = new ClobClient(
+    CLOB_API_HOST,
+    CHAIN_ID,
+    signer,
+    creds,
+    sigType,
+    FUNDER_ADDRESS,
+  );
   clobClient._Side = Side;
   clobClient._OrderType = OrderType;
   return clobClient;
@@ -158,7 +185,7 @@ async function placeMarketBuy(trade, amountUsdc) {
   if (isDryRun) {
     log(
       `[DRY_RUN] would market-BUY $${amountUsdc} of "${trade.outcome}" ` +
-        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price})`
+        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price})`,
     );
     return { dryRun: true };
   }
@@ -208,14 +235,17 @@ async function pollUser(wallet, state) {
     const amount = betAmount();
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
-        `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`
+        `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
     );
     try {
       await placeMarketBuy(trade, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
     } catch (err) {
-      log(`${tag} FAILED to place order for ${tradeKey(trade)}:`, err.message || err);
+      log(
+        `${tag} FAILED to place order for ${tradeKey(trade)}:`,
+        err.message || err,
+      );
       // not marked seen -> retried next poll
     }
   }
@@ -226,25 +256,40 @@ async function pollOnce(state) {
     try {
       await pollUser(wallet, state);
     } catch (err) {
-      log(`[${wallet.category}:${wallet.address}] poll error:`, err.message || err);
+      log(
+        `[${wallet.category}:${wallet.address}] poll error:`,
+        err.message || err,
+      );
     }
   }
 }
 
 async function main() {
   if (targetWallets.length === 0) {
-    console.error("TARGET_WALLETS in copy-trader.js is empty — add at least one {address, category}");
+    console.error(
+      "TARGET_WALLETS in copy-trader.js is empty — add at least one {address, category}",
+    );
     process.exit(1);
   }
   if (!isDryRun && (!PRIVATE_KEY || !FUNDER_ADDRESS)) {
-    console.error("PRIVATE_KEY and FUNDER_ADDRESS are required unless DRY_RUN=1");
+    console.error(
+      "PRIVATE_KEY and FUNDER_ADDRESS are required unless DRY_RUN=1",
+    );
+    process.exit(1);
+  }
+  if (!Number.isFinite(BET_USDC) || BET_USDC < MIN_ORDER_USDC) {
+    console.error(
+      `MAX_BET_USDC must be a number >= ${MIN_ORDER_USDC} (Polymarket minimum)`,
+    );
     process.exit(1);
   }
 
   log(
     `copy-trader started: targets=[${targetWallets
       .map((w) => `${w.category}:${w.address}`)
-      .join(", ")}] interval=${pollInterval}ms bet=$${BET_USDC} (fixed) dryRun=${isDryRun}`
+      .join(
+        ", ",
+      )}] interval=${pollInterval}ms bet=$${BET_USDC} (fixed) dryRun=${isDryRun}`,
   );
 
   const state = loadState();
@@ -260,4 +305,11 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, TARGET_WALLETS };
+module.exports = {
+  filterBuys,
+  pickNewTrades,
+  betAmount,
+  tradeKey,
+  normalizeWallets,
+  TARGET_WALLETS,
+};
