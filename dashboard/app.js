@@ -311,6 +311,8 @@ function App() {
     failed: (t) => t.status === "failed",
   };
   const [copySort, setCopySort] = useState("recent"); // recent | bet-desc | bet-asc
+  const nextSort = { recent: "bet-desc", "bet-desc": "bet-asc", "bet-asc": "recent" };
+  const sortLabel = { recent: "recent", "bet-desc": "bet ↓", "bet-asc": "bet ↑" };
 
   const shownCopied = copied
     .filter(copyFilterFn[copyFilter] || copyFilterFn.all)
@@ -356,20 +358,20 @@ function App() {
 
         <div className="panel">
           <h2>
-            <span>Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}</span>
-            <span className="controls">
-              <select value=${copyFilter} onChange=${(e) => setCopyFilter(e.target.value)}>
-                <option value="all">All statuses</option>
-                <option value="win">Win</option>
-                <option value="loss">Loss</option>
-                <option value="pending">Pending</option>
-                <option value="failed">Failed</option>
-              </select>
-              <select value=${copySort} onChange=${(e) => setCopySort(e.target.value)}>
-                <option value="recent">Newest first</option>
-                <option value="bet-desc">Bet: high → low</option>
-                <option value="bet-asc">Bet: low → high</option>
-              </select>
+            Copied trades (${copied.length}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            <span className="filters">
+              ${["all", "win", "loss", "pending", "failed"].map(
+                (f) => html`<button
+                  key=${f}
+                  className=${copyFilter === f ? "on" : ""}
+                  onClick=${() => setCopyFilter(f)}
+                >${f}</button>`,
+              )}
+              <button
+                className=${copySort === "recent" ? "" : "on"}
+                title="Sort: newest first / bet value high-low / bet value low-high"
+                onClick=${() => setCopySort(nextSort[copySort])}
+              >sort: ${sortLabel[copySort]}</button>
             </span>
           </h2>
           <div className="list">
