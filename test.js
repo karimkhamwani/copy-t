@@ -25,10 +25,16 @@ assert.strictEqual(fresh[0].transactionHash, "0xccc");
 fresh.forEach((t) => seen.add(tradeKey(t)));
 assert.strictEqual(pickNewTrades(buys, seen).length, 0);
 
-// 4. Bet sizing: always the fixed $1, regardless of their trade size
-assert.strictEqual(betAmount({ usdcSize: 50 }), 1);
-assert.strictEqual(betAmount({ usdcSize: 0.5 }), 1);
-assert.strictEqual(betAmount({}), 1);
+// 4. Bet sizing
+// fixed mode (default): always MAX_BET_USDC, regardless of their trade size
+assert.strictEqual(betAmount({ usdcSize: 50 }, { mirror: false, cap: 1 }), 1);
+assert.strictEqual(betAmount({ usdcSize: 0.5 }, { mirror: false, cap: 1 }), 1);
+assert.strictEqual(betAmount({}, { mirror: false, cap: 1 }), 1);
+// mirror mode: match trader's size, capped, floored at $1 minimum
+assert.strictEqual(betAmount({ usdcSize: 50 }, { mirror: true, cap: 10 }), 10); // capped
+assert.strictEqual(betAmount({ usdcSize: 3.5 }, { mirror: true, cap: 10 }), 3.5); // matched
+assert.strictEqual(betAmount({ usdcSize: 0.4 }, { mirror: true, cap: 10 }), 1); // $1 floor
+assert.strictEqual(betAmount({}, { mirror: true, cap: 10 }), 10); // no size -> cap
 
 // 5. Wallet list normalization: trims, lowercases, dedupes by address, defaults category
 assert.deepStrictEqual(

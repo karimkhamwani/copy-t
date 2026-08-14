@@ -269,7 +269,7 @@ function App() {
         <span className=${`pill ${online ? "on" : "off"}`}>${online ? "ENGINE ONLINE" : "ENGINE OFFLINE"}</span>
         ${status && html`
           <span className="stats">
-            <span>bet ${money(status.betUsdc)}</span>
+            <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>
             <span>poll ${(status.pollIntervalMs || 0) / 1000}s</span>
             <span>placed ${status.tradesPlaced ?? 0}${status.maxTrades ? `/${status.maxTrades}` : ""}</span>
             <span>

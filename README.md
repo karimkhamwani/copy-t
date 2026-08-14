@@ -70,7 +70,8 @@ and ignores everything else that wallet trades. Add more keywords to widen it
 | Var | Meaning |
 | --- | --- |
 | `TARGET_USERS` | Optional override: comma-separated addresses (mainly for tests) |
-| `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1) |
+| `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1). With mirror mode on, this is the cap |
+| `MIRROR_TRADER_BET` | `1` = bet what the trader bet, capped at `MAX_BET_USDC` (min $1). `0` = fixed bet (default) |
 | `MAX_TRADES` | Stop after this many placed trades (0 = unlimited). Use `1` for the first live run |
 | `MAX_TRADE_AGE_SEC` | Skip trades older than this (default 120s) — avoids chasing expired fast markets |
 | `POLL_INTERVAL_MS` | Poll interval, default 5000 (5s) |

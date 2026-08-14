@@ -39,6 +39,7 @@ const {
   SIGNATURE_TYPE = "1",
   POLL_INTERVAL_MS = "5000",
   MAX_BET_USDC = "1",
+  MIRROR_TRADER_BET = "0", // 1 = bet what the trader bet (capped by MAX_BET_USDC)
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
   MAX_TRADE_AGE_SEC = "120", // skip trades older than this (avoids expired fast markets)
   DRY_RUN = "0",
@@ -52,6 +53,7 @@ const MIN_ORDER_USDC = 1; // Polymarket minimum for market orders
 const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, default $1)
 
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
+const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
 const maxTradeAgeSec = Number(MAX_TRADE_AGE_SEC) || 120;
@@ -197,6 +199,7 @@ function writeStatus() {
     writeJsonAtomic(STATUS_FILE, {
       mode: isDryRun ? "dry" : "live",
       betUsdc: BET_USDC,
+      betMode: mirrorBet ? "mirror" : "fixed",
       pollIntervalMs: pollInterval,
       maxTrades,
       tradesPlaced,
@@ -303,9 +306,17 @@ function splitStale(trades, nowSec, maxAgeSec) {
   return { copyable, stale };
 }
 
-/** Fixed bet per copied trade: MAX_BET_USDC from env (ignores their trade size). */
-function betAmount() {
-  return BET_USDC;
+/**
+ * USDC to spend on a copied trade.
+ * - default: fixed MAX_BET_USDC, ignoring the trader's size
+ * - MIRROR_TRADER_BET=1: match the trader's usdcSize, capped at MAX_BET_USDC
+ *   and floored at Polymarket's $1 minimum
+ */
+function betAmount(trade, { mirror = mirrorBet, cap = BET_USDC } = {}) {
+  if (!mirror) return cap;
+  const theirs = Number(trade?.usdcSize);
+  if (!Number.isFinite(theirs) || theirs <= 0) return cap;
+  return Math.max(MIN_ORDER_USDC, Math.min(theirs, cap));
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +470,7 @@ async function pollUser(wallet, state) {
 
   for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
-    const amount = betAmount();
+    const amount = betAmount(trade);
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
         `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
@@ -563,7 +574,9 @@ async function main() {
       )
       .join(
         ", ",
-      )}] interval=${pollInterval}ms bet=$${BET_USDC} (fixed) dryRun=${isDryRun} ` +
+      )}] interval=${pollInterval}ms bet=${
+        mirrorBet ? `mirror (cap $${BET_USDC})` : `$${BET_USDC} (fixed)`
+      } dryRun=${isDryRun} ` +
       `maxTrades=${maxTrades || "unlimited"}`,
   );
 
