@@ -11,6 +11,7 @@ const BADGE_LABEL = {
   filtered: "FILTERED",
   stale: "STALE",
   baseline: "BASELINE",
+  "min-skip": "MIN SKIP",
 };
 
 function timeAgo(ms) {

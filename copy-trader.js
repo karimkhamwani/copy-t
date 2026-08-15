@@ -40,6 +40,7 @@ const {
   POLL_INTERVAL_MS = "5000",
   MAX_BET_USDC = "1",
   MIRROR_TRADER_BET = "0", // 1 = bet what the trader bet (capped by MAX_BET_USDC)
+  SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
   MAX_TRADE_AGE_SEC = "120", // skip trades older than this (avoids expired fast markets)
   DRY_RUN = "0",
@@ -54,6 +55,7 @@ const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, d
 
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
 const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() === "true";
+const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
 const maxTradeAgeSec = Number(MAX_TRADE_AGE_SEC) || 120;
@@ -423,7 +425,7 @@ function observedEntry(trade, wallet, status) {
     theirPrice: trade.price,
     theirUsdc: trade.usdcSize,
     theirShares: trade.size,
-    status, // baseline | filtered | stale | pending | success | failed
+    status, // baseline | filtered | stale | pending | min-skip | success | failed
     copy: null, // filled in when we attempt the copy
   };
 }
@@ -485,6 +487,29 @@ async function pollUser(wallet, state) {
 
   for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
+
+    // Exact mirroring below Polymarket's $1 order minimum is impossible —
+    // optionally skip those trades instead of rounding the bet up to $1.
+    if (
+      mirrorBet &&
+      skipBelowMin &&
+      Number(trade.usdcSize) > 0 &&
+      Number(trade.usdcSize) < MIN_ORDER_USDC
+    ) {
+      state.seen.add(tradeKey(trade));
+      saveState(state);
+      journalUpdate(
+        tradeKey(trade),
+        { status: "min-skip" },
+        observedEntry(trade, wallet, "min-skip"),
+      );
+      log(
+        `${tag} their bet $${trade.usdcSize} is under the $${MIN_ORDER_USDC} ` +
+          `order minimum — skipping "${trade.title}" (SKIP_BELOW_MIN=1)`,
+      );
+      continue;
+    }
+
     const amount = betAmount(trade);
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
@@ -600,7 +625,8 @@ async function main() {
       )}] interval=${pollInterval}ms bet=${
         mirrorBet ? `mirror (cap $${BET_USDC})` : `$${BET_USDC} (fixed)`
       } dryRun=${isDryRun} ` +
-      `maxTrades=${maxTrades || "unlimited"}`,
+      `maxTrades=${maxTrades || "unlimited"} ` +
+      `skipBelowMin=${skipBelowMin ? "on" : "off"}`,
   );
 
   const state = loadState();
