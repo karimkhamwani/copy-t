@@ -18,7 +18,7 @@ module.exports = [
   {
     address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
     category: "crypto",
-    sub_category: ["btc-updown-5m"],
+    sub_category: ["eth-updown-5m"],
     max_trade_age_sec: 30, // 5m markets expire fast — don't chase old entries
   },
 ];
