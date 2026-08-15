@@ -60,64 +60,32 @@ function readJson(file, fallback) {
 }
 
 // ---------------------------------------------------------------------------
-// Win/loss resolution via the CLOB markets API (GET /markets/{condition_id}).
-// The gamma API stops returning fast markets (5-minute up/down) once they close,
-// so resolved ones would stay "pending" forever there. The CLOB API keeps them
-// and flags the winning token directly: tokens[].winner.
-// Resolved markets are cached forever; unresolved ones are re-checked every 60s.
+// Win/loss resolution via the CLOB markets API — shared cache module (the
+// trader's risk gate uses the same one). The gamma API stops returning fast
+// markets (5-minute up/down) once they close, so resolved ones would stay
+// "pending" forever there; the CLOB API keeps them and flags tokens[].winner.
 // ---------------------------------------------------------------------------
 
-const resolutionCache = new Map(); // conditionId -> { resolved, tokens, checkedAt }
-const PENDING_RECHECK_MS = 60000;
-const MAX_LOOKUPS_PER_REQUEST = 10;
+const { createResolutionCache } = require("./market-resolution.js");
 
-async function fetchResolution(conditionId) {
-  const now = Date.now();
-  try {
-    const res = await fetch(`${CLOB_API_HOST}/markets/${conditionId}`, {
+const resolutions = createResolutionCache({
+  host: CLOB_API_HOST,
+  fetchJson: async (url) => {
+    const res = await fetch(url, {
       headers: { accept: "application/json" },
       signal: AbortSignal.timeout(10000), // a hung request must not stall /api/trades
     });
     if (!res.ok) throw new Error(`clob API ${res.status}`);
-    const m = await res.json();
-    const tokens = (m.tokens || []).map((t) => ({
-      tokenId: t.token_id,
-      outcome: t.outcome,
-      winner: Boolean(t.winner),
-    }));
-    resolutionCache.set(conditionId, {
-      // resolved once a winner is flagged (closed alone isn't enough)
-      resolved: Boolean(m.closed) && tokens.some((t) => t.winner),
-      tokens,
-      checkedAt: now,
-    });
-  } catch {
-    // offline/blocked/unknown market -> stays "pending", re-checked later
-    if (!resolutionCache.get(conditionId)?.resolved) {
-      resolutionCache.set(conditionId, {
-        resolved: false,
-        tokens: [],
-        checkedAt: now,
-      });
-    }
-  }
-}
+    return res.json();
+  },
+});
 
-async function refreshResolutions(entries) {
-  const now = Date.now();
-  const need = [
-    ...new Set(
-      entries
-        .filter((e) => e.copy && e.status === "success" && e.conditionId)
-        .map((e) => e.conditionId)
-        .filter((id) => {
-          const c = resolutionCache.get(id);
-          return !c || (!c.resolved && now - c.checkedAt > PENDING_RECHECK_MS);
-        }),
-    ),
-  ].slice(0, MAX_LOOKUPS_PER_REQUEST);
-  if (need.length === 0) return;
-  await Promise.all(need.map(fetchResolution));
+function refreshResolutions(entries) {
+  return resolutions.refresh(
+    entries
+      .filter((e) => e.copy && e.status === "success")
+      .map((e) => e.conditionId),
+  );
 }
 
 /** The outcome token this entry bought (journal id is "txHash:asset"). */
@@ -128,7 +96,7 @@ function entryTokenId(entry) {
 /** win | loss | pending for a successfully copied trade, undefined otherwise. */
 function resultFor(entry) {
   if (!entry.copy || entry.status !== "success") return undefined;
-  const c = entry.conditionId && resolutionCache.get(entry.conditionId);
+  const c = entry.conditionId && resolutions.get(entry.conditionId);
   if (!c || !c.resolved) return "pending";
   const mine = c.tokens.find((t) => t.tokenId === entryTokenId(entry));
   if (mine) return mine.winner ? "win" : "loss";

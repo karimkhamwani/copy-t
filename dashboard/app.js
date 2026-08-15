@@ -12,6 +12,7 @@ const BADGE_LABEL = {
   stale: "STALE",
   baseline: "BASELINE",
   "min-skip": "MIN SKIP",
+  "risk-skip": "RISK SKIP",
 };
 
 function timeAgo(ms) {
@@ -379,7 +380,7 @@ function MarketBetsChart({ copied, selectedMarket, onSelectMarket }) {
     </div>`;
 }
 
-function Analytics({ copied, selectedMarket, onSelectMarket }) {
+function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
   const ok = copied.filter((t) => t.status === "success");
   const wins = ok.filter((t) => t.result === "win");
   const losses = ok.filter((t) => t.result === "loss");
@@ -396,6 +397,16 @@ function Analytics({ copied, selectedMarket, onSelectMarket }) {
     .filter((t) => t.result !== "win" && t.result !== "loss")
     .reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
 
+  // risk-gate cap: MAX_ACTIVE_PCT of bankroll (balance + active)
+  const balance = status?.mode === "dry" ? status?.paperBalance : status?.balance;
+  const cap = status?.maxActivePct && balance != null
+    ? (status.maxActivePct / 100) * (balance + active)
+    : null;
+  const capUsage = cap > 0 ? active / cap : 0;
+  const activeTone = cap == null
+    ? active > 0 ? "#4c9aff" : null
+    : capUsage >= 0.999 ? C_LOSS : capUsage >= 0.9 ? "#f0a13a" : "#4c9aff";
+
   return html`
     <div className="panel" style=${{ marginBottom: 16 }}>
       <h2>Analytics</h2>
@@ -408,7 +419,11 @@ function Analytics({ copied, selectedMarket, onSelectMarket }) {
         <${StatTile} label="Lifetime profit" value=${`+$${totalProfit.toFixed(2)}`} tone=${totalProfit > 0 ? C_WIN : null} />
         <${StatTile} label="Lifetime loss" value=${`-$${totalLoss.toFixed(2)}`} tone=${totalLoss > 0 ? C_LOSS : null} />
         <${StatTile} label="Total spent" value=${`$${totalSpent.toFixed(2)}`} />
-        <${StatTile} label="Active in trading" value=${`$${active.toFixed(2)}`} tone=${active > 0 ? "#4c9aff" : null} />
+        <${StatTile}
+          label=${cap != null ? `Active in trading (${status.maxActivePct}% cap)` : "Active in trading"}
+          value=${cap != null ? `$${active.toFixed(2)} / $${cap.toFixed(2)}` : `$${active.toFixed(2)}`}
+          tone=${activeTone}
+        />
       </div>
       <div style=${{ padding: "0 14px 12px" }}>
         <${WinLossChart} copied=${copied} />
@@ -510,12 +525,18 @@ function App() {
             </span>
           </span>`}
         <span className="balance">
-          <span className="balance-label">Balance</span>
-          <span className="balance-value">${balance != null ? money(balance) : "—"}</span>
+          <span className="balance-label">
+            Balance${status?.mode === "dry" && status?.paperBalance != null ? " (paper)" : ""}
+          </span>
+          <span className="balance-value">
+            ${status?.mode === "dry" && status?.paperBalance != null
+              ? money(status.paperBalance)
+              : balance != null ? money(balance) : "—"}
+          </span>
         </span>
       </div>
 
-      <${Analytics} copied=${copied} selectedMarket=${selectedMarket} onSelectMarket=${setSelectedMarket} />
+      <${Analytics} copied=${copied} status=${status} selectedMarket=${selectedMarket} onSelectMarket=${setSelectedMarket} />
 
       <div className="cols">
         <div className="panel">

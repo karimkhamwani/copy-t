@@ -15,6 +15,7 @@ const path = require("path");
 
 // Wallets to copy live in target-wallets.js — edit that file to add/remove users
 const TARGET_WALLETS = require("./target-wallets.js");
+const { createResolutionCache } = require("./market-resolution.js");
 
 const {
   DATA_API_HOST = "https://data-api.polymarket.com",
@@ -28,6 +29,9 @@ const {
   MIRROR_TRADER_BET = "0", // 1 = bet what the trader bet (capped by MAX_BET_USDC)
   SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
+  MAX_ACTIVE_PCT = "50", // cap: active bets <= this % of (balance + active). 0 = gate disabled
+  DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
+  RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
@@ -39,6 +43,7 @@ const MIN_ORDER_USDC = 1; // Polymarket minimum for market orders
 const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, default $1)
 
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
+const maxActivePct = Math.max(0, Number(MAX_ACTIVE_PCT) || 0); // 0 = disabled
 const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() === "true";
 const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
@@ -216,6 +221,26 @@ function loadStartedAt() {
   return Date.now();
 }
 const engineStartedAt = loadStartedAt();
+
+/**
+ * Dry-run paper balance survives restarts the same way startedAt does: reuse
+ * the value from the previous status file; a fresh start (`yarn reset`)
+ * re-seeds it from DRY_RUN_BALANCE_USDC.
+ */
+function loadPaperBalance() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
+    if (Number.isFinite(s.paperBalance)) return s.paperBalance;
+  } catch {
+    /* fresh start */
+  }
+  return Number(DRY_RUN_BALANCE_USDC) || 0;
+}
+let paperBalance = isDryRun ? loadPaperBalance() : null;
+
+// Last risk-gate snapshot, surfaced to the dashboard via status.json
+let riskSnapshot = { balance: null, activeUsdc: null, riskSkipped: 0 };
+
 function writeStatus() {
   try {
     writeJsonAtomic(STATUS_FILE, {
@@ -227,6 +252,11 @@ function writeStatus() {
       tradesPlaced,
       targets: targetWallets,
       startedAt: engineStartedAt,
+      maxActivePct,
+      paperBalance: isDryRun ? paperBalance : undefined,
+      balance: riskSnapshot.balance,
+      activeUsdc: riskSnapshot.activeUsdc,
+      riskSkipped: riskSnapshot.riskSkipped,
       updatedAt: Date.now(),
     });
   } catch (err) {
@@ -354,7 +384,7 @@ async function getClobClient() {
 
   // CLOB v2: Polymarket archived @polymarket/clob-client — orders from it are
   // rejected with "invalid order version". clob-client-v2 requires Node >= 20.10.
-  const { ClobClient, Side, OrderType } =
+  const { ClobClient, Side, OrderType, AssetType } =
     await import("@polymarket/clob-client-v2");
   const { Wallet } = require("@ethersproject/wallet");
 
@@ -380,6 +410,7 @@ async function getClobClient() {
   });
   clobClient._Side = Side;
   clobClient._OrderType = OrderType;
+  clobClient._AssetType = AssetType;
   return clobClient;
 }
 
@@ -412,6 +443,122 @@ async function placeMarketBuy(trade, amountUsdc) {
     );
   }
   return resp;
+}
+
+// ---------------------------------------------------------------------------
+// Risk gate: cap active-in-trading at MAX_ACTIVE_PCT of the bankroll
+// ---------------------------------------------------------------------------
+
+// Market resolution via CLOB /markets/{condition_id} — shared cache module,
+// same one the dashboard server uses for win/loss display.
+const resolutions = createResolutionCache({
+  host: CLOB_API_HOST,
+  fetchJson: getJson,
+  recheckMs: Number(RESOLUTION_RECHECK_MS) || 0,
+});
+
+/** Successful copies from the journal (the positions the gate accounts for). */
+function successfulCopies() {
+  return journal.filter((e) => e.copy && e.status === "success");
+}
+
+function refreshResolutions() {
+  return resolutions.refresh(
+    successfulCopies()
+      .filter((e) => !e.copy.settled)
+      .map((e) => e.conditionId),
+  );
+}
+
+/**
+ * Mark resolved copies as settled (so they leave "active" permanently).
+ * Dry-run: also credit win payouts to the paper balance — winners pay $1/share,
+ * losers pay nothing (the spend was already debited at bet time).
+ */
+function settleResolvedCopies() {
+  for (const e of successfulCopies()) {
+    if (e.copy.settled) continue;
+    const c = e.conditionId && resolutions.get(e.conditionId);
+    if (!c || !c.resolved) continue;
+    const tokenId = e.asset || String(e.id || "").split(":")[1] || "";
+    const won = c.tokens.some((t) => t.tokenId === tokenId && t.winner);
+    if (isDryRun && e.copy.mode === "dry" && won) {
+      paperBalance += e.copy.shares || 0;
+    }
+    journalUpdate(e.id, { copy: { ...e.copy, settled: true, won } });
+  }
+}
+
+/** USDC committed to copies whose market hasn't resolved yet (cost basis). */
+function getActiveUsdc() {
+  let sum = 0;
+  for (const e of successfulCopies()) {
+    const c = e.conditionId && resolutions.get(e.conditionId);
+    if (e.copy.settled || (c && c.resolved)) continue;
+    sum += e.copy.spentUsdc || 0;
+  }
+  return sum;
+}
+
+const BALANCE_TTL_MS = 30000;
+let balanceCache = { value: null, fetchedAt: 0 };
+
+/** Spendable USDC: paper balance in dry-run, CLOB getBalanceAllowance live. */
+async function getUsdcBalance() {
+  if (isDryRun) return paperBalance;
+  const now = Date.now();
+  if (balanceCache.value != null && now - balanceCache.fetchedAt < BALANCE_TTL_MS)
+    return balanceCache.value;
+  const client = await getClobClient();
+  const resp = await client.getBalanceAllowance({
+    asset_type: client._AssetType.COLLATERAL,
+  });
+  const raw = Number(resp?.balance); // micro-USDC string (6 decimals)
+  if (!Number.isFinite(raw)) throw new Error("balance API returned no balance");
+  balanceCache = { value: raw / 1e6, fetchedAt: now };
+  return balanceCache.value;
+}
+
+/**
+ * Allow a new bet only while (active + bet) stays within MAX_ACTIVE_PCT of the
+ * bankroll. Bankroll = balance + active: the "original money" — open bets are
+ * money that still exists, just committed, so a shrinking cash balance doesn't
+ * double-count them and silently tighten the cap.
+ * Fail-closed: if the balance can't be read, the trade is blocked.
+ */
+async function riskGateCheck(amountUsdc) {
+  if (!maxActivePct) return { allowed: true, disabled: true };
+  await refreshResolutions();
+  settleResolvedCopies();
+  const active = getActiveUsdc();
+  let balance;
+  try {
+    balance = await getUsdcBalance();
+  } catch (err) {
+    riskSnapshot = { ...riskSnapshot, activeUsdc: active, balance: null };
+    return {
+      allowed: false,
+      active,
+      reason: `balance unavailable (${err.message}) — failing closed`,
+    };
+  }
+  const bankroll = balance + active;
+  const capUsdc = (maxActivePct / 100) * bankroll;
+  riskSnapshot = { ...riskSnapshot, balance, activeUsdc: active };
+  if (active + amountUsdc > capUsdc + 1e-9) {
+    return {
+      allowed: false,
+      active,
+      balance,
+      capUsdc,
+      reason:
+        `$${(active + amountUsdc).toFixed(2)} at risk would exceed the ` +
+        `${maxActivePct}% cap $${capUsdc.toFixed(2)} ` +
+        `(active $${active.toFixed(2)} + bet $${amountUsdc.toFixed(2)}, ` +
+        `bankroll $${bankroll.toFixed(2)})`,
+    };
+  }
+  return { allowed: true, active, balance, capUsdc };
 }
 
 // ---------------------------------------------------------------------------
@@ -529,6 +676,25 @@ async function pollUser(wallet, state) {
     }
 
     const amount = betAmount(trade);
+
+    // Risk gate: never let active-in-trading exceed MAX_ACTIVE_PCT of the
+    // bankroll. Blocked trades are skipped for good (chasing them minutes
+    // later at a moved price is worse than missing the bet).
+    const gate = await riskGateCheck(amount);
+    if (!gate.allowed) {
+      riskSnapshot.riskSkipped++;
+      state.seen.add(tradeKey(trade));
+      saveState(state);
+      journalUpdate(
+        tradeKey(trade),
+        { status: "risk-skip", riskReason: gate.reason },
+        observedEntry(trade, wallet, "risk-skip"),
+      );
+      log(`${tag} RISK SKIP "${trade.title}": ${gate.reason}`);
+      writeStatus();
+      continue;
+    }
+
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
         `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
@@ -539,6 +705,8 @@ async function pollUser(wallet, state) {
       saveState(state);
       tradesPlaced++;
       const spent = resp.dryRun ? amount : Number(resp.makingAmount) || amount;
+      if (isDryRun) paperBalance -= spent; // paper: debit like a real fill
+      balanceCache = { value: null, fetchedAt: 0 }; // live: balance changed, re-fetch
       const shares = resp.dryRun
         ? trade.price > 0
           ? amount / trade.price
@@ -677,5 +845,7 @@ module.exports = {
   splitStale,
   matchesSubCategory,
   pollUser,
+  riskGateCheck,
+  getActiveUsdc,
   TARGET_WALLETS,
 };
