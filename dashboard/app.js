@@ -300,6 +300,49 @@ function ActiveChart({ copied }) {
     </div>`;
 }
 
+/** Placed bets grouped by market: [{ title, count }], busiest first. */
+function marketBets(copied) {
+  const byMarket = new Map();
+  for (const t of copied) {
+    if (t.status !== "success") continue;
+    const key = t.conditionId || t.slug || t.title;
+    if (!key) continue;
+    if (!byMarket.has(key)) byMarket.set(key, { title: t.title || t.slug, count: 0 });
+    byMarket.get(key).count++;
+  }
+  return [...byMarket.values()].sort((a, b) => b.count - a.count);
+}
+
+const MARKET_CHART_MAX = 10;
+
+/** Horizontal bar chart: how many bets we placed in each market. */
+function MarketBetsChart({ copied }) {
+  const all = marketBets(copied);
+  if (all.length === 0)
+    return html`<div className="empty">No placed bets to chart per market yet</div>`;
+  const data = all.slice(0, MARKET_CHART_MAX);
+
+  return html`
+    <div>
+      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
+        Bets placed per market${all.length > data.length ? ` (top ${data.length} of ${all.length})` : ""}
+      </div>
+      <${ResponsiveContainer} width="100%" height=${Math.max(80, data.length * 30 + 40)}>
+        <${BarChart} data=${data} layout="vertical" margin=${{ top: 0, right: 28, left: 8, bottom: 0 }} barCategoryGap="30%">
+          <${CartesianGrid} horizontal=${false} stroke=${CH.grid} />
+          <${XAxis} type="number" allowDecimals=${false} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} />
+          <${YAxis} type="category" dataKey="title" width=${190}
+            tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false}
+            tickFormatter=${(v) => (String(v).length > 26 ? String(v).slice(0, 25) + "…" : v)} />
+          <${Tooltip} ...${TIP_STYLE} formatter=${(v) => [v, "Bets placed"]} />
+          <${Bar} dataKey="count" name="Bets placed" fill="#4c9aff" stroke=${CH.surface} strokeWidth=${1} radius=${[0, 4, 4, 0]}>
+            <${LabelList} dataKey="count" position="right" style=${{ fontSize: 10, fill: CH.ink }} />
+          <//>
+        <//>
+      <//>
+    </div>`;
+}
+
 function Analytics({ copied }) {
   const ok = copied.filter((t) => t.status === "success");
   const wins = ok.filter((t) => t.result === "win");
@@ -335,6 +378,7 @@ function Analytics({ copied }) {
         <${WinLossChart} copied=${copied} />
         <${PnlChart} copied=${copied} />
         <${ActiveChart} copied=${copied} />
+        <${MarketBetsChart} copied=${copied} />
       </div>
     </div>`;
 }
