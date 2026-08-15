@@ -19,7 +19,12 @@ const {
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
   STATUS_FILE = path.join(__dirname, "status.json"),
   CLOB_API_HOST = "https://clob.polymarket.com",
+  FUNDER_ADDRESS,
+  PRIVATE_KEY,
+  SIGNATURE_TYPE = "1",
 } = process.env;
+
+const CHAIN_ID = 137; // Polygon mainnet
 
 const STATIC_FILES = {
   "/": { file: path.join(__dirname, "dashboard", "index.html"), type: "text/html" },
@@ -134,6 +139,65 @@ function resultFor(entry) {
   return "pending";
 }
 
+// ---------------------------------------------------------------------------
+// USDC balance via the CLOB client's getBalanceAllowance (COLLATERAL).
+// Needs PRIVATE_KEY (+ FUNDER_ADDRESS) — without them /api/balance returns null.
+// Cached briefly so the dashboard's 3s poll doesn't hammer the API.
+// ---------------------------------------------------------------------------
+
+let clobClient = null;
+
+async function getClobClient() {
+  if (clobClient) return clobClient;
+  // clob-client-v2 is ESM-only — same dynamic-import dance as copy-trader.js
+  const { ClobClient, AssetType } = await import("@polymarket/clob-client-v2");
+  const { Wallet } = require("@ethersproject/wallet");
+  const signer = new Wallet(PRIVATE_KEY);
+  const bootstrap = new ClobClient({
+    host: CLOB_API_HOST,
+    chain: CHAIN_ID,
+    signer,
+    signatureType: Number(SIGNATURE_TYPE),
+    funderAddress: FUNDER_ADDRESS,
+  });
+  const creds = await bootstrap.createOrDeriveApiKey();
+  clobClient = new ClobClient({
+    host: CLOB_API_HOST,
+    chain: CHAIN_ID,
+    signer,
+    creds,
+    signatureType: Number(SIGNATURE_TYPE),
+    funderAddress: FUNDER_ADDRESS,
+  });
+  clobClient._AssetType = AssetType;
+  return clobClient;
+}
+
+const BALANCE_TTL_MS = 30000;
+let balanceCache = { balance: null, fetchedAt: 0 };
+
+async function getUsdcBalance() {
+  if (!PRIVATE_KEY) return null;
+  const now = Date.now();
+  if (now - balanceCache.fetchedAt < BALANCE_TTL_MS) return balanceCache.balance;
+  try {
+    const client = await getClobClient();
+    const resp = await client.getBalanceAllowance({
+      asset_type: client._AssetType.COLLATERAL,
+    });
+    // balance is a micro-USDC string (6 decimals)
+    const raw = Number(resp?.balance);
+    balanceCache = {
+      balance: Number.isFinite(raw) ? raw / 1e6 : null,
+      fetchedAt: now,
+    };
+  } catch {
+    // keep last known balance, retry after the TTL
+    balanceCache.fetchedAt = now;
+  }
+  return balanceCache.balance;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
@@ -149,6 +213,12 @@ const server = http.createServer(async (req, res) => {
     const status = readJson(STATUS_FILE, null);
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ ...(status || {}), serverTime: Date.now() }));
+  }
+
+  if (url === "/api/balance") {
+    const balance = await getUsdcBalance();
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ balance }));
   }
 
   const entry = STATIC_FILES[url];
