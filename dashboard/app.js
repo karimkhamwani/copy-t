@@ -152,7 +152,7 @@ function bucketize(copied) {
 /* global Recharts */
 const {
   ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis,
-  CartesianGrid, Tooltip, Legend, ReferenceLine, LabelList,
+  CartesianGrid, Tooltip, Legend, ReferenceLine, LabelList, Cell,
 } = Recharts;
 
 // Hardcoded theme colors for chart internals (SVG attributes can't use CSS vars)
@@ -300,15 +300,20 @@ function ActiveChart({ copied }) {
     </div>`;
 }
 
-/** Placed bets grouped by market: [{ title, win, loss, pending, count }], busiest first. */
+/** Stable market identity for grouping/filtering. */
+function marketKey(t) {
+  return t.conditionId || t.slug || t.title || "";
+}
+
+/** Placed bets grouped by market: [{ key, title, win, loss, pending, count }], oldest first. */
 function marketBets(copied) {
   const byMarket = new Map();
   for (const t of copied) {
     if (t.status !== "success") continue;
-    const key = t.conditionId || t.slug || t.title;
+    const key = marketKey(t);
     if (!key) continue;
     if (!byMarket.has(key))
-      byMarket.set(key, { title: t.title || t.slug, win: 0, loss: 0, pending: 0, firstAt: Infinity });
+      byMarket.set(key, { key, title: t.title || t.slug, win: 0, loss: 0, pending: 0, firstAt: Infinity });
     const b = byMarket.get(key);
     if (t.result === "win") b.win++;
     else if (t.result === "loss") b.loss++;
@@ -323,17 +328,32 @@ function marketBets(copied) {
 
 const MARKET_CHART_MAX = 10;
 
-/** Horizontal bar chart: how many bets we placed in each market. */
-function MarketBetsChart({ copied }) {
+/** Horizontal bar chart: how many bets we placed in each market. Click a bar to
+    filter the copied-trades list to that market (click again to clear). */
+function MarketBetsChart({ copied, selectedMarket, onSelectMarket }) {
   const all = marketBets(copied);
   if (all.length === 0)
     return html`<div className="empty">No placed bets to chart per market yet</div>`;
   const data = all.slice(-MARKET_CHART_MAX); // most recent markets, oldest at the top
 
+  const toggle = (d) => {
+    const key = d?.payload?.key ?? d?.key;
+    if (key) onSelectMarket(selectedMarket?.key === key ? null : { key, title: d.payload?.title ?? d.title });
+  };
+  // dim the bars that are NOT the selected market
+  const cells = (bar) =>
+    data.map((d) => html`<${Cell}
+      key=${`${bar}-${d.key}`}
+      fillOpacity=${selectedMarket && d.key !== selectedMarket.key ? 0.3 : 1}
+    />`);
+
   return html`
-    <div>
+    <div className="market-chart">
       <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
         Bets placed per market, oldest first${all.length > data.length ? ` (last ${data.length} of ${all.length})` : ""}
+        — ${selectedMarket
+          ? html`filtering copied trades, <a href="#" onClick=${(e) => { e.preventDefault(); onSelectMarket(null); }}>clear</a>`
+          : "click a bar to filter copied trades"}
       </div>
       <${ResponsiveContainer} width="100%" height=${Math.max(104, data.length * 30 + 64)}>
         <${BarChart} data=${data} layout="vertical" margin=${{ top: 0, right: 28, left: 8, bottom: 0 }} barCategoryGap="30%">
@@ -344,9 +364,14 @@ function MarketBetsChart({ copied }) {
             tickFormatter=${(v) => (String(v).length > 26 ? String(v).slice(0, 25) + "…" : v)} />
           <${Tooltip} ...${TIP_STYLE} />
           <${Legend} wrapperStyle=${{ fontSize: 12 }} />
-          <${Bar} dataKey="win" name="Wins" stackId="m" fill=${C_WIN} stroke=${CH.surface} strokeWidth=${1} />
-          <${Bar} dataKey="loss" name="Losses" stackId="m" fill=${C_LOSS} stroke=${CH.surface} strokeWidth=${1} />
-          <${Bar} dataKey="pending" name="Pending" stackId="m" fill=${C_PENDING} stroke=${CH.surface} strokeWidth=${1}>
+          <${Bar} dataKey="win" name="Wins" stackId="m" fill=${C_WIN} stroke=${CH.surface} strokeWidth=${1} onClick=${toggle}>
+            ${cells("win")}
+          <//>
+          <${Bar} dataKey="loss" name="Losses" stackId="m" fill=${C_LOSS} stroke=${CH.surface} strokeWidth=${1} onClick=${toggle}>
+            ${cells("loss")}
+          <//>
+          <${Bar} dataKey="pending" name="Pending" stackId="m" fill=${C_PENDING} stroke=${CH.surface} strokeWidth=${1} onClick=${toggle}>
+            ${cells("pending")}
             <${LabelList} dataKey="count" position="right" style=${{ fontSize: 10, fill: CH.ink }} />
           <//>
         <//>
@@ -354,7 +379,7 @@ function MarketBetsChart({ copied }) {
     </div>`;
 }
 
-function Analytics({ copied }) {
+function Analytics({ copied, selectedMarket, onSelectMarket }) {
   const ok = copied.filter((t) => t.status === "success");
   const wins = ok.filter((t) => t.result === "win");
   const losses = ok.filter((t) => t.result === "loss");
@@ -389,7 +414,7 @@ function Analytics({ copied }) {
         <${WinLossChart} copied=${copied} />
         <${PnlChart} copied=${copied} />
         <${ActiveChart} copied=${copied} />
-        <${MarketBetsChart} copied=${copied} />
+        <${MarketBetsChart} copied=${copied} selectedMarket=${selectedMarket} onSelectMarket=${onSelectMarket} />
       </div>
     </div>`;
 }
@@ -419,6 +444,7 @@ function App() {
   const [balance, setBalance] = useState(null);
   const [copiedFilter, setCopiedFilter] = useState("all");
   const [copiedSort, setCopiedSort] = useState("none");
+  const [selectedMarket, setSelectedMarket] = useState(null); // { key, title } from the per-market chart
 
   useEffect(() => {
     let alive = true;
@@ -454,6 +480,9 @@ function App() {
   const wins = copied.filter((t) => t.result === "win").length;
   const losses = copied.filter((t) => t.result === "loss").length;
   let filteredCopied = copied.filter(COPIED_FILTERS[copiedFilter].match);
+  if (selectedMarket) {
+    filteredCopied = filteredCopied.filter((t) => marketKey(t) === selectedMarket.key);
+  }
   if (copiedFilter !== "all" && copiedSort !== "none") {
     filteredCopied = [...filteredCopied].sort((a, b) =>
       copiedSort === "asc" ? betValue(a) - betValue(b) : betValue(b) - betValue(a)
@@ -486,7 +515,7 @@ function App() {
         </span>
       </div>
 
-      <${Analytics} copied=${copied} />
+      <${Analytics} copied=${copied} selectedMarket=${selectedMarket} onSelectMarket=${setSelectedMarket} />
 
       <div className="cols">
         <div className="panel">
@@ -499,7 +528,12 @@ function App() {
 
         <div className="panel">
           <h2>
-            Copied trades (${filteredCopied.length}${copiedFilter !== "all" ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            Copied trades (${filteredCopied.length}${copiedFilter !== "all" || selectedMarket ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            ${selectedMarket &&
+            html`<span className="market-chip" title=${selectedMarket.title}>
+              ${String(selectedMarket.title).length > 24 ? String(selectedMarket.title).slice(0, 23) + "…" : selectedMarket.title}
+              <button onClick=${() => setSelectedMarket(null)} aria-label="Clear market filter">✕</button>
+            </span>`}
             ${copiedFilter !== "all" &&
             html`<select
               className="filter"
