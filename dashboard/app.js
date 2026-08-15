@@ -384,6 +384,7 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
   const ok = copied.filter((t) => t.status === "success");
   const wins = ok.filter((t) => t.result === "win");
   const losses = ok.filter((t) => t.result === "loss");
+  const pending = ok.length - wins.length - losses.length;
   const resolved = wins.length + losses.length;
   const winRate = resolved ? Math.round((wins.length / resolved) * 100) : null;
   // lifetime totals: copied trades are never evicted from the journal
@@ -414,6 +415,7 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
         <${StatTile} label="Copied trades" value=${ok.length} />
         <${StatTile} label="Wins" value=${wins.length} tone=${C_WIN} />
         <${StatTile} label="Losses" value=${losses.length} tone=${C_LOSS} />
+        <${StatTile} label="Pending" value=${pending} tone=${pending > 0 ? C_PENDING : null} />
         <${StatTile} label="Win rate" value=${winRate == null ? "—" : winRate + "%"} />
         <${StatTile} label="Net P/L (resolved)" value=${`${pnl >= 0 ? "+" : "-"}$${Math.abs(pnl).toFixed(2)}`} tone=${resolved ? (pnl >= 0 ? C_WIN : C_LOSS) : null} />
         <${StatTile} label="Lifetime profit" value=${`+$${totalProfit.toFixed(2)}`} tone=${totalProfit > 0 ? C_WIN : null} />
