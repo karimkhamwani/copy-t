@@ -529,11 +529,18 @@ function App() {
         <div className="panel">
           <h2>
             Copied trades (${filteredCopied.length}${copiedFilter !== "all" || selectedMarket ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
-            ${selectedMarket &&
-            html`<span className="market-chip" title=${selectedMarket.title}>
-              ${String(selectedMarket.title).length > 24 ? String(selectedMarket.title).slice(0, 23) + "…" : selectedMarket.title}
-              <button onClick=${() => setSelectedMarket(null)} aria-label="Clear market filter">✕</button>
-            </span>`}
+          </h2>
+          <div className="toolbar">
+            <select
+              className="filter"
+              value=${copiedFilter}
+              onChange=${(e) => setCopiedFilter(e.target.value)}
+              aria-label="Filter copied trades by status"
+            >
+              ${Object.entries(COPIED_FILTERS).map(
+                ([k, f]) => html`<option key=${k} value=${k}>${f.label}</option>`
+              )}
+            </select>
             ${copiedFilter !== "all" &&
             html`<select
               className="filter"
@@ -545,17 +552,12 @@ function App() {
               <option value="asc">Win value ↑</option>
               <option value="desc">Win value ↓</option>
             </select>`}
-            <select
-              className="filter"
-              value=${copiedFilter}
-              onChange=${(e) => setCopiedFilter(e.target.value)}
-              aria-label="Filter copied trades by status"
-            >
-              ${Object.entries(COPIED_FILTERS).map(
-                ([k, f]) => html`<option key=${k} value=${k}>${f.label}</option>`
-              )}
-            </select>
-          </h2>
+            ${selectedMarket &&
+            html`<span className="market-chip" title=${selectedMarket.title}>
+              ${String(selectedMarket.title).length > 32 ? String(selectedMarket.title).slice(0, 31) + "…" : selectedMarket.title}
+              <button onClick=${() => setSelectedMarket(null)} aria-label="Clear market filter">✕</button>
+            </span>`}
+          </div>
           <div className="list">
             ${copied.length === 0 && html`<div className="empty">Nothing copied yet</div>`}
             ${copied.length > 0 && filteredCopied.length === 0 &&

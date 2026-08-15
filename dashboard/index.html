@@ -33,9 +33,11 @@
   .panel h2 { font-size: 13px; letter-spacing: .06em; text-transform: uppercase; color: var(--dim);
               margin: 0; padding: 12px 14px; border-bottom: 1px solid var(--border); }
   .list { max-height: 78vh; overflow-y: auto; }
-  .panel h2 .filter { float: right; margin-left: 6px; background: var(--bg, #0a0d12); color: var(--text);
-                      border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
-                      padding: 2px 6px; text-transform: none; letter-spacing: normal; }
+  .panel .filter { background: var(--bg, #0a0d12); color: var(--text);
+                   border: 1px solid var(--border); border-radius: 6px; font-size: 12px;
+                   padding: 2px 6px; text-transform: none; letter-spacing: normal; }
+  .toolbar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+             padding: 8px 14px; border-bottom: 1px solid var(--border); }
   .row { padding: 10px 14px; border-bottom: 1px solid var(--border); }
   .row:last-child { border-bottom: none; }
   .row .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
@@ -65,7 +67,7 @@
              font-size: 12px; padding: 5px 9px; border-radius: 6px; pointer-events: none;
              white-space: nowrap; z-index: 10; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
   .market-chart .recharts-bar-rectangle { cursor: pointer; }
-  .market-chip { float: right; display: inline-flex; align-items: center; gap: 6px;
+  .market-chip { display: inline-flex; align-items: center; gap: 6px;
                  background: rgba(76,154,255,.15); color: var(--blue); border: 1px solid var(--blue);
                  border-radius: 999px; font-size: 11px; font-weight: 600; padding: 2px 8px;
                  margin-left: 6px; text-transform: none; letter-spacing: normal; }
