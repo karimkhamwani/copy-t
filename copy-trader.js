@@ -282,7 +282,7 @@ function getJson(url) {
 
 async function fetchActivity(user) {
   const url =
-    `${DATA_API_HOST}/activity?limit=100&offset=0` +
+    `${DATA_API_HOST}/activity?limit=250&offset=0` +
     `&excludeDepositsWithdrawals=true&sortBy=TIMESTAMP&sortDirection=DESC` +
     `&type=TRADE&side=BUY` +
     `&user=${user}`;
