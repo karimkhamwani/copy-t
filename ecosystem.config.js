@@ -16,7 +16,7 @@ module.exports = {
     {
       name: "copy-trader",
       script: "copy-trader.js",
-      watch: ["copy-trader.js", ".env"],
+      watch: ["copy-trader.js", "target-wallets.js", ".env"],
       watch_delay: 2000,
       // A clean exit (MAX_TRADES reached) must NOT be auto-restarted,
       // otherwise pm2 would immediately place another batch of trades.

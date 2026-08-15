@@ -13,8 +13,8 @@ npm start
 
 ## How it works
 
-1. Every `POLL_INTERVAL_MS` (default 30s), fetch `/activity` for each wallet in the
-   `TARGET_WALLETS` array at the top of copy-trader.js
+1. Every `POLL_INTERVAL_MS` (default 30s), fetch `/activity` for each wallet in
+   target-wallets.js
    (`excludeDepositsWithdrawals=true`, sorted newest first). Each entry is
    `{ address, category }` — the category is just a label used in logs.
 2. Keep only BUY trades that have an `asset` (token ID) and `transactionHash`.
@@ -50,10 +50,10 @@ so it works identically in dry and live mode. Run both processes side by side.
 
 ## Env vars
 
-Target wallets live in the script itself (`TARGET_WALLETS` in copy-trader.js):
+Target wallets live in their own file (target-wallets.js):
 
 ```js
-const TARGET_WALLETS = [
+module.exports = [
   {
     address: "0x0cb038487586d1119b165466072e9baf666f3a90",
     category: "crypto",

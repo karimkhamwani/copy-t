@@ -13,22 +13,8 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 
-// ---------------------------------------------------------------------------
-// Wallets to copy — edit this list to add/remove users
-// ---------------------------------------------------------------------------
-
-const TARGET_WALLETS = [
-  // {
-  //   address: "0xb55fa1296e6ec55d0ce53d93b9237389f11764d4",
-  //   category: "crypto",
-  //   sub_category: ["btc"],
-  // },
-  {
-    address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
-    category: "crypto",
-    sub_category: ["btc-updown-5m"],
-  },
-];
+// Wallets to copy live in target-wallets.js — edit that file to add/remove users
+const TARGET_WALLETS = require("./target-wallets.js");
 
 const {
   DATA_API_HOST = "https://data-api.polymarket.com",
@@ -589,7 +575,7 @@ async function pollOnce(state) {
 async function main() {
   if (targetWallets.length === 0) {
     console.error(
-      "TARGET_WALLETS in copy-trader.js is empty — add at least one {address, category}",
+      "target-wallets.js is empty — add at least one {address, category}",
     );
     process.exit(1);
   }
