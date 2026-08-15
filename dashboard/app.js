@@ -490,6 +490,24 @@ function App() {
     Date.now() - status.updatedAt < Math.max(15000, (status.pollIntervalMs || 5000) * 3);
 
   const copied = trades.filter((t) => t.copy);
+
+  // Risk-gate state for the header pill: TRADING while there's room under the
+  // cap, GATED when active has reached it (or the live balance is unreadable).
+  const gateActive = copied
+    .filter((t) => t.status === "success" && t.result !== "win" && t.result !== "loss")
+    .reduce((s, t) => s + (t.copy?.spentUsdc || 0), 0);
+  const gateBalance = status?.mode === "dry" ? status?.paperBalance : status?.balance;
+  const gateCap = status?.maxActivePct && gateBalance != null
+    ? (status.maxActivePct / 100) * (gateBalance + gateActive)
+    : null;
+  const gate = !status?.maxActivePct
+    ? null // gate disabled -> no pill
+    : gateBalance == null
+      ? { label: "GATED", cls: "off", why: "balance unavailable — trading blocked (fail-closed)" }
+      : gateActive >= gateCap - 0.005
+        ? { label: "GATED", cls: "gated", why: `active $${gateActive.toFixed(2)} has hit the ${status.maxActivePct}% cap $${gateCap.toFixed(2)}` }
+        : { label: "TRADING", cls: "on", why: `$${(gateCap - gateActive).toFixed(2)} of headroom under the ${status.maxActivePct}% cap $${gateCap.toFixed(2)}` };
+
   const successes = copied.filter((t) => t.status === "success").length;
   const failures = copied.filter((t) => t.status === "failed").length;
   const wins = copied.filter((t) => t.result === "win").length;
@@ -511,6 +529,7 @@ function App() {
         ${status?.mode &&
         html`<span className=${`pill ${status.mode}`}>${status.mode === "dry" ? "DRY RUN" : "LIVE"}</span>`}
         <span className=${`pill ${online ? "on" : "off"}`}>${online ? "ENGINE ONLINE" : "ENGINE OFFLINE"}</span>
+        ${gate && html`<span className=${`pill ${gate.cls}`} title=${gate.why}>${gate.label}</span>`}
         ${online && status?.startedAt && html`<span className="pill">up ${uptime(status.startedAt)}</span>`}
         ${status && html`
           <span className="stats">
