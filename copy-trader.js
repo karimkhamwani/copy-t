@@ -199,7 +199,23 @@ function journalUpdate(id, patch, base) {
 }
 
 /** Heartbeat + config snapshot so the dashboard knows the engine is alive. */
-const engineStartedAt = Date.now();
+
+/**
+ * Uptime survives restarts: reuse startedAt from the previous status file so
+ * pm2 restarts/redeploys don't reset the clock. Only a true fresh start —
+ * no status.json, e.g. after `yarn reset` — begins a new uptime.
+ */
+function loadStartedAt() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATUS_FILE, "utf8"));
+    if (Number.isFinite(s.startedAt) && s.startedAt > 0 && s.startedAt <= Date.now())
+      return s.startedAt;
+  } catch {
+    /* no/unreadable status file -> fresh start */
+  }
+  return Date.now();
+}
+const engineStartedAt = loadStartedAt();
 function writeStatus() {
   try {
     writeJsonAtomic(STATUS_FILE, {
