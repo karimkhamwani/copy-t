@@ -20,12 +20,21 @@ const {
   STATUS_FILE = path.join(__dirname, "status.json"),
   CLOB_API_HOST = "https://clob.polymarket.com",
   DATA_API_HOST = "https://data-api.polymarket.com",
-  POLYGON_RPC_HOST = "https://polygon-rpc.com",
+  POLYGON_RPC_HOST, // optional override; otherwise the fallback list below is used
   FUNDER_ADDRESS, // your proxy wallet — used for the portfolio/cash display
 } = process.env;
 
-// Polymarket settles in bridged USDC.e on Polygon (6 decimals)
-const USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+// Public Polygon RPCs, tried in order (polygon-rpc.com shut its free gateway down)
+const POLYGON_RPC_HOSTS = POLYGON_RPC_HOST
+  ? [POLYGON_RPC_HOST]
+  : ["https://1rpc.io/matic", "https://polygon-bor-rpc.publicnode.com", "https://polygon.drpc.org"];
+
+// Cash can sit in either USDC contract on Polygon (both 6 decimals):
+// bridged USDC.e (Polymarket's collateral) and native USDC.
+const USDC_CONTRACTS = [
+  "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", // USDC.e (bridged)
+  "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359", // USDC (native)
+];
 
 const STATIC_FILES = {
   "/": { file: path.join(__dirname, "dashboard", "index.html"), type: "text/html" },
@@ -162,28 +171,38 @@ async function fetchPortfolioValue(address) {
 }
 
 async function fetchUsdcBalance(address) {
-  const res = await fetch(POLYGON_RPC_HOST, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    signal: AbortSignal.timeout(10000),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_call",
-      params: [
-        {
-          to: USDC_CONTRACT,
-          // balanceOf(address)
-          data: "0x70a08231" + address.toLowerCase().replace(/^0x/, "").padStart(64, "0"),
-        },
-        "latest",
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`polygon RPC ${res.status}`);
-  const j = await res.json();
-  if (j.error || !j.result) throw new Error(j.error?.message || "empty RPC result");
-  return Number(BigInt(j.result)) / 1e6; // USDC has 6 decimals
+  // balanceOf(address) for both USDC contracts, batched in one JSON-RPC request
+  const calldata =
+    "0x70a08231" + address.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+  const batch = USDC_CONTRACTS.map((to, i) => ({
+    jsonrpc: "2.0",
+    id: i,
+    method: "eth_call",
+    params: [{ to, data: calldata }, "latest"],
+  }));
+
+  let lastErr = null;
+  for (const rpc of POLYGON_RPC_HOSTS) {
+    try {
+      const res = await fetch(rpc, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        signal: AbortSignal.timeout(10000),
+        body: JSON.stringify(batch),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = await res.json();
+      const results = Array.isArray(j) ? j : [j];
+      if (results.length === 0 || results.some((r) => r.error || !r.result)) {
+        throw new Error(results.find((r) => r.error)?.error?.message || "empty RPC result");
+      }
+      return results.reduce((sum, r) => sum + Number(BigInt(r.result)) / 1e6, 0);
+    } catch (err) {
+      lastErr = err;
+      console.error(`cash lookup via ${rpc} failed: ${err.message}`);
+    }
+  }
+  throw lastErr || new Error("all polygon RPCs failed");
 }
 
 async function getWalletSnapshot() {
@@ -197,6 +216,8 @@ async function getWalletSnapshot() {
     fetchPortfolioValue(FUNDER_ADDRESS),
     fetchUsdcBalance(FUNDER_ADDRESS),
   ]);
+  if (pf.status === "rejected")
+    console.error(`portfolio lookup failed: ${pf.reason?.message || pf.reason}`);
   walletCache = {
     fetchedAt: now,
     portfolio: pf.status === "fulfilled" ? pf.value : walletCache.portfolio,
