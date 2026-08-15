@@ -308,15 +308,17 @@ function marketBets(copied) {
     const key = t.conditionId || t.slug || t.title;
     if (!key) continue;
     if (!byMarket.has(key))
-      byMarket.set(key, { title: t.title || t.slug, win: 0, loss: 0, pending: 0 });
+      byMarket.set(key, { title: t.title || t.slug, win: 0, loss: 0, pending: 0, firstAt: Infinity });
     const b = byMarket.get(key);
     if (t.result === "win") b.win++;
     else if (t.result === "loss") b.loss++;
     else b.pending++;
+    b.firstAt = Math.min(b.firstAt, t.tradedAt || t.copy?.copiedAt || Infinity);
   }
+  // chronological: markets we bet in first come first
   return [...byMarket.values()]
     .map((b) => ({ ...b, count: b.win + b.loss + b.pending }))
-    .sort((a, b) => b.count - a.count);
+    .sort((a, b) => a.firstAt - b.firstAt);
 }
 
 const MARKET_CHART_MAX = 10;
@@ -326,12 +328,12 @@ function MarketBetsChart({ copied }) {
   const all = marketBets(copied);
   if (all.length === 0)
     return html`<div className="empty">No placed bets to chart per market yet</div>`;
-  const data = all.slice(0, MARKET_CHART_MAX);
+  const data = all.slice(-MARKET_CHART_MAX); // most recent markets, oldest at the top
 
   return html`
     <div>
       <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
-        Bets placed per market${all.length > data.length ? ` (top ${data.length} of ${all.length})` : ""}
+        Bets placed per market, oldest first${all.length > data.length ? ` (last ${data.length} of ${all.length})` : ""}
       </div>
       <${ResponsiveContainer} width="100%" height=${Math.max(104, data.length * 30 + 64)}>
         <${BarChart} data=${data} layout="vertical" margin=${{ top: 0, right: 28, left: 8, bottom: 0 }} barCategoryGap="30%">
