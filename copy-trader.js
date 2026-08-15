@@ -4,7 +4,7 @@
  * - Polls the activity API every POLL_INTERVAL_MS for the target user's trades
  * - Filters to BUY trades only
  * - Dedupes by transactionHash + asset (persisted to seen-trades.json)
- * - Mirrors each new trade as a FOK market BUY order via the CLOB client
+ * - Mirrors each new trade as a FAK market BUY order via the CLOB client
  * - Every copied bet spends a fixed MAX_BET_USDC (env, default $1), regardless of their trade size
  * - DRY_RUN=1 logs orders instead of placing them
  */
@@ -393,13 +393,16 @@ async function placeMarketBuy(trade, amountUsdc) {
   }
 
   const client = await getClobClient();
+  // FAK (fill-and-kill): take whatever liquidity is available at the computed
+  // market price and cancel the rest — partial directional exposure beats the
+  // all-or-nothing FOK, which fails exactly when fast markets move.
   const order = await client.createMarketOrder({
     tokenID: trade.asset,
     amount: amountUsdc, // USDC to spend for a BUY market order
     side: client._Side.BUY,
-    orderType: client._OrderType.FOK,
+    orderType: client._OrderType.FAK,
   });
-  const resp = await client.postOrder(order, client._OrderType.FOK);
+  const resp = await client.postOrder(order, client._OrderType.FAK);
   log("order response:", JSON.stringify(resp));
   // The client can return API errors as a normal response instead of throwing —
   // a rejected order must NOT count as placed or be marked seen.
