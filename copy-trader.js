@@ -278,6 +278,7 @@ async function fetchActivity(user) {
   const url =
     `${DATA_API_HOST}/activity?limit=100&offset=0` +
     `&excludeDepositsWithdrawals=true&sortBy=TIMESTAMP&sortDirection=DESC` +
+    `&type=TRADE&side=BUY` +
     `&user=${user}`;
   const data = await getJson(url);
   if (!Array.isArray(data)) throw new Error("activity API returned non-array");
