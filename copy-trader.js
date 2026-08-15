@@ -482,6 +482,11 @@ async function pollUser(wallet, state) {
   for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
 
+    // Activity can contain several rows with the same txHash:asset (partial
+    // fills of one order). pickNewTrades ran before this loop, so a key that
+    // is in `seen` now was copied earlier in THIS batch — never copy it twice.
+    if (state.seen.has(tradeKey(trade))) continue;
+
     // Exact mirroring below Polymarket's $1 order minimum is impossible —
     // optionally skip those trades instead of rounding the bet up to $1.
     if (
@@ -524,6 +529,12 @@ async function pollUser(wallet, state) {
         tradeKey(trade),
         {
           status: "success",
+          // Refresh the trader-side snapshot: the activity row can grow between
+          // first observation and the copy (fills aggregate), and betAmount used
+          // the values at copy time — the journal must show the same numbers.
+          theirPrice: trade.price,
+          theirUsdc: trade.usdcSize,
+          theirShares: trade.size,
           copy: {
             mode: isDryRun ? "dry" : "live",
             copiedAt: Date.now(),
@@ -646,5 +657,6 @@ module.exports = {
   normalizeWallets,
   splitStale,
   matchesSubCategory,
+  pollUser,
   TARGET_WALLETS,
 };
