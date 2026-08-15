@@ -22,6 +22,11 @@
   .pill.dry { background: rgba(76,154,255,.15); color: var(--blue); border-color: var(--blue); }
   .pill.on { background: rgba(46,204,113,.12); color: var(--green); border-color: var(--green); }
   .pill.off { background: rgba(231,76,91,.12); color: var(--red); border-color: var(--red); }
+  .portfolio { margin-left: auto; display: inline-flex; align-items: baseline; gap: 8px;
+               background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+               padding: 6px 12px; }
+  .portfolio-label { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+  .portfolio-value { font-size: 18px; font-weight: 700; color: var(--green); }
   .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }

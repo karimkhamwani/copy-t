@@ -19,6 +19,8 @@ const {
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
   STATUS_FILE = path.join(__dirname, "status.json"),
   CLOB_API_HOST = "https://clob.polymarket.com",
+  DATA_API_HOST = "https://data-api.polymarket.com",
+  FUNDER_ADDRESS,
 } = process.env;
 
 const STATIC_FILES = {
@@ -134,6 +136,42 @@ function resultFor(entry) {
   return "pending";
 }
 
+// ---------------------------------------------------------------------------
+// Portfolio value via the data API (GET /value?user=<address>).
+// Cached briefly so the dashboard's 3s poll doesn't hammer the API.
+// ---------------------------------------------------------------------------
+
+const PORTFOLIO_TTL_MS = 30000;
+let portfolioCache = { value: null, fetchedAt: 0 };
+
+async function fetchPortFolioValue({ user }) {
+  const res = await fetch(`${DATA_API_HOST}/value?user=${user}`, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) throw new Error(`data API ${res.status}`);
+  const data = await res.json();
+  // response shape: [{ user, value }]
+  const value = Array.isArray(data) ? data[0]?.value : data?.value;
+  return value == null ? null : Number(value);
+}
+
+async function getPortfolioValue() {
+  if (!FUNDER_ADDRESS) return null;
+  const now = Date.now();
+  if (now - portfolioCache.fetchedAt < PORTFOLIO_TTL_MS) return portfolioCache.value;
+  try {
+    portfolioCache = {
+      value: await fetchPortFolioValue({ user: FUNDER_ADDRESS }),
+      fetchedAt: now,
+    };
+  } catch {
+    // keep last known value, retry after the TTL
+    portfolioCache.fetchedAt = now;
+  }
+  return portfolioCache.value;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
@@ -149,6 +187,12 @@ const server = http.createServer(async (req, res) => {
     const status = readJson(STATUS_FILE, null);
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ ...(status || {}), serverTime: Date.now() }));
+  }
+
+  if (url === "/api/portfolio") {
+    const value = await getPortfolioValue();
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ user: FUNDER_ADDRESS || null, value }));
   }
 
   const entry = STATIC_FILES[url];
