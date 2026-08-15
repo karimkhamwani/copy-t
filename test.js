@@ -45,11 +45,20 @@ assert.deepStrictEqual(
     { address: "" },
   ]),
   [
-    { address: "0xabc", category: "esports", subCategories: [] },
-    { address: "0xdef", category: "uncategorized", subCategories: [] },
+    { address: "0xabc", category: "esports", subCategories: [], maxTradeAgeSec: null },
+    { address: "0xdef", category: "uncategorized", subCategories: [], maxTradeAgeSec: null },
   ]
 );
 assert.deepStrictEqual(normalizeWallets(undefined), []);
+// per-wallet stale cutoff; absent or junk = null (no cutoff, copy any age)
+assert.strictEqual(
+  normalizeWallets([{ address: "0xa", max_trade_age_sec: 7 }])[0].maxTradeAgeSec,
+  7
+);
+assert.strictEqual(
+  normalizeWallets([{ address: "0xa", max_trade_age_sec: "nope" }])[0].maxTradeAgeSec,
+  null
+);
 
 // 6. Staleness split: trades older than maxAge go to stale, missing timestamp = stale
 {

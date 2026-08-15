@@ -28,7 +28,6 @@ const {
   MIRROR_TRADER_BET = "0", // 1 = bet what the trader bet (capped by MAX_BET_USDC)
   SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
-  MAX_TRADE_AGE_SEC = "120", // skip trades older than this (avoids expired fast markets)
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
@@ -44,7 +43,6 @@ const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() =
 const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
-const maxTradeAgeSec = Number(MAX_TRADE_AGE_SEC) || 120;
 let tradesPlaced = 0;
 
 /** Normalize wallet entries: lowercase addresses, drop empties, dedupe by address. */
@@ -64,6 +62,12 @@ function normalizeWallets(list) {
       subCategories: (w.sub_category || w.subCategories || [])
         .map((s) => String(s).trim().toLowerCase())
         .filter(Boolean),
+      // max_trade_age_sec: per-wallet stale cutoff; null/absent = no cutoff,
+      // copy regardless of trade age
+      maxTradeAgeSec:
+        Number(w.max_trade_age_sec ?? w.maxTradeAgeSec) > 0
+          ? Number(w.max_trade_age_sec ?? w.maxTradeAgeSec)
+          : null,
     });
   }
   return out;
@@ -448,7 +452,10 @@ async function pollUser(wallet, state) {
   }
 
   const nowSec = Math.floor(Date.now() / 1000);
-  const { copyable, stale } = splitStale(fresh, nowSec, maxTradeAgeSec);
+  // No per-wallet cutoff = copy everything regardless of trade age
+  const { copyable, stale } = wallet.maxTradeAgeSec
+    ? splitStale(fresh, nowSec, wallet.maxTradeAgeSec)
+    : { copyable: fresh, stale: [] };
 
   // Too old to chase (fast markets expire) — mark seen so we never retry them
   if (stale.length > 0) {
@@ -458,7 +465,7 @@ async function pollUser(wallet, state) {
     });
     saveState(state);
     log(
-      `${tag} skipped ${stale.length} stale trade(s) older than ${maxTradeAgeSec}s`,
+      `${tag} skipped ${stale.length} stale trade(s) older than ${wallet.maxTradeAgeSec}s`,
     );
   }
 
