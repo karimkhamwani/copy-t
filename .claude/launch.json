@@ -6,12 +6,6 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["dashboard-server.js"],
       "port": 3210
-    },
-    {
-      "name": "dashboard-alt",
-      "runtimeExecutable": "env",
-      "runtimeArgs": ["DASHBOARD_PORT=3213", "node", "dashboard-server.js"],
-      "port": 3213
     }
   ]
 }

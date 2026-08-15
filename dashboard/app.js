@@ -361,7 +361,6 @@ function betValue(t) {
 function App() {
   const [trades, setTrades] = useState([]);
   const [status, setStatus] = useState(null);
-  const [portfolio, setPortfolio] = useState(null);
   const [copiedFilter, setCopiedFilter] = useState("all");
   const [copiedSort, setCopiedSort] = useState("none");
 
@@ -369,15 +368,13 @@ function App() {
     let alive = true;
     const load = async () => {
       try {
-        const [t, s, p] = await Promise.all([
+        const [t, s] = await Promise.all([
           fetch("/api/trades").then((r) => r.json()),
           fetch("/api/status").then((r) => r.json()),
-          fetch("/api/portfolio").then((r) => r.json()),
         ]);
         if (alive) {
           setTrades(Array.isArray(t) ? t : []);
           setStatus(s);
-          setPortfolio(p);
         }
       } catch {
         /* server briefly unavailable — keep last data */
@@ -425,12 +422,6 @@ function App() {
                 .join(", ")}
             </span>
           </span>`}
-        <span className="portfolio">
-          <span className="portfolio-label">Portfolio</span>
-          <span className="portfolio-value">
-            ${portfolio?.value != null ? money(portfolio.value) : "—"}
-          </span>
-        </span>
       </div>
 
       <${Analytics} copied=${copied} />
