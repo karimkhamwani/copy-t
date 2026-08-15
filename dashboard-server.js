@@ -19,13 +19,7 @@ const {
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
   STATUS_FILE = path.join(__dirname, "status.json"),
   CLOB_API_HOST = "https://clob.polymarket.com",
-  DATA_API_HOST = "https://data-api.polymarket.com",
-  POLYGON_RPC_HOST = "https://polygon-rpc.com",
-  FUNDER_ADDRESS, // your proxy wallet — used for the portfolio/cash display
 } = process.env;
-
-// Polymarket settles in bridged USDC.e on Polygon (6 decimals)
-const USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
 const STATIC_FILES = {
   "/": { file: path.join(__dirname, "dashboard", "index.html"), type: "text/html" },
@@ -140,71 +134,6 @@ function resultFor(entry) {
   return "pending";
 }
 
-// ---------------------------------------------------------------------------
-// Wallet snapshot: portfolio value from the data API, cash = on-chain USDC.e
-// balance of the funder wallet (public Polygon RPC, no keys needed).
-// Cached for 30s so dashboard polling doesn't hammer either source.
-// ---------------------------------------------------------------------------
-
-const WALLET_CACHE_MS = 30000;
-let walletCache = { fetchedAt: 0, portfolio: null, cash: null };
-
-async function fetchPortfolioValue(address) {
-  const res = await fetch(`${DATA_API_HOST}/value?user=${address}`, {
-    headers: { accept: "application/json" },
-    signal: AbortSignal.timeout(10000),
-  });
-  if (!res.ok) throw new Error(`value API ${res.status}`);
-  const j = await res.json();
-  // returns [{ user, value }] (or { value } depending on version)
-  const v = Array.isArray(j) ? j[0]?.value : j?.value;
-  return Number.isFinite(Number(v)) ? Number(v) : null;
-}
-
-async function fetchUsdcBalance(address) {
-  const res = await fetch(POLYGON_RPC_HOST, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    signal: AbortSignal.timeout(10000),
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_call",
-      params: [
-        {
-          to: USDC_CONTRACT,
-          // balanceOf(address)
-          data: "0x70a08231" + address.toLowerCase().replace(/^0x/, "").padStart(64, "0"),
-        },
-        "latest",
-      ],
-    }),
-  });
-  if (!res.ok) throw new Error(`polygon RPC ${res.status}`);
-  const j = await res.json();
-  if (j.error || !j.result) throw new Error(j.error?.message || "empty RPC result");
-  return Number(BigInt(j.result)) / 1e6; // USDC has 6 decimals
-}
-
-async function getWalletSnapshot() {
-  if (!FUNDER_ADDRESS) return { address: null, portfolio: null, cash: null };
-  const now = Date.now();
-  if (now - walletCache.fetchedAt < WALLET_CACHE_MS) {
-    return { address: FUNDER_ADDRESS, ...walletCache };
-  }
-  // fetch both; one source failing must not blank the other (keep last known)
-  const [pf, cash] = await Promise.allSettled([
-    fetchPortfolioValue(FUNDER_ADDRESS),
-    fetchUsdcBalance(FUNDER_ADDRESS),
-  ]);
-  walletCache = {
-    fetchedAt: now,
-    portfolio: pf.status === "fulfilled" ? pf.value : walletCache.portfolio,
-    cash: cash.status === "fulfilled" ? cash.value : walletCache.cash,
-  };
-  return { address: FUNDER_ADDRESS, ...walletCache };
-}
-
 const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
@@ -214,12 +143,6 @@ const server = http.createServer(async (req, res) => {
     const withResults = trades.map((t) => ({ ...t, result: resultFor(t) }));
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify(withResults));
-  }
-
-  if (url === "/api/wallet") {
-    const snap = await getWalletSnapshot();
-    res.writeHead(200, { "content-type": "application/json" });
-    return res.end(JSON.stringify(snap));
   }
 
   if (url === "/api/status") {
