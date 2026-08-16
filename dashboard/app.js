@@ -523,6 +523,8 @@ function App() {
       copiedSort === "asc" ? betValue(a) - betValue(b) : betValue(b) - betValue(a)
     );
   }
+  // net P/L of exactly the rows shown in the copied list (filters applied)
+  const shownPl = filteredCopied.reduce((s, t) => s + betValue(t), 0);
 
   return html`
     <div>
@@ -599,6 +601,13 @@ function App() {
               ${String(selectedMarket.title).length > 32 ? String(selectedMarket.title).slice(0, 31) + "…" : selectedMarket.title}
               <button onClick=${() => setSelectedMarket(null)} aria-label="Clear market filter">✕</button>
             </span>`}
+            <span
+              className="toolbar-sum"
+              title="Net P/L of the entries shown below (wins − losses; pending counts as $0)"
+              style=${{ color: shownPl > 0 ? C_WIN : shownPl < 0 ? C_LOSS : "var(--dim)" }}
+            >
+              Σ ${fmtMoney(shownPl)}
+            </span>
           </div>
           <div className="list">
             ${copied.length === 0 && html`<div className="empty">Nothing copied yet</div>`}
