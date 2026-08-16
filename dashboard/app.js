@@ -39,6 +39,11 @@ function money(n) {
   return n == null ? "—" : `$${Number(n).toFixed(2)}`;
 }
 
+/** Share counts trimmed to 2 decimals (15.1515 -> 15.15, 20 -> 20). */
+function shares(n) {
+  return n == null ? "—" : parseFloat(Number(n).toFixed(2));
+}
+
 function Badge({ status }) {
   return html`<span className=${`badge b-${status}`}>${BADGE_LABEL[status] || status}</span>`;
 }
@@ -94,14 +99,23 @@ function CopiedTradeRow({ t }) {
           ${ok && html`<${ResultBadge} result=${t.result} copy=${c} />`}
         </span>
       </div>
+      ${ok &&
+      html`
+        <div className="meta compare">
+          <span className="who">trader</span>
+          <span>price ${t.theirPrice}</span>
+          <span>${money(t.theirUsdc)}</span>
+          <span>${shares(t.theirShares)} shares</span>
+        </div>
+        <div className="meta compare">
+          <span className="who">us</span>
+          <span>price ${c.price}</span>
+          <span>${money(c.spentUsdc)}</span>
+          <span>${shares(c.shares)} shares</span>
+        </div>
+      `}
       <div className="meta">
         <span className="outcome">${t.outcome}</span>
-        ${ok &&
-        html`
-          <span>price ${c.price}</span>
-          <span>${c.shares} shares</span>
-          <span>trader ${money(t.theirUsdc)} → us ${money(c.spentUsdc)}</span>
-        `}
         <span>${timeAgo(c.copiedAt)}</span>
         ${c.orderID && html`<span>order ${c.orderID.slice(0, 10)}…</span>`}
         ${ok && c.txHashes && c.txHashes[0] &&

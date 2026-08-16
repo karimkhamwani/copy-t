@@ -46,6 +46,9 @@
   .row .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
   .row .title { font-weight: 600; }
   .row .meta { color: var(--dim); font-size: 12px; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .row .meta.compare span:not(.who) { min-width: 84px; }
+  .row .meta .who { display: inline-block; min-width: 46px; font-size: 10px; font-weight: 700;
+                    text-transform: uppercase; letter-spacing: .06em; align-self: center; }
   .badge { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 5px; white-space: nowrap; }
   .b-success { background: rgba(46,204,113,.15); color: var(--green); }
   .b-failed { background: rgba(231,76,91,.15); color: var(--red); }
