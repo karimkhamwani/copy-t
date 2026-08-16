@@ -617,9 +617,13 @@ async function pollUser(wallet, state) {
     return;
   }
 
-  // Journal every newly observed buy, including ones we won't copy
+  // Journal every newly observed buy, including ones we won't copy.
+  // Skip trades already decided (in `seen`) whose journal row was evicted by
+  // the observed-pool cap — re-adding them would create zombie "pending" rows
+  // that never receive a verdict (the copy loop never revisits seen keys).
   for (const t of allBuys) {
-    if (journalIds.has(tradeKey(t))) continue;
+    const key = tradeKey(t);
+    if (journalIds.has(key) || state.seen.has(key)) continue;
     const status = matchesSubCategory(t, wallet.subCategories)
       ? "pending"
       : "filtered";
