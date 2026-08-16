@@ -492,8 +492,12 @@ function settleResolvedCopies() {
 
 /** USDC committed to copies whose market hasn't resolved yet (cost basis). */
 function getActiveUsdc() {
+  const mode = isDryRun ? "dry" : "live";
   let sum = 0;
   for (const e of successfulCopies()) {
+    // dry-run leftovers must not consume the LIVE cap (and vice versa):
+    // paper exposure isn't real money, so the gate only counts its own mode
+    if (e.copy.mode !== mode) continue;
     const c = e.conditionId && resolutions.get(e.conditionId);
     if (e.copy.settled || (c && c.resolved)) continue;
     sum += e.copy.spentUsdc || 0;
@@ -702,17 +706,18 @@ async function pollUser(wallet, state) {
     );
     try {
       const resp = await placeMarketBuy(trade, amount);
+      const fill = resp.dryRun ? null : parseLiveFill(resp, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
       tradesPlaced++;
-      const spent = resp.dryRun ? amount : Number(resp.makingAmount) || amount;
+      const spent = resp.dryRun ? amount : fill.spent;
       if (isDryRun) paperBalance -= spent; // paper: debit like a real fill
       balanceCache = { value: null, fetchedAt: 0 }; // live: balance changed, re-fetch
       const shares = resp.dryRun
         ? trade.price > 0
           ? amount / trade.price
           : 0
-        : Number(resp.takingAmount) || 0;
+        : fill.shares;
       journalUpdate(
         tradeKey(trade),
         {
@@ -796,6 +801,26 @@ function shutdownViaYarnDown(reason) {
       process.exit(1);
     }
   });
+}
+
+/**
+ * Extract the real fill from a live order response.
+ * A FAK can be accepted yet fill NOTHING (the book moved) — that is not a
+ * copy: throw so the normal failure path retries it until it goes stale,
+ * instead of journaling a phantom full-price position.
+ */
+function parseLiveFill(resp, intendedAmount) {
+  const shares = Number(resp.takingAmount);
+  if (!Number.isFinite(shares) || shares <= 0) {
+    throw new Error(
+      `order accepted but nothing filled (status ${resp.status || "?"})`,
+    );
+  }
+  const spent = Number(resp.makingAmount);
+  return {
+    spent: Number.isFinite(spent) && spent > 0 ? spent : intendedAmount,
+    shares,
+  };
 }
 
 async function pollOnce(state) {
@@ -895,5 +920,6 @@ module.exports = {
   pollUser,
   riskGateCheck,
   getActiveUsdc,
+  parseLiveFill,
   TARGET_WALLETS,
 };
