@@ -32,6 +32,7 @@ const {
   MAX_ACTIVE_PCT = "50", // cap: active bets <= this % of (balance + active). 0 = gate disabled
   DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
   RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
+  FETCH_FAIL_LIMIT = "3", // consecutive all-wallet network-failed polls before self-shutdown (yarn down). 0 = never
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
@@ -764,7 +765,41 @@ async function pollUser(wallet, state) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Network-failure self-shutdown: if every wallet poll fails with a network
+// error for FETCH_FAIL_LIMIT consecutive cycles, the API is unreachable from
+// this machine — run `yarn down` (pm2 delete) instead of spinning forever.
+// A plain process.exit would NOT work here: pm2 would just restart us.
+// ---------------------------------------------------------------------------
+
+const fetchFailLimit = Math.max(0, Number(FETCH_FAIL_LIMIT) || 0); // 0 = disabled
+let consecutiveNetFails = 0;
+let shuttingDown = false;
+
+const isNetworkError = (err) =>
+  /fetch failed|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|activity API timeout/i.test(
+    String(err?.message || err),
+  );
+
+function shutdownViaYarnDown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`SHUTTING DOWN (yarn down): ${reason}`);
+  writeStatus();
+  const { exec } = require("child_process");
+  exec("yarn down", { cwd: __dirname }, (err, stdout, stderr) => {
+    // if pm2 delete worked, this process is already dead before the callback;
+    // reaching here with an error means yarn/pm2 wasn't available — exit hard
+    // so at least this process stops (pm2 may restart it, but we tried).
+    if (err) {
+      log("yarn down failed:", stderr || err.message);
+      process.exit(1);
+    }
+  });
+}
+
 async function pollOnce(state) {
+  let netFails = 0;
   for (const wallet of targetWallets) {
     try {
       await pollUser(wallet, state);
@@ -773,7 +808,20 @@ async function pollOnce(state) {
         `[${wallet.category}:${wallet.address}] poll error:`,
         err.message || err,
       );
+      if (isNetworkError(err)) netFails++;
     }
+  }
+  // every wallet failed with a network error -> the API is unreachable
+  if (targetWallets.length > 0 && netFails === targetWallets.length) {
+    consecutiveNetFails++;
+    if (fetchFailLimit && consecutiveNetFails >= fetchFailLimit) {
+      shutdownViaYarnDown(
+        `${consecutiveNetFails} consecutive polls failed with network errors ` +
+          `(FETCH_FAIL_LIMIT=${fetchFailLimit})`,
+      );
+    }
+  } else {
+    consecutiveNetFails = 0;
   }
 }
 
