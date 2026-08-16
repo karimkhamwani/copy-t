@@ -332,10 +332,12 @@ const MARKET_CHART_MAX = 10;
 /** Horizontal bar chart: how many bets we placed in each market. Click a bar to
     filter the copied-trades list to that market (click again to clear). */
 function MarketBetsChart({ copied, selectedMarket, onSelectMarket }) {
+  const [showAll, setShowAll] = useState(false);
   const all = marketBets(copied);
   if (all.length === 0)
     return html`<div className="empty">No placed bets to chart per market yet</div>`;
-  const data = all.slice(-MARKET_CHART_MAX); // most recent markets, oldest at the top
+  // most recent markets by default, oldest at the top; "show all" expands
+  const data = showAll ? all : all.slice(-MARKET_CHART_MAX);
 
   const toggle = (d) => {
     const key = d?.payload?.key ?? d?.key;
@@ -351,11 +353,16 @@ function MarketBetsChart({ copied, selectedMarket, onSelectMarket }) {
   return html`
     <div className="market-chart">
       <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
-        Bets placed per market, oldest first${all.length > data.length ? ` (last ${data.length} of ${all.length})` : ""}
+        Bets placed per market, oldest first${!showAll && all.length > data.length ? ` (last ${data.length} of ${all.length})` : showAll ? ` (all ${all.length})` : ""}
+        ${all.length > MARKET_CHART_MAX &&
+        html` — <a href="#" onClick=${(e) => { e.preventDefault(); setShowAll(!showAll); }}>
+          ${showAll ? "show last 10" : "show all"}
+        </a>`}
         — ${selectedMarket
           ? html`filtering copied trades, <a href="#" onClick=${(e) => { e.preventDefault(); onSelectMarket(null); }}>clear</a>`
           : "click a bar to filter copied trades"}
       </div>
+      <div style=${showAll ? { maxHeight: 360, overflowY: "auto" } : null}>
       <${ResponsiveContainer} width="100%" height=${Math.max(104, data.length * 30 + 64)}>
         <${BarChart} data=${data} layout="vertical" margin=${{ top: 0, right: 28, left: 8, bottom: 0 }} barCategoryGap="30%">
           <${CartesianGrid} horizontal=${false} stroke=${CH.grid} />
@@ -377,6 +384,7 @@ function MarketBetsChart({ copied, selectedMarket, onSelectMarket }) {
           <//>
         <//>
       <//>
+      </div>
     </div>`;
 }
 
