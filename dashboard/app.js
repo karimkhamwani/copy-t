@@ -561,6 +561,10 @@ function App() {
           <span className="stats">
             <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>
             <span>poll ${(status.pollIntervalMs || 0) / 1000}s</span>
+            ${status.wsEnabled != null &&
+            html`<span style=${{ color: status.wsEnabled && !status.wsConnected ? "var(--orange)" : undefined }}>
+              signal ${status.wsConnected ? "ws ⚡" : status.wsEnabled ? "ws down → poll" : "poll"}
+            </span>`}
             <span>placed ${status.tradesPlaced ?? 0}${status.maxTrades ? `/${status.maxTrades}` : ""}</span>
             <span>
               targets:${" "}

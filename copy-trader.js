@@ -33,6 +33,8 @@ const {
   DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
   RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
   FETCH_FAIL_LIMIT = "3", // consecutive all-wallet network-failed polls before self-shutdown (yarn down). 0 = never
+  WS_ENABLED = "1", // 1 = real-time websocket trade feed is the primary signal (poller stays as fallback)
+  WS_URL = "wss://ws-live-data.polymarket.com",
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
@@ -254,6 +256,8 @@ function writeStatus() {
       targets: targetWallets,
       startedAt: engineStartedAt,
       maxActivePct,
+      wsEnabled,
+      wsConnected,
       paperBalance: isDryRun ? paperBalance : undefined,
       balance: riskSnapshot.balance,
       activeUsdc: riskSnapshot.activeUsdc,
@@ -649,7 +653,11 @@ async function pollUser(wallet, state) {
 
   // Oldest first so we copy in the order they traded
   copyable.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  await copyTrades(wallet, copyable, state, tag);
+}
 
+/** Copy a batch of fresh, non-stale BUY trades (shared by poller and ws feed). */
+async function copyTrades(wallet, copyable, state, tag) {
   for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
 
@@ -823,6 +831,74 @@ function parseLiveFill(resp, intendedAmount) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Real-time websocket feed (primary signal) + serialization
+// ---------------------------------------------------------------------------
+
+const wsEnabled = WS_ENABLED === "1" || WS_ENABLED.toLowerCase() === "true";
+let wsConnected = false;
+
+// The poller and the ws feed share mutable state (seen set, journal, gate,
+// tradesPlaced). Everything flows through one serial queue so a ws event can
+// never interleave mid-poll and double-copy or race the risk gate.
+let workQueue = Promise.resolve();
+function serialize(fn) {
+  const run = workQueue.then(fn);
+  workQueue = run.catch((err) => log("queued task error:", err.message || err));
+  return run;
+}
+
+const walletsByAddress = new Map(targetWallets.map((w) => [w.address, w]));
+
+/**
+ * One trade row arriving from the websocket (already activity-API shaped).
+ * Mirrors the poller's pipeline: baseline guard, journal, sub-category filter,
+ * staleness, dedupe, then the shared copyTrades().
+ */
+async function handleWsTrade(row, state) {
+  const wallet = walletsByAddress.get(String(row.proxyWallet || "").toLowerCase());
+  if (!wallet) return; // not a wallet we follow
+  if (!state.baselined.has(wallet.address)) return; // poller baselines first
+  const [buy] = filterBuys([row]);
+  if (!buy) return; // sells / malformed
+  const key = tradeKey(buy);
+  if (state.seen.has(key)) return; // already copied/skipped (poll or ws)
+  const tag = `[ws:${wallet.category}:${wallet.address}]`;
+
+  const matches = matchesSubCategory(buy, wallet.subCategories);
+  if (!journalIds.has(key)) {
+    journalAdd(observedEntry(buy, wallet, matches ? "pending" : "filtered"));
+  }
+  if (!matches) return;
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (wallet.maxTradeAgeSec && nowSec - (buy.timestamp || 0) > wallet.maxTradeAgeSec) {
+    state.seen.add(key);
+    saveState(state);
+    journalUpdate(key, { status: "stale" });
+    return;
+  }
+  await copyTrades(wallet, [buy], state, tag);
+}
+
+function startWsFeed(state) {
+  const { createLiveTradeFeed } = require("./live-trades-ws.js");
+  return createLiveTradeFeed({
+    url: WS_URL,
+    log,
+    onStatus: (up) => {
+      wsConnected = up;
+      log(up ? "ws: live feed is PRIMARY signal" : "ws: feed down — poller is covering");
+      writeStatus();
+    },
+    onTrade: (row) => {
+      // cheap pre-filter before paying for the queue
+      if (!walletsByAddress.has(String(row.proxyWallet || "").toLowerCase())) return;
+      serialize(() => handleWsTrade(row, state));
+    },
+  });
+}
+
 async function pollOnce(state) {
   let netFails = 0;
   for (const wallet of targetWallets) {
@@ -897,9 +973,15 @@ async function main() {
   const state = loadState();
   writeStatus();
 
+  if (wsEnabled) {
+    startWsFeed(state);
+    log(`ws: real-time feed enabled (${WS_URL}) — poller runs as fallback`);
+  }
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
-    await pollOnce(state);
+    // through the same queue as ws events, so the two sources never interleave
+    await serialize(() => pollOnce(state));
     writeStatus();
     await new Promise((r) => setTimeout(r, pollInterval));
   }
@@ -921,5 +1003,6 @@ module.exports = {
   riskGateCheck,
   getActiveUsdc,
   parseLiveFill,
+  handleWsTrade,
   TARGET_WALLETS,
 };

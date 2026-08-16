@@ -4,14 +4,32 @@
     {
       "name": "dashboard",
       "runtimeExecutable": "node",
-      "runtimeArgs": ["dashboard-server.js"],
+      "runtimeArgs": [
+        "dashboard-server.js"
+      ],
       "port": 3210
     },
     {
       "name": "dashboard-alt",
       "runtimeExecutable": "env",
-      "runtimeArgs": ["DASHBOARD_PORT=3213", "node", "dashboard-server.js"],
+      "runtimeArgs": [
+        "DASHBOARD_PORT=3213",
+        "node",
+        "dashboard-server.js"
+      ],
       "port": 3213
+    },
+    {
+      "name": "scratch-static",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "3217",
+        "--directory",
+        "/private/tmp/claude-503/-Users-KLiaquat-Desktop-work-copy-t/d0317ae7-5356-4ca8-8caf-ea5671f19590/scratchpad"
+      ],
+      "port": 3217
     }
   ]
 }
