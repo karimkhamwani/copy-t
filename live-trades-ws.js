@@ -1,8 +1,7 @@
 /**
  * Real-time trade feed from Polymarket's live-data websocket (the stream that
- * powers polymarket.com's activity feed). Trades arrive here in ~1s, versus
- * 13–25s on the REST activity API — this is the copy-trader's primary signal;
- * the poller stays as fallback + reconciliation (dedupe makes overlap safe).
+ * powers polymarket.com's activity feed). Trades arrive here in ~1s — this is
+ * the copy-trader's sole trade signal.
  *
  * Emits rows normalized to the activity-API shape the engine already speaks:
  *   { type:"TRADE", side, transactionHash, asset, conditionId, price, size,
