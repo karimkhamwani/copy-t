@@ -35,6 +35,7 @@ const {
   FETCH_FAIL_LIMIT = "3", // consecutive all-wallet network-failed polls before self-shutdown (yarn down). 0 = never
   WS_ENABLED = "1", // 1 = real-time websocket trade feed is the primary signal (poller stays as fallback)
   WS_URL = "wss://ws-live-data.polymarket.com",
+  WS_DEBUG = "0", // 1 = log every raw ws message (verbose; first 3 after connect are always logged)
   DRY_RUN = "0",
   SEEN_FILE = path.join(__dirname, "seen-trades.json"),
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
@@ -908,6 +909,7 @@ function startWsFeed(state) {
   return createLiveTradeFeed({
     url: WS_URL,
     log,
+    debug: WS_DEBUG === "1" || WS_DEBUG.toLowerCase() === "true",
     onStatus: (up) => {
       wsConnected = up;
       log(up ? "ws: live feed is PRIMARY signal" : "ws: feed down — poller is covering");

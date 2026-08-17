@@ -81,7 +81,12 @@ function createLiveTradeFeed({
   pingIntervalMs = 20000,
   idleTimeoutMs = 90000,
   maxBackoffMs = 30000,
+  debug = false, // true = log EVERY raw message (verbose!)
 } = {}) {
+  // Even without debug, log the first few raw messages after each connect so
+  // the stream's real shape is always visible in the logs.
+  const FIRST_MESSAGES_TO_LOG = 3;
+  let firstLogged = 0;
   const WebSocket = WebSocketImpl || require("ws");
   let ws = null;
   let closed = false;
@@ -118,6 +123,7 @@ function createLiveTradeFeed({
 
     ws.on("open", () => {
       backoff = 1000;
+      firstLogged = 0; // re-log the first messages after every (re)connect
       setConnected(true);
       log("ws: connected to", url);
       // subscribe to the global trades stream (filtering happens engine-side)
@@ -135,9 +141,17 @@ function createLiveTradeFeed({
 
     ws.on("message", (raw) => {
       resetIdle();
+      const text = raw.toString();
+      if (debug || firstLogged < FIRST_MESSAGES_TO_LOG) {
+        firstLogged++;
+        log(
+          `ws: recv${debug ? "" : ` (first ${firstLogged}/${FIRST_MESSAGES_TO_LOG})`}:`,
+          text.length > 800 ? text.slice(0, 800) + `… [${text.length} chars]` : text,
+        );
+      }
       let msg;
       try {
-        msg = JSON.parse(raw.toString());
+        msg = JSON.parse(text);
       } catch {
         return; // non-JSON keepalives are fine
       }
