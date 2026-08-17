@@ -44,6 +44,38 @@ function shares(n) {
   return n == null ? "—" : parseFloat(Number(n).toFixed(2));
 }
 
+/** Duration in ms -> "0.8s" / "12.4s" / "2m 05s". */
+function dur(ms) {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return "—";
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(1)}s`;
+  return `${Math.floor(s / 60)}m ${String(Math.round(s % 60)).padStart(2, "0")}s`;
+}
+
+/** Clock time with millisecond precision for latency tooltips. */
+function clockMs(ms) {
+  if (!ms) return "—";
+  const d = new Date(ms);
+  return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
+}
+
+/** Signal-received -> bet-placed latency line for a copied row. */
+function LatencyLine({ t }) {
+  const c = t.copy || {};
+  if (!c.copiedAt || !t.observedAt) return null;
+  const sigToBet = c.copiedAt - t.observedAt; // our processing (gate + order)
+  const tradeToBet = t.tradedAt ? c.copiedAt - t.tradedAt : null; // total vs trader
+  const tone = tradeToBet == null ? undefined
+    : tradeToBet <= 3000 ? "var(--green)" : tradeToBet <= 10000 ? "var(--orange)" : "var(--red)";
+  const tip =
+    `trader traded  ${clockMs(t.tradedAt)}\n` +
+    `signal received ${clockMs(t.observedAt)} (${c.source || "?"})\n` +
+    `bet placed      ${clockMs(c.copiedAt)}`;
+  return html`<span title=${tip} style=${{ color: tone }}>
+    ${c.source === "ws" ? "⚡" : "⟳"} sig→bet ${dur(sigToBet)} · trade→bet ${tradeToBet == null ? "—" : dur(tradeToBet)}
+  </span>`;
+}
+
 function Badge({ status }) {
   return html`<span className=${`badge b-${status}`}>${BADGE_LABEL[status] || status}</span>`;
 }
@@ -117,6 +149,7 @@ function CopiedTradeRow({ t }) {
       <div className="meta">
         <span className="outcome">${t.outcome}</span>
         <span>${timeAgo(c.copiedAt)}</span>
+        ${ok && html`<${LatencyLine} t=${t} />`}
         ${c.orderID && html`<span>order ${c.orderID.slice(0, 10)}…</span>`}
         ${ok && c.txHashes && c.txHashes[0] &&
         html`<a href=${`https://polygonscan.com/tx/${c.txHashes[0]}`} target="_blank" rel="noreferrer">tx ↗</a>`}

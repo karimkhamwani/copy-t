@@ -467,10 +467,24 @@ function successfulCopies() {
   return journal.filter((e) => e.copy && e.status === "success");
 }
 
+/** Market close time (ms) parsed from up/down slugs like "eth-updown-5m-1786848600". */
+function marketCloseMs(slug) {
+  const m = /-(\d+)m-(\d{10})$/.exec(slug || "");
+  return m ? (Number(m[2]) + Number(m[1]) * 60) * 1000 : null;
+}
+
 function refreshResolutions() {
+  const now = Date.now();
   return resolutions.refresh(
     successfulCopies()
-      .filter((e) => !e.copy.settled)
+      .filter((e) => {
+        if (e.copy.settled) return false;
+        // a market cannot resolve before it closes — don't waste lookups
+        // mid-market; ask the moment the clock passes the close time
+        // (unparseable slugs are checked normally as a safe fallback)
+        const closeMs = marketCloseMs(e.slug);
+        return !closeMs || now >= closeMs;
+      })
       .map((e) => e.conditionId),
   );
 }
@@ -662,6 +676,8 @@ async function pollUser(wallet, state) {
 
 /** Copy a batch of fresh, non-stale BUY trades (shared by poller and ws feed). */
 async function copyTrades(wallet, copyable, state, tag) {
+  // which pipeline delivered the signal — recorded per copy for latency stats
+  const source = tag.startsWith("[ws") ? "ws" : "poll";
   for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
 
@@ -742,6 +758,7 @@ async function copyTrades(wallet, copyable, state, tag) {
           theirShares: trade.size,
           copy: {
             mode: isDryRun ? "dry" : "live",
+            source, // ws | poll — which pipeline delivered the signal
             copiedAt: Date.now(),
             spentUsdc: Number(spent.toFixed(6)),
             shares: Number(shares.toFixed(4)),
@@ -771,6 +788,7 @@ async function copyTrades(wallet, copyable, state, tag) {
           status: "failed",
           copy: {
             mode: isDryRun ? "dry" : "live",
+            source,
             copiedAt: Date.now(),
             error: String(err.message || err),
           },
