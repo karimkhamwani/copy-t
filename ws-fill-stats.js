@@ -27,9 +27,12 @@ if (!targetWallet) {
 
 const WS_URL = process.env.WS_URL || "wss://ws-live-data.polymarket.com";
 
-// key = txHash:asset -> { fills: [{usdc, ts}], wallet, title, side, outcome }
+// key = txHash:asset -> { fills: [{usdc, ts}], wallet, title, side, outcome, slug }
 const keys = new Map();
 let events = 0;
+
+/** The markets this bot actually trades: crypto up/down (btc/eth/sol/xrp…). */
+const isCrypto = (k) => /-updown-/.test(k.slug || "");
 
 const feed = createLiveTradeFeed({
   url: WS_URL,
@@ -38,7 +41,7 @@ const feed = createLiveTradeFeed({
     events++;
     const k = `${r.transactionHash}:${r.asset}`;
     if (!keys.has(k)) {
-      keys.set(k, { fills: [], wallet: r.proxyWallet, title: r.title, side: r.side, outcome: r.outcome });
+      keys.set(k, { fills: [], wallet: r.proxyWallet, title: r.title, side: r.side, outcome: r.outcome, slug: r.slug });
     }
     keys.get(k).fills.push({ usdc: r.usdcSize || 0, ts: Date.now() });
   },
@@ -92,6 +95,20 @@ function report() {
         `${pad(tx.slice(0, 10) + "…", 12)} | ${rpad(k.fills.length, 5)} | ${pad($(k.f1), 8)} | ${pad($(k.t), 8)} | ${pad(k.wallet.slice(0, 8) + "…", 10)} | ${(k.title || "").slice(0, 40)}`,
       );
     }
+  }
+
+  // --- crypto up/down markets only (what the bot actually trades) ---
+  const crypto = all.filter(isCrypto);
+  const cryptoMulti = crypto.filter((k) => k.fills.length > 1);
+  console.log(`\n--- crypto up/down markets only ---`);
+  console.log(`orders: ${crypto.length} | multi-fill: ${cryptoMulti.length} (${crypto.length ? ((100 * cryptoMulti.length) / crypto.length).toFixed(1) : 0}%)`);
+  if (crypto.length) {
+    const f1 = crypto.reduce((s, k) => s + k.fills[0].usdc, 0);
+    const tt = crypto.reduce((s, k) => s + k.fills.reduce((x, f) => x + f.usdc, 0), 0);
+    let gap = 0;
+    for (const k of cryptoMulti) gap = Math.max(gap, k.fills[k.fills.length - 1].ts - k.fills[0].ts);
+    console.log(`first-fill sizing captures ${$(f1)} of ${$(tt)} (${tt ? ((100 * f1) / tt).toFixed(0) : 100}%)`);
+    console.log(`largest first→last fill gap in crypto: ${gap}ms`);
   }
 
   if (targetWallet) {
