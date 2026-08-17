@@ -59,20 +59,20 @@ function clockMs(ms) {
   return d.toLocaleTimeString([], { hour12: false }) + "." + String(d.getMilliseconds()).padStart(3, "0");
 }
 
-/** Signal-received -> bet-placed latency line for a copied row. */
+/** Trader's trade time vs our bet time for a copied row. */
 function LatencyLine({ t }) {
   const c = t.copy || {};
-  if (!c.copiedAt || !t.observedAt) return null;
-  const sigToBet = c.copiedAt - t.observedAt; // our processing (gate + order)
+  if (!c.copiedAt) return null;
   const tradeToBet = t.tradedAt ? c.copiedAt - t.tradedAt : null; // total vs trader
   const tone = tradeToBet == null ? undefined
     : tradeToBet <= 3000 ? "var(--green)" : tradeToBet <= 10000 ? "var(--orange)" : "var(--red)";
   const tip =
     `trader traded  ${clockMs(t.tradedAt)}\n` +
     `signal received ${clockMs(t.observedAt)} (${c.source || "?"})\n` +
-    `bet placed      ${clockMs(c.copiedAt)}`;
+    `bet placed      ${clockMs(c.copiedAt)}` +
+    (tradeToBet == null ? "" : `\ntrade→bet ${dur(tradeToBet)}`);
   return html`<span title=${tip} style=${{ color: tone }}>
-    ${c.source === "ws" ? "⚡" : "⟳"} sig→bet ${dur(sigToBet)} · trade→bet ${tradeToBet == null ? "—" : dur(tradeToBet)}
+    ${c.source === "ws" ? "⚡" : "⟳"} trader→us ${tradeToBet == null ? "—" : dur(tradeToBet)}
   </span>`;
 }
 
