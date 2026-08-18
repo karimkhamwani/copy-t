@@ -473,16 +473,17 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
     ? active > 0 ? "#4c9aff" : null
     : capUsage >= 0.999 ? C_LOSS : capUsage >= 0.9 ? "#f0a13a" : "#4c9aff";
 
-  // average trader→us copy latency, overall and per signal source
-  const lat = avgLatency(ok);
+  // average trader→us copy latency of the ACTIVE signal source (ws when
+  // connected, poll while it covers a ws outage) — the other one is secondary
   const latWs = avgLatency(ok.filter((t) => t.copy?.source === "ws"));
   const latPoll = avgLatency(ok.filter((t) => t.copy?.source === "poll"));
+  const wsActive = !!status?.wsConnected;
+  const lat = wsActive ? latWs : latPoll;
+  const latOther = wsActive ? latPoll : latWs;
   const latTone = lat == null ? null
     : lat <= 3000 ? C_WIN : lat <= 10000 ? "#f0a13a" : C_LOSS;
-  const latSub = [
-    latWs != null && `ws ⚡ ${dur(latWs)}`,
-    latPoll != null && `poll ⟳ ${dur(latPoll)}`,
-  ].filter(Boolean).join(" · ");
+  const latSub = latOther == null ? null
+    : `${wsActive ? "poll ⟳" : "ws ⚡"} ${dur(latOther)}`;
 
   return html`
     <div className="panel" style=${{ marginBottom: 16 }}>
@@ -498,10 +499,10 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
         <${StatTile} label="Lifetime loss" value=${`-$${totalLoss.toFixed(2)}`} tone=${totalLoss > 0 ? C_LOSS : null} />
         <${StatTile} label="Total spent" value=${`$${totalSpent.toFixed(2)}`} />
         <${StatTile}
-          label="Avg copy latency"
+          label=${`Avg copy latency (${wsActive ? "ws ⚡" : "poll ⟳"})`}
           value=${lat == null ? "—" : dur(lat)}
           tone=${latTone}
-          sub=${latSub || null}
+          sub=${latSub}
         />
         <${StatTile}
           label=${cap != null ? `Active in trading (${status.maxActivePct}% cap)` : "Active in trading"}
