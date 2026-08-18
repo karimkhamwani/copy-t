@@ -1,6 +1,6 @@
 /** Offline tests for the copy-trader logic (no network needed). */
 const assert = require("assert");
-const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory } = require("./copy-trader");
+const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory, priceBandReject, hedgeReject, marketCapReject, slippageCents } = require("./copy-trader");
 
 const sample = [
   { type: "TRADE", side: "BUY", transactionHash: "0xaaa", asset: "111", usdcSize: 50, price: 0.42, timestamp: 100, title: "Market A", outcome: "Yes" },
@@ -86,6 +86,55 @@ assert.strictEqual(
   // normalizeWallets carries sub_category through, lowercased
   const [w] = normalizeWallets([{ address: "0xA", category: "crypto", sub_category: [" BTC ", ""] }]);
   assert.deepStrictEqual(w.subCategories, ["btc"]);
+}
+
+// 8. Entry-price band: above the cap the upside is smaller than a real fill cost
+{
+  const band = { max: 0.85, min: 0.05 };
+  assert.strictEqual(priceBandReject(0.52, band), null);
+  assert.strictEqual(priceBandReject(0.85, band), null); // inclusive
+  assert.ok(priceBandReject(0.98, band).includes("above"));
+  assert.ok(priceBandReject(0.02, band).includes("below"));
+  // disabled (0) and unknown prices never reject
+  assert.strictEqual(priceBandReject(0.99, { max: 0, min: 0 }), null);
+  assert.strictEqual(priceBandReject(undefined, band), null);
+  assert.strictEqual(priceBandReject(0, band), null);
+}
+
+// 9. Self-hedge guard: never buy the outcome opposite one we already hold
+{
+  const copies = [
+    { conditionId: "0xmarket", asset: "UP", outcome: "Up", copy: { settled: false } },
+  ];
+  const down = { conditionId: "0xmarket", asset: "DOWN", outcome: "Down" };
+  const upAgain = { conditionId: "0xmarket", asset: "UP", outcome: "Up" };
+  const other = { conditionId: "0xother", asset: "DOWN", outcome: "Down" };
+  assert.ok(hedgeReject(down, copies).includes("Up"));
+  assert.strictEqual(hedgeReject(upAgain, copies), null); // scaling in is fine
+  assert.strictEqual(hedgeReject(other, copies), null); // different market
+  assert.strictEqual(hedgeReject(down, copies, { enabled: false }), null);
+  // a settled market is a clean slate
+  const settled = [{ ...copies[0], copy: { settled: true } }];
+  assert.strictEqual(hedgeReject(down, settled), null);
+}
+
+// 10. Per-market fill cap counts only open copies in that market
+{
+  const mk = (asset) => ({ conditionId: "0xm", asset, outcome: "Up", copy: { settled: false } });
+  const copies = [mk("UP"), mk("UP"), mk("UP")];
+  const trade = { conditionId: "0xm", asset: "UP", outcome: "Up" };
+  assert.strictEqual(marketCapReject(trade, copies, { max: 0 }), null); // disabled
+  assert.strictEqual(marketCapReject(trade, copies, { max: 5 }), null);
+  assert.ok(marketCapReject(trade, copies, { max: 3 }).includes("3 copies"));
+  assert.strictEqual(marketCapReject({ conditionId: "0xz", asset: "UP" }, copies, { max: 1 }), null);
+}
+
+// 11. Slippage in cents, ours vs theirs
+{
+  assert.strictEqual(slippageCents(0.53, 0.52), 1);
+  assert.strictEqual(slippageCents(0.5, 0.52), -2); // we filled better
+  assert.strictEqual(slippageCents(0.525, 0.52), 0.5);
+  assert.strictEqual(slippageCents(null, 0.52), null);
 }
 
 console.log("all tests passed");

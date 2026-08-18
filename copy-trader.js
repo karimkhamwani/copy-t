@@ -28,8 +28,16 @@ const {
   SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
   MAX_ACTIVE_PCT = "50", // cap: active bets <= this % of (balance + active). 0 = gate disabled
+  MAX_ENTRY_PRICE = "0.85", // skip entries above this price (upside < realistic slippage). 0 = off
+  MIN_ENTRY_PRICE = "0", // skip entries below this price (lottery tickets). 0 = off
+  ONE_SIDE_PER_MARKET = "1", // 1 = never buy the opposite outcome of a market we're already in
+  MAX_COPIES_PER_MARKET = "0", // stop copying a market after N fills (0 = unlimited)
+  LOG_THEIR_SELLS = "1", // 1 = journal the target's SELLs (observe-only) so exits are measurable
+  USE_BOOK_PRICE = "1", // 1 = read our real ask before copying: dry-run fills there, live records slippage
+  MAX_SLIPPAGE_CENTS = "1.5", // skip when our ask is this many cents worse than their fill. 0 = off
   DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
   RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
+  BASELINE_WINDOW_MS = "120000", // after startup, journal trades as baseline (no copying) for this long. 0 = off
   WS_URL = "wss://ws-live-data.polymarket.com",
   WS_DEBUG = "0", // 1 = log every raw ws message (verbose; first 3 after connect are always logged)
   DRY_RUN = "0",
@@ -47,7 +55,24 @@ const maxActivePct = Math.max(0, Number(MAX_ACTIVE_PCT) || 0); // 0 = disabled
 const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() === "true";
 const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
+const maxEntryPrice = Math.max(0, Number(MAX_ENTRY_PRICE) || 0); // 0 = disabled
+const minEntryPrice = Math.max(0, Number(MIN_ENTRY_PRICE) || 0); // 0 = disabled
+const oneSidePerMarket =
+  ONE_SIDE_PER_MARKET === "1" || ONE_SIDE_PER_MARKET.toLowerCase() === "true";
+const maxCopiesPerMarket = Math.max(0, Number(MAX_COPIES_PER_MARKET) || 0); // 0 = unlimited
+const logTheirSells =
+  LOG_THEIR_SELLS === "1" || LOG_THEIR_SELLS.toLowerCase() === "true";
+const useBookPrice =
+  USE_BOOK_PRICE === "1" || USE_BOOK_PRICE.toLowerCase() === "true";
+const maxSlippageCents = Math.max(0, Number(MAX_SLIPPAGE_CENTS) || 0); // 0 = disabled
 let tradesPlaced = 0;
+
+// Startup baseline window: for the first BASELINE_WINDOW_MS after boot, target
+// trades are journaled and marked seen but NOT copied — the engine observes
+// only, so it never chases positions it didn't watch develop from the start.
+const baselineWindowMs = Math.max(0, Number(BASELINE_WINDOW_MS) || 0);
+const bootAt = Date.now();
+const inBaselineWindow = () => Date.now() - bootAt < baselineWindowMs;
 
 /** Normalize wallet entries: lowercase addresses, drop empties, dedupe by address. */
 function normalizeWallets(list) {
@@ -142,7 +167,7 @@ function tradeKey(t) {
 // Trade journal + status (read by the dashboard)
 // ---------------------------------------------------------------------------
 
-// Rows WITHOUT a copy attempt (filtered/stale/pending) rotate in a
+// Rows WITHOUT a copy attempt (baseline/filtered/stale/pending) rotate in a
 // small pool so observation churn can't bloat the journal. Rows WITH a copy
 // attempt are NEVER evicted — the full lifetime copy history is kept.
 const MAX_OBSERVED_ENTRIES = 300;
@@ -264,6 +289,12 @@ function writeStatus() {
       targets: targetWallets,
       startedAt: engineStartedAt,
       maxActivePct,
+      maxEntryPrice,
+      minEntryPrice,
+      oneSidePerMarket,
+      maxCopiesPerMarket,
+      maxSlippageCents,
+      useBookPrice,
       wsConnected,
       paperBalance: isDryRun ? paperBalance : undefined,
       balance: riskSnapshot.balance,
@@ -359,6 +390,65 @@ function splitStale(trades, nowSec, maxAgeSec) {
 }
 
 /**
+ * Entry-price guard. Above maxEntryPrice the best case is smaller than a
+ * realistic fill cost (at 0.98 the whole upside is 2c); below minEntryPrice
+ * we're buying lottery tickets. Returns null when the entry is allowed,
+ * otherwise the reason string.
+ */
+function priceBandReject(
+  price,
+  { max = maxEntryPrice, min = minEntryPrice } = {},
+) {
+  const p = Number(price);
+  if (!Number.isFinite(p) || p <= 0) return null; // unknown price -> other guards decide
+  if (max && p > max) return `entry ${p} above MAX_ENTRY_PRICE ${max}`;
+  if (min && p < min) return `entry ${p} below MIN_ENTRY_PRICE ${min}`;
+  return null;
+}
+
+/**
+ * Copies we already hold in a market, from the journal: { shares, assets }.
+ * `open` rows only — a settled market is a clean slate.
+ */
+function openCopiesInMarket(conditionId, copies) {
+  return (copies || []).filter(
+    (e) => e.conditionId && e.conditionId === conditionId && !e.copy.settled,
+  );
+}
+
+/**
+ * Buying both outcomes of the same market is a self-hedge: N shares of Up plus
+ * N of Down cost more than the $N they are guaranteed to pay back. The target
+ * can do it because they SELL to flatten; a buy-only copier just burns the
+ * spread. Returns a reason string when this trade would open the other side.
+ */
+function hedgeReject(trade, copies, { enabled = oneSidePerMarket } = {}) {
+  if (!enabled) return null;
+  const held = openCopiesInMarket(trade.conditionId, copies).find(
+    (e) => e.asset && e.asset !== trade.asset,
+  );
+  return held
+    ? `already long "${held.outcome}" in this market — not buying "${trade.outcome}" against it`
+    : null;
+}
+
+/** Per-market fill cap: keeps one market from eating the whole bankroll. */
+function marketCapReject(trade, copies, { max = maxCopiesPerMarket } = {}) {
+  if (!max) return null;
+  const n = openCopiesInMarket(trade.conditionId, copies).length;
+  return n >= max ? `already ${n} copies in this market (MAX_COPIES_PER_MARKET=${max})` : null;
+}
+
+/** How much worse (in cents) our ask is than the price they filled at. */
+function slippageCents(ourPrice, theirPrice) {
+  if (ourPrice == null || theirPrice == null) return null;
+  const a = Number(ourPrice);
+  const b = Number(theirPrice);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  return Number(((a - b) * 100).toFixed(2));
+}
+
+/**
  * USDC to spend on a copied trade.
  * - default: fixed MAX_BET_USDC, ignoring the trader's size
  * - MIRROR_TRADER_BET=1: match the trader's usdcSize, capped at MAX_BET_USDC
@@ -412,11 +502,37 @@ async function getClobClient() {
   return clobClient;
 }
 
-async function placeMarketBuy(trade, amountUsdc) {
+const ASK_TIMEOUT_MS = 1500; // a stale quote is worse than no quote
+
+/**
+ * The price WE would pay right now: best ask from the CLOB book. Copying is
+ * ~1s behind the target, so their fill price is not our fill price — this is
+ * the number that decides whether the edge survives. Returns null on any
+ * failure (fail-open: the copy proceeds on their price, unpriced).
+ */
+async function getAskPrice(tokenId) {
+  if (!useBookPrice || !tokenId) return null;
+  try {
+    const url = `${CLOB_API_HOST}/price?token_id=${tokenId}&side=buy`;
+    const json = await Promise.race([
+      getJson(url),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("ask timeout")), ASK_TIMEOUT_MS),
+      ),
+    ]);
+    const p = Number(json?.price);
+    return Number.isFinite(p) && p > 0 && p < 1 ? p : null;
+  } catch {
+    return null;
+  }
+}
+
+async function placeMarketBuy(trade, amountUsdc, entryPrice) {
   if (isDryRun) {
     log(
       `[DRY_RUN] would market-BUY $${amountUsdc} of "${trade.outcome}" ` +
-        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price})`,
+        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price}` +
+        `${entryPrice != null && entryPrice !== trade.price ? `, our ask ${entryPrice}` : ""})`,
     );
     return { dryRun: true };
   }
@@ -598,9 +714,26 @@ function observedEntry(trade, wallet, status) {
     theirPrice: trade.price,
     theirUsdc: trade.usdcSize,
     theirShares: trade.size,
-    status, // filtered | stale | pending | min-skip | success | failed
+    status, // baseline | filtered | stale | pending | their-sell | min-skip
+    // | hedge-skip | market-skip | price-skip | slippage-skip | risk-skip
+    // | success | failed
     copy: null, // filled in when we attempt the copy
   };
+}
+
+/**
+ * Record a trade we deliberately did not copy and never look at it again.
+ * Chasing a skipped trade later, at a moved price, is worse than missing it.
+ */
+function skipTrade(trade, wallet, state, status, reason, tag) {
+  state.seen.add(tradeKey(trade));
+  saveState(state);
+  journalUpdate(
+    tradeKey(trade),
+    { status, skipReason: reason },
+    observedEntry(trade, wallet, status),
+  );
+  log(`${tag} ${status.toUpperCase()} "${trade.title}": ${reason}`);
 }
 
 /** Copy a batch of fresh, non-stale BUY trades from the ws feed. */
@@ -636,6 +769,42 @@ async function copyTrades(wallet, copyable, state, tag) {
       continue;
     }
 
+    // Self-hedge guard: never take the other side of a market we're in.
+    const copies = successfulCopies();
+    const hedge = hedgeReject(trade, copies);
+    if (hedge) {
+      skipTrade(trade, wallet, state, "hedge-skip", hedge, tag);
+      continue;
+    }
+    const capped = marketCapReject(trade, copies);
+    if (capped) {
+      skipTrade(trade, wallet, state, "market-skip", capped, tag);
+      continue;
+    }
+
+    // What WE would pay, not what they paid. Null = book unavailable.
+    const ask = await getAskPrice(trade.asset);
+    const entryPrice = ask ?? trade.price;
+    const slip = ask == null ? null : slippageCents(ask, trade.price);
+
+    const band = priceBandReject(entryPrice);
+    if (band) {
+      skipTrade(trade, wallet, state, "price-skip", band, tag);
+      continue;
+    }
+    if (maxSlippageCents && slip != null && slip > maxSlippageCents) {
+      skipTrade(
+        trade,
+        wallet,
+        state,
+        "slippage-skip",
+        `our ask ${ask} is ${slip}c worse than their ${trade.price} ` +
+          `(MAX_SLIPPAGE_CENTS=${maxSlippageCents})`,
+        tag,
+      );
+      continue;
+    }
+
     const amount = betAmount(trade);
 
     // Risk gate: never let active-in-trading exceed MAX_ACTIVE_PCT of the
@@ -661,7 +830,7 @@ async function copyTrades(wallet, copyable, state, tag) {
         `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
     );
     try {
-      const resp = await placeMarketBuy(trade, amount);
+      const resp = await placeMarketBuy(trade, amount, entryPrice);
       const fill = resp.dryRun ? null : parseLiveFill(resp, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
@@ -669,9 +838,11 @@ async function copyTrades(wallet, copyable, state, tag) {
       const spent = resp.dryRun ? amount : fill.spent;
       if (isDryRun) paperBalance -= spent; // paper: debit like a real fill
       balanceCache = { value: null, fetchedAt: 0 }; // live: balance changed, re-fetch
+      // Dry-run fills at OUR ask, not their price: a paper edge measured at
+      // their fill price is the edge we do not get.
       const shares = resp.dryRun
-        ? trade.price > 0
-          ? amount / trade.price
+        ? entryPrice > 0
+          ? amount / entryPrice
           : 0
         : fill.shares;
       journalUpdate(
@@ -691,6 +862,9 @@ async function copyTrades(wallet, copyable, state, tag) {
             spentUsdc: Number(spent.toFixed(6)),
             shares: Number(shares.toFixed(4)),
             price: shares > 0 ? Number((spent / shares).toFixed(4)) : trade.price,
+            bookAsk: ask, // our quote at copy time (null = book unavailable)
+            slippageCents:
+              shares > 0 ? slippageCents(spent / shares, trade.price) : slip,
             orderID: resp.orderID || null,
             txHashes: resp.transactionsHashes || [],
           },
@@ -774,11 +948,37 @@ const walletsByAddress = new Map(targetWallets.map((w) => [w.address, w]));
 async function handleWsTrade(row, state) {
   const wallet = walletsByAddress.get(String(row.proxyWallet || "").toLowerCase());
   if (!wallet) return; // not a wallet we follow
+  // Their exits are the half of the strategy a buy-only copier never sees.
+  // We don't mirror them (we hold to resolution) but we log them, so
+  // "do they flatten before expiry?" is answerable from the journal.
+  if (String(row.side || "").toUpperCase() === "SELL") {
+    if (
+      logTheirSells &&
+      row.transactionHash &&
+      row.asset &&
+      matchesSubCategory(row, wallet.subCategories)
+    ) {
+      journalAdd(observedEntry(row, wallet, "their-sell"));
+    }
+    return;
+  }
   const [buy] = filterBuys([row]);
   if (!buy) return; // sells / malformed
   const key = tradeKey(buy);
   if (state.seen.has(key)) return; // already copied/skipped
   const tag = `[ws:${wallet.category}:${wallet.address}]`;
+
+  // Startup baseline window: observe and record, never copy.
+  if (inBaselineWindow()) {
+    state.seen.add(key);
+    saveState(state);
+    journalAdd(observedEntry(buy, wallet, "baseline"));
+    log(
+      `${tag} baseline: observed "${buy.title}" / ${buy.outcome} — not copying ` +
+        `(${Math.ceil((baselineWindowMs - (Date.now() - bootAt)) / 1000)}s left in window)`,
+    );
+    return;
+  }
 
   const matches = matchesSubCategory(buy, wallet.subCategories);
   if (!journalIds.has(key)) {
@@ -867,6 +1067,15 @@ async function main() {
 
   startWsFeed(state);
   log(`ws: real-time trade feed is the sole signal (${WS_URL})`);
+  if (baselineWindowMs > 0) {
+    log(
+      `baseline window: observing only for the first ${baselineWindowMs / 1000}s — no copies until it ends`,
+    );
+    setTimeout(
+      () => log("baseline window over — copying enabled"),
+      baselineWindowMs,
+    );
+  }
 
   setInterval(() => {
     // through the queue so a status write can't observe a half-applied copy
@@ -886,6 +1095,10 @@ module.exports = {
   normalizeWallets,
   splitStale,
   matchesSubCategory,
+  priceBandReject,
+  hedgeReject,
+  marketCapReject,
+  slippageCents,
   riskGateCheck,
   getActiveUsdc,
   parseLiveFill,
