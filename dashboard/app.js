@@ -300,6 +300,54 @@ function PnlChart({ copied }) {
     </div>`;
 }
 
+/** Line chart of per-copy trader→us latency (trade timestamp -> bet placed). */
+function LatencyChart({ copied, status }) {
+  const pts = copied
+    .filter((t) => t.status === "success" && t.tradedAt && t.copy?.copiedAt)
+    .sort((a, b) => a.copy.copiedAt - b.copy.copiedAt)
+    .map((t) => ({
+      label: new Date(t.copy.copiedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+      latency: Number(((t.copy.copiedAt - t.tradedAt) / 1000).toFixed(1)),
+      source: t.copy.source || "?",
+    }));
+  if (pts.length < 2)
+    return html`<div className="empty">Need at least 2 copies to chart latency</div>`;
+
+  const avg = pts.reduce((s, p) => s + p.latency, 0) / pts.length;
+  // distinct per-wallet stale cutoffs, shown as red dashed reference lines
+  const cutoffs = [...new Set(
+    (status?.targets || []).map((w) => w.maxTradeAgeSec).filter((v) => v > 0),
+  )];
+
+  const dot = (p) => html`<circle
+    key=${`lat-${p.index}`} cx=${p.cx} cy=${p.cy} r="2.5"
+    fill=${p.payload.source === "ws" ? "#4c9aff" : "#f0a13a"}
+    stroke=${CH.surface} strokeWidth="1.5" />`;
+
+  return html`
+    <div>
+      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
+        Copy latency trader→us — avg <b>${dur(avg * 1000)}</b>
+        ${" "}(dots: <span style=${{ color: "#4c9aff" }}>ws ⚡</span> /
+        <span style=${{ color: "#f0a13a" }}> poll ⟳</span>)
+      </div>
+      <${ResponsiveContainer} width="100%" height=${160}>
+        <${LineChart} data=${pts} margin=${{ top: 10, right: 12, left: -16, bottom: 0 }}>
+          <${CartesianGrid} vertical=${false} stroke=${CH.grid} />
+          <${XAxis} dataKey="label" tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} interval="preserveStartEnd" minTickGap=${30} />
+          <${YAxis} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false} tickFormatter=${(v) => `${v}s`} domain=${[0, "auto"]} />
+          <${Tooltip} ...${TIP_STYLE}
+            formatter=${(v, name, entry) => [`${v}s (${entry?.payload?.source || "?"})`, "trader→us"]} />
+          ${cutoffs.map((c) => html`<${ReferenceLine}
+            key=${`cutoff-${c}`} y=${c} stroke=${C_LOSS} strokeDasharray="3 3"
+            label=${{ value: `stale cutoff ${c}s`, position: "insideTopRight", fontSize: 10, fill: C_LOSS }} />`)}
+          <${Line} type="monotone" dataKey="latency" name="trader→us" stroke="#8a7ef0" strokeWidth=${2}
+            dot=${dot} activeDot=${{ r: 5 }} isAnimationActive=${false} />
+        <//>
+      <//>
+    </div>`;
+}
+
 /** Market close time (ms) parsed from up/down slugs like "btc-updown-5m-1786744800". */
 function parseMarketEnd(t) {
   const m = /-(\d+)m-(\d{10})$/.exec(t.slug || "");
@@ -513,6 +561,7 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
       <div style=${{ padding: "0 14px 12px" }}>
         <${WinLossChart} copied=${copied} />
         <${PnlChart} copied=${copied} />
+        <${LatencyChart} copied=${copied} status=${status} />
         <${ActiveChart} copied=${copied} />
         <${MarketBetsChart} copied=${copied} selectedMarket=${selectedMarket} onSelectMarket=${onSelectMarket} />
       </div>
