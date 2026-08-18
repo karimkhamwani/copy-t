@@ -164,12 +164,22 @@ const C_WIN = "#29a75e";
 const C_LOSS = "#c04a5c";
 const C_PENDING = "#5c6675";
 
-function StatTile({ label, value, tone }) {
+function StatTile({ label, value, tone, sub }) {
   return html`
     <div className="tile">
       <div className="tile-label">${label}</div>
       <div className="tile-value" style=${tone ? { color: tone } : null}>${value}</div>
+      ${sub && html`<div className="tile-label" style=${{ marginTop: 2 }}>${sub}</div>`}
     </div>`;
+}
+
+/** Mean trader→us latency (tradedAt -> copiedAt) over successful copies. */
+function avgLatency(trades) {
+  const samples = trades
+    .map((t) => (t.tradedAt && t.copy?.copiedAt ? t.copy.copiedAt - t.tradedAt : null))
+    .filter((ms) => ms != null && ms >= 0);
+  if (!samples.length) return null;
+  return samples.reduce((s, ms) => s + ms, 0) / samples.length;
 }
 
 /** Hourly buckets of copied trades: { label, win, loss, pending }. */
@@ -463,6 +473,17 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
     ? active > 0 ? "#4c9aff" : null
     : capUsage >= 0.999 ? C_LOSS : capUsage >= 0.9 ? "#f0a13a" : "#4c9aff";
 
+  // average trader→us copy latency, overall and per signal source
+  const lat = avgLatency(ok);
+  const latWs = avgLatency(ok.filter((t) => t.copy?.source === "ws"));
+  const latPoll = avgLatency(ok.filter((t) => t.copy?.source === "poll"));
+  const latTone = lat == null ? null
+    : lat <= 3000 ? C_WIN : lat <= 10000 ? "#f0a13a" : C_LOSS;
+  const latSub = [
+    latWs != null && `ws ⚡ ${dur(latWs)}`,
+    latPoll != null && `poll ⟳ ${dur(latPoll)}`,
+  ].filter(Boolean).join(" · ");
+
   return html`
     <div className="panel" style=${{ marginBottom: 16 }}>
       <h2>Analytics</h2>
@@ -476,6 +497,12 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
         <${StatTile} label="Lifetime profit" value=${`+$${totalProfit.toFixed(2)}`} tone=${totalProfit > 0 ? C_WIN : null} />
         <${StatTile} label="Lifetime loss" value=${`-$${totalLoss.toFixed(2)}`} tone=${totalLoss > 0 ? C_LOSS : null} />
         <${StatTile} label="Total spent" value=${`$${totalSpent.toFixed(2)}`} />
+        <${StatTile}
+          label="Avg copy latency"
+          value=${lat == null ? "—" : dur(lat)}
+          tone=${latTone}
+          sub=${latSub || null}
+        />
         <${StatTile}
           label=${cap != null ? `Active in trading (${status.maxActivePct}% cap)` : "Active in trading"}
           value=${cap != null ? `$${active.toFixed(2)} / $${cap.toFixed(2)}` : `$${active.toFixed(2)}`}
