@@ -666,6 +666,7 @@ function App() {
   const [balance, setBalance] = useState(null);
   const [copiedFilter, setCopiedFilter] = useState("all");
   const [copiedSort, setCopiedSort] = useState("none");
+  const [outcomeFilter, setOutcomeFilter] = useState("all"); // all | up | down
   const [selectedMarket, setSelectedMarket] = useState(null); // { key, title } from the per-market chart
 
   useEffect(() => {
@@ -722,6 +723,11 @@ function App() {
   const dupes = duplicateKeys(copied);
   const srcCounts = sourceCounts(copied);
   let filteredCopied = copied.filter(COPIED_FILTERS[copiedFilter].match);
+  if (outcomeFilter !== "all") {
+    filteredCopied = filteredCopied.filter(
+      (t) => String(t.outcome || "").toLowerCase() === outcomeFilter,
+    );
+  }
   if (selectedMarket) {
     filteredCopied = filteredCopied.filter((t) => marketKey(t) === selectedMarket.key);
   }
@@ -789,7 +795,7 @@ function App() {
 
         <div className="panel">
           <h2>
-            Copied trades (${filteredCopied.length}${copiedFilter !== "all" || selectedMarket ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
+            Copied trades (${filteredCopied.length}${copiedFilter !== "all" || outcomeFilter !== "all" || selectedMarket ? `/${copied.length}` : ""}) — ✓ ${successes} ✗ ${failures} · W ${wins} / L ${losses}
           </h2>
           <div className="toolbar">
             <select
@@ -801,6 +807,16 @@ function App() {
               ${Object.entries(COPIED_FILTERS).map(
                 ([k, f]) => html`<option key=${k} value=${k}>${f.label}</option>`
               )}
+            </select>
+            <select
+              className="filter"
+              value=${outcomeFilter}
+              onChange=${(e) => setOutcomeFilter(e.target.value)}
+              aria-label="Filter copied trades by outcome (Up/Down)"
+            >
+              <option value="all">Up+Down</option>
+              <option value="up">Up</option>
+              <option value="down">Down</option>
             </select>
             ${copiedFilter !== "all" &&
             html`<select
