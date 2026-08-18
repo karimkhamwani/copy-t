@@ -91,11 +91,30 @@ function log(...args) {
 // Seen-trade persistence (so restarts don't re-place old trades)
 // ---------------------------------------------------------------------------
 
-/** Write JSON atomically (tmp file + rename) so a mid-write crash can't corrupt it. */
+/**
+ * Write JSON atomically (tmp file + rename) so a mid-write crash can't corrupt it.
+ * On Windows the rename fails with EPERM/EBUSY while another process (dashboard
+ * read, antivirus scan, OneDrive sync) briefly holds the target open. Renaming
+ * over an open file is forbidden there, but writing INTO it is allowed — so
+ * fall back to a direct write instead of dropping the save. The fallback isn't
+ * crash-atomic, but it only runs in that rare contested window, and the journal
+ * loader already backs up an unparseable file instead of wiping history.
+ */
 function writeJsonAtomic(file, data) {
+  const json = JSON.stringify(data, null, 2);
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, file);
+  fs.writeFileSync(tmp, json);
+  try {
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    if (!/^(EPERM|EBUSY|EACCES)$/.test(err.code || "")) throw err;
+    fs.writeFileSync(file, json);
+    try {
+      fs.unlinkSync(tmp);
+    } catch {
+      /* next save overwrites it */
+    }
+  }
 }
 
 function loadState() {
