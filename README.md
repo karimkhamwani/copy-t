@@ -1,8 +1,7 @@
 # Polymarket copy-trader (test)
 
-Listens to Polymarket's real-time live-data websocket for one or more target wallets'
-**BUY** trades and mirrors each new one as a **FOK market BUY** order via
-`@polymarket/clob-client`.
+Polls the Polymarket activity API every 30s for one or more target wallets' **BUY** trades
+and mirrors each new one as a **FOK market BUY** order via `@polymarket/clob-client`.
 
 ## Setup
 
@@ -14,17 +13,17 @@ npm start
 
 ## How it works
 
-1. Subscribe to the live-data websocket (`WS_URL`) and watch trades from each
-   wallet in target-wallets.js. Each entry is `{ address, category }` — the
-   category is just a label used in logs. The feed only delivers live trades,
-   so a newly added wallet's old history is never copied.
+1. Every `POLL_INTERVAL_MS` (default 30s), fetch `/activity` for each wallet in
+   target-wallets.js
+   (`excludeDepositsWithdrawals=true`, sorted newest first). Each entry is
+   `{ address, category }` — the category is just a label used in logs.
 2. Keep only BUY trades that have an `asset` (token ID) and `transactionHash`.
 3. Dedupe by `transactionHash:asset`, persisted in `seen-trades.json` so restarts
-   don't re-place old trades.
+   don't re-place old trades. Each wallet is baselined independently the first time
+   it's watched — adding a new wallet later never copies its old history.
 4. For each new trade, place a market BUY on the same token spending a fixed
    `MAX_BET_USDC` (env, default $1 — Polymarket's minimum), regardless of the
-   target's trade size. The feed never redelivers a trade, so failed orders are
-   not retried.
+   target's trade size. Failed orders are retried on the next poll.
 
 ## Dashboard
 
@@ -43,7 +42,7 @@ a WIN/LOSS/PENDING badge once the market resolves (with profit/loss amount),
 and a Polygonscan link for live fills. Resolution is looked up from the gamma
 markets API by conditionId, cached server-side (resolved markets are never
 re-fetched; pending ones re-check every 60s). Header shows engine mode, heartbeat
-(online/offline), bet size, ws signal state, and per-wallet sub-category filters.
+(online/offline), bet size, poll interval, and per-wallet sub-category filters.
 
 The trader writes `trades-log.json` (journal, capped at 500 entries) and
 `status.json` (heartbeat) next to the script; the dashboard server just reads them,
@@ -74,7 +73,7 @@ and ignores everything else that wallet trades. Add more keywords to widen it
 | `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1). With mirror mode on, this is the cap |
 | `MIRROR_TRADER_BET` | `1` = bet what the trader bet, capped at `MAX_BET_USDC` (min $1). `0` = fixed bet (default) |
 | `MAX_TRADES` | Stop after this many placed trades (0 = unlimited). Use `1` for the first live run |
-| `WS_URL` | Live-data websocket URL, default `wss://ws-live-data.polymarket.com` |
+| `POLL_INTERVAL_MS` | Poll interval, default 5000 (5s) |
 | `DASHBOARD_PORT` | Dashboard server port, default 3210 |
 | `DRY_RUN` | `1` = log orders instead of placing (default in .env.example) |
 | `PRIVATE_KEY` | Your signing key (only needed when `DRY_RUN=0`) |
@@ -91,4 +90,4 @@ Runs offline unit tests for the BUY filter, dedupe, and bet-sizing logic.
 Run the main script with `DRY_RUN=1` on a machine with API access to watch
 it detect trades without spending anything; flip to `DRY_RUN=0` to go live.
 
-Delete `seen-trades.json` to reset the dedupe history from scratch.
+Delete `seen-trades.json` to re-baseline from scratch.

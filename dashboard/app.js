@@ -541,9 +541,10 @@ function App() {
     return () => { alive = false; clearInterval(id); };
   }, []);
 
-  // Engine considered online if heartbeat within 3 heartbeat intervals (10s each)
+  // Engine considered online if heartbeat within 3 poll intervals
   const online =
-    status?.updatedAt && Date.now() - status.updatedAt < 30000;
+    status?.updatedAt &&
+    Date.now() - status.updatedAt < Math.max(15000, (status.pollIntervalMs || 5000) * 3);
 
   const copied = trades.filter((t) => t.copy);
 
@@ -592,9 +593,11 @@ function App() {
         ${status && html`
           <span className="stats">
             <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>
-            <span style=${{ color: !status.wsConnected ? "var(--orange)" : undefined }}>
-              signal ${status.wsConnected ? "ws ⚡" : "ws down"}
-            </span>
+            <span>poll ${(status.pollIntervalMs || 0) / 1000}s</span>
+            ${status.wsEnabled != null &&
+            html`<span style=${{ color: status.wsEnabled && !status.wsConnected ? "var(--orange)" : undefined }}>
+              signal ${status.wsConnected ? "ws ⚡" : status.wsEnabled ? "ws down → poll" : "poll"}
+            </span>`}
             <span>placed ${status.tradesPlaced ?? 0}${status.maxTrades ? `/${status.maxTrades}` : ""}</span>
             <span>
               targets:${" "}

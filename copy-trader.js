@@ -1,7 +1,7 @@
 /**
  * Polymarket copy-trader (test version)
  *
- * - Listens to the real-time websocket trade feed for the target user's trades
+ * - Polls the activity API every POLL_INTERVAL_MS for the target user's trades
  * - Filters to BUY trades only
  * - Dedupes by transactionHash + asset (persisted to seen-trades.json)
  * - Mirrors each new trade as a FAK market BUY order via the CLOB client
@@ -18,11 +18,13 @@ const TARGET_WALLETS = require("./target-wallets.js");
 const { createResolutionCache } = require("./market-resolution.js");
 
 const {
+  DATA_API_HOST = "https://data-api.polymarket.com",
   CLOB_API_HOST = "https://clob.polymarket.com",
   TARGET_USERS, // optional env override (comma-separated addresses), mainly for tests
   PRIVATE_KEY,
   FUNDER_ADDRESS,
   SIGNATURE_TYPE = "1",
+  POLL_INTERVAL_MS = "5000",
   MAX_BET_USDC = "1",
   MIRROR_TRADER_BET = "0", // 1 = bet what the trader bet (capped by MAX_BET_USDC)
   SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
@@ -30,6 +32,8 @@ const {
   MAX_ACTIVE_PCT = "50", // cap: active bets <= this % of (balance + active). 0 = gate disabled
   DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
   RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
+  FETCH_FAIL_LIMIT = "3", // consecutive all-wallet network-failed polls before self-shutdown (yarn down). 0 = never
+  WS_ENABLED = "1", // 1 = real-time websocket trade feed is the primary signal (poller stays as fallback)
   WS_URL = "wss://ws-live-data.polymarket.com",
   WS_DEBUG = "0", // 1 = log every raw ws message (verbose; first 3 after connect are always logged)
   DRY_RUN = "0",
@@ -46,6 +50,7 @@ const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
 const maxActivePct = Math.max(0, Number(MAX_ACTIVE_PCT) || 0); // 0 = disabled
 const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() === "true";
 const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
+const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
 let tradesPlaced = 0;
 
@@ -121,17 +126,23 @@ function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(SEEN_FILE, "utf8"));
     if (Array.isArray(raw)) {
-      // legacy format: plain array of seen keys
-      return { seen: new Set(raw) };
+      // legacy format: plain array of seen keys, no per-wallet baseline info
+      return { seen: new Set(raw), baselined: new Set() };
     }
-    return { seen: new Set(raw.seen || []) };
+    return {
+      seen: new Set(raw.seen || []),
+      baselined: new Set(raw.baselined || []),
+    };
   } catch {
-    return { seen: new Set() };
+    return { seen: new Set(), baselined: new Set() };
   }
 }
 
 function saveState(state) {
-  writeJsonAtomic(SEEN_FILE, { seen: [...state.seen] });
+  writeJsonAtomic(SEEN_FILE, {
+    seen: [...state.seen],
+    baselined: [...state.baselined],
+  });
 }
 
 function tradeKey(t) {
@@ -142,7 +153,7 @@ function tradeKey(t) {
 // Trade journal + status (read by the dashboard)
 // ---------------------------------------------------------------------------
 
-// Rows WITHOUT a copy attempt (filtered/stale/pending) rotate in a
+// Rows WITHOUT a copy attempt (baseline/filtered/stale/pending) rotate in a
 // small pool so observation churn can't bloat the journal. Rows WITH a copy
 // attempt are NEVER evicted — the full lifetime copy history is kept.
 const MAX_OBSERVED_ENTRIES = 300;
@@ -259,11 +270,13 @@ function writeStatus() {
       mode: isDryRun ? "dry" : "live",
       betUsdc: BET_USDC,
       betMode: mirrorBet ? "mirror" : "fixed",
+      pollIntervalMs: pollInterval,
       maxTrades,
       tradesPlaced,
       targets: targetWallets,
       startedAt: engineStartedAt,
       maxActivePct,
+      wsEnabled,
       wsConnected,
       paperBalance: isDryRun ? paperBalance : undefined,
       balance: riskSnapshot.balance,
@@ -277,7 +290,7 @@ function writeStatus() {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP helper (used by the market-resolution cache)
+// Activity API
 // ---------------------------------------------------------------------------
 
 /** GET a JSON URL. Uses global fetch (Node 18+) or falls back to http/https (Node 16). */
@@ -286,7 +299,8 @@ function getJson(url) {
     return fetch(url, {
       headers: { accept: "application/json, text/plain, */*" },
     }).then((res) => {
-      if (!res.ok) throw new Error(`API ${res.status} ${res.statusText}`);
+      if (!res.ok)
+        throw new Error(`activity API ${res.status} ${res.statusText}`);
       return res.json();
     });
   }
@@ -299,7 +313,7 @@ function getJson(url) {
         if (res.statusCode < 200 || res.statusCode >= 300) {
           res.resume();
           return reject(
-            new Error(`API ${res.statusCode} ${res.statusMessage}`),
+            new Error(`activity API ${res.statusCode} ${res.statusMessage}`),
           );
         }
         let body = "";
@@ -309,14 +323,27 @@ function getJson(url) {
           try {
             resolve(JSON.parse(body));
           } catch (err) {
-            reject(new Error(`API returned invalid JSON: ${err.message}`));
+            reject(
+              new Error(`activity API returned invalid JSON: ${err.message}`),
+            );
           }
         });
       },
     );
     req.on("error", reject);
-    req.setTimeout(15000, () => req.destroy(new Error("API timeout")));
+    req.setTimeout(15000, () => req.destroy(new Error("activity API timeout")));
   });
+}
+
+async function fetchActivity(user) {
+  const url =
+    `${DATA_API_HOST}/activity?limit=250&offset=0` +
+    `&excludeDepositsWithdrawals=true&sortBy=TIMESTAMP&sortDirection=DESC` +
+    `&type=TRADE&side=BUY` +
+    `&user=${user}`;
+  const data = await getJson(url);
+  if (!Array.isArray(data)) throw new Error("activity API returned non-array");
+  return data;
 }
 
 /** Keep only BUY trade rows that have what we need to place an order. */
@@ -598,20 +625,85 @@ function observedEntry(trade, wallet, status) {
     theirPrice: trade.price,
     theirUsdc: trade.usdcSize,
     theirShares: trade.size,
-    status, // filtered | stale | pending | min-skip | success | failed
+    status, // baseline | filtered | stale | pending | min-skip | success | failed
     copy: null, // filled in when we attempt the copy
   };
 }
 
-/** Copy a batch of fresh, non-stale BUY trades from the ws feed. */
+async function pollUser(wallet, state) {
+  const { address, category } = wallet;
+  const tag = `[${category}:${address}]`;
+  const activity = await fetchActivity(address);
+  const allBuys = filterBuys(activity);
+  const buys = allBuys.filter((t) =>
+    matchesSubCategory(t, wallet.subCategories),
+  );
+  const fresh = pickNewTrades(buys, state.seen);
+
+  if (!state.baselined.has(address)) {
+    // First time we watch this wallet: record its existing history as seen,
+    // only copy trades it makes from now on.
+    fresh.forEach((t) => state.seen.add(tradeKey(t)));
+    state.baselined.add(address);
+    saveState(state);
+    allBuys.forEach((t) => journalAdd(observedEntry(t, wallet, "baseline")));
+    log(`${tag} baseline: marked ${fresh.length} existing BUY trades as seen`);
+    return;
+  }
+
+  // Journal every newly observed buy, including ones we won't copy.
+  // Skip trades already decided (in `seen`) whose journal row was evicted by
+  // the observed-pool cap — re-adding them would create zombie "pending" rows
+  // that never receive a verdict (the copy loop never revisits seen keys).
+  for (const t of allBuys) {
+    const key = tradeKey(t);
+    if (journalIds.has(key) || state.seen.has(key)) continue;
+    const status = matchesSubCategory(t, wallet.subCategories)
+      ? "pending"
+      : "filtered";
+    journalAdd(observedEntry(t, wallet, status));
+  }
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  // No per-wallet cutoff = copy everything regardless of trade age
+  const { copyable, stale } = wallet.maxTradeAgeSec
+    ? splitStale(fresh, nowSec, wallet.maxTradeAgeSec)
+    : { copyable: fresh, stale: [] };
+
+  // Too old to chase (fast markets expire) — mark seen so we never retry them
+  if (stale.length > 0) {
+    stale.forEach((t) => {
+      state.seen.add(tradeKey(t));
+      journalUpdate(tradeKey(t), { status: "stale" });
+    });
+    saveState(state);
+    log(
+      `${tag} skipped ${stale.length} stale trade(s) older than ${wallet.maxTradeAgeSec}s`,
+    );
+  }
+
+  if (copyable.length === 0) {
+    log(
+      `${tag} no new BUY trades (${buys.length}/${allBuys.length} buys in window match sub-categories)`,
+    );
+    return;
+  }
+
+  // Oldest first so we copy in the order they traded
+  copyable.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  await copyTrades(wallet, copyable, state, tag);
+}
+
+/** Copy a batch of fresh, non-stale BUY trades (shared by poller and ws feed). */
 async function copyTrades(wallet, copyable, state, tag) {
-  const source = "ws"; // recorded per copy for latency stats
+  // which pipeline delivered the signal — recorded per copy for latency stats
+  const source = tag.startsWith("[ws") ? "ws" : "poll";
   for (const trade of copyable) {
     if (maxTrades && tradesPlaced >= maxTrades) return;
 
-    // The feed can deliver several rows with the same txHash:asset (partial
-    // fills of one order). Dedupe ran before this loop, so a key that is in
-    // `seen` now was copied earlier in THIS batch — never copy it twice.
+    // Activity can contain several rows with the same txHash:asset (partial
+    // fills of one order). pickNewTrades ran before this loop, so a key that
+    // is in `seen` now was copied earlier in THIS batch — never copy it twice.
     if (state.seen.has(tradeKey(trade))) continue;
 
     // Exact mirroring below Polymarket's $1 order minimum is impossible —
@@ -678,7 +770,7 @@ async function copyTrades(wallet, copyable, state, tag) {
         tradeKey(trade),
         {
           status: "success",
-          // Refresh the trader-side snapshot: the trade row can grow between
+          // Refresh the trader-side snapshot: the activity row can grow between
           // first observation and the copy (fills aggregate), and betAmount used
           // the values at copy time — the journal must show the same numbers.
           theirPrice: trade.price,
@@ -686,7 +778,7 @@ async function copyTrades(wallet, copyable, state, tag) {
           theirShares: trade.size,
           copy: {
             mode: isDryRun ? "dry" : "live",
-            source, // which pipeline delivered the signal
+            source, // ws | poll — which pipeline delivered the signal
             copiedAt: Date.now(),
             spentUsdc: Number(spent.toFixed(6)),
             shares: Number(shares.toFixed(4)),
@@ -723,10 +815,42 @@ async function copyTrades(wallet, copyable, state, tag) {
         },
         observedEntry(trade, wallet, "failed"),
       );
-      // not marked seen — but the ws feed never redelivers a trade, so a
-      // failed copy is not retried
+      // not marked seen -> retried next poll (until it goes stale)
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Network-failure self-shutdown: if every wallet poll fails with a network
+// error for FETCH_FAIL_LIMIT consecutive cycles, the API is unreachable from
+// this machine — run `yarn down` (pm2 delete) instead of spinning forever.
+// A plain process.exit would NOT work here: pm2 would just restart us.
+// ---------------------------------------------------------------------------
+
+const fetchFailLimit = Math.max(0, Number(FETCH_FAIL_LIMIT) || 0); // 0 = disabled
+let consecutiveNetFails = 0;
+let shuttingDown = false;
+
+const isNetworkError = (err) =>
+  /fetch failed|ENOTFOUND|ECONNREFUSED|ECONNRESET|ETIMEDOUT|activity API timeout/i.test(
+    String(err?.message || err),
+  );
+
+function shutdownViaYarnDown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log(`SHUTTING DOWN (yarn down): ${reason}`);
+  writeStatus();
+  const { exec } = require("child_process");
+  exec("yarn down", { cwd: __dirname }, (err, stdout, stderr) => {
+    // if pm2 delete worked, this process is already dead before the callback;
+    // reaching here with an error means yarn/pm2 wasn't available — exit hard
+    // so at least this process stops (pm2 may restart it, but we tried).
+    if (err) {
+      log("yarn down failed:", stderr || err.message);
+      process.exit(1);
+    }
+  });
 }
 
 /**
@@ -750,14 +874,15 @@ function parseLiveFill(resp, intendedAmount) {
 }
 
 // ---------------------------------------------------------------------------
-// Real-time websocket feed (sole signal) + serialization
+// Real-time websocket feed (primary signal) + serialization
 // ---------------------------------------------------------------------------
 
+const wsEnabled = WS_ENABLED === "1" || WS_ENABLED.toLowerCase() === "true";
 let wsConnected = false;
 
-// ws events share mutable state (seen set, journal, gate, tradesPlaced).
-// Everything flows through one serial queue so two events can never
-// interleave mid-copy and double-copy or race the risk gate.
+// The poller and the ws feed share mutable state (seen set, journal, gate,
+// tradesPlaced). Everything flows through one serial queue so a ws event can
+// never interleave mid-poll and double-copy or race the risk gate.
 let workQueue = Promise.resolve();
 function serialize(fn) {
   const run = workQueue.then(fn);
@@ -769,15 +894,17 @@ const walletsByAddress = new Map(targetWallets.map((w) => [w.address, w]));
 
 /**
  * One trade row arriving from the websocket (already activity-API shaped).
- * Pipeline: journal, sub-category filter, staleness, dedupe, then copyTrades().
+ * Mirrors the poller's pipeline: baseline guard, journal, sub-category filter,
+ * staleness, dedupe, then the shared copyTrades().
  */
 async function handleWsTrade(row, state) {
   const wallet = walletsByAddress.get(String(row.proxyWallet || "").toLowerCase());
   if (!wallet) return; // not a wallet we follow
+  if (!state.baselined.has(wallet.address)) return; // poller baselines first
   const [buy] = filterBuys([row]);
   if (!buy) return; // sells / malformed
   const key = tradeKey(buy);
-  if (state.seen.has(key)) return; // already copied/skipped
+  if (state.seen.has(key)) return; // already copied/skipped (poll or ws)
   const tag = `[ws:${wallet.category}:${wallet.address}]`;
 
   const matches = matchesSubCategory(buy, wallet.subCategories);
@@ -804,7 +931,7 @@ function startWsFeed(state) {
     debug: WS_DEBUG === "1" || WS_DEBUG.toLowerCase() === "true",
     onStatus: (up) => {
       wsConnected = up;
-      log(up ? "ws: live feed connected" : "ws: feed down — reconnecting");
+      log(up ? "ws: live feed is PRIMARY signal" : "ws: feed down — poller is covering");
       writeStatus();
     },
     onTrade: (row) => {
@@ -815,8 +942,32 @@ function startWsFeed(state) {
   });
 }
 
-// Heartbeat: keep status.json fresh so the dashboard can tell we're alive
-const HEARTBEAT_MS = 10000;
+async function pollOnce(state) {
+  let netFails = 0;
+  for (const wallet of targetWallets) {
+    try {
+      await pollUser(wallet, state);
+    } catch (err) {
+      log(
+        `[${wallet.category}:${wallet.address}] poll error:`,
+        err.message || err,
+      );
+      if (isNetworkError(err)) netFails++;
+    }
+  }
+  // every wallet failed with a network error -> the API is unreachable
+  if (targetWallets.length > 0 && netFails === targetWallets.length) {
+    consecutiveNetFails++;
+    if (fetchFailLimit && consecutiveNetFails >= fetchFailLimit) {
+      shutdownViaYarnDown(
+        `${consecutiveNetFails} consecutive polls failed with network errors ` +
+          `(FETCH_FAIL_LIMIT=${fetchFailLimit})`,
+      );
+    }
+  } else {
+    consecutiveNetFails = 0;
+  }
+}
 
 async function main() {
   if (targetWallets.length === 0) {
@@ -855,7 +1006,7 @@ async function main() {
       )
       .join(
         ", ",
-      )}] bet=${
+      )}] interval=${pollInterval}ms bet=${
         mirrorBet ? `mirror (cap $${BET_USDC})` : `$${BET_USDC} (fixed)`
       } dryRun=${isDryRun} ` +
       `maxTrades=${maxTrades || "unlimited"} ` +
@@ -865,13 +1016,18 @@ async function main() {
   const state = loadState();
   writeStatus();
 
-  startWsFeed(state);
-  log(`ws: real-time trade feed is the sole signal (${WS_URL})`);
+  if (wsEnabled) {
+    startWsFeed(state);
+    log(`ws: real-time feed enabled (${WS_URL}) — poller runs as fallback`);
+  }
 
-  setInterval(() => {
-    // through the queue so a status write can't observe a half-applied copy
-    serialize(writeStatus);
-  }, HEARTBEAT_MS);
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    // through the same queue as ws events, so the two sources never interleave
+    await serialize(() => pollOnce(state));
+    writeStatus();
+    await new Promise((r) => setTimeout(r, pollInterval));
+  }
 }
 
 if (require.main === module) {
@@ -886,6 +1042,7 @@ module.exports = {
   normalizeWallets,
   splitStale,
   matchesSubCategory,
+  pollUser,
   riskGateCheck,
   getActiveUsdc,
   parseLiveFill,
