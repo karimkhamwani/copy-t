@@ -171,7 +171,13 @@ const server = http.createServer(async (req, res) => {
 
   if (url === "/api/trades") {
     const trades = readJson(TRADES_LOG_FILE, []);
-    await refreshResolutions(trades);
+    // Answer from the resolution cache and refresh it in the background: a slow
+    // CLOB lookup must never delay the response, or the dashboard's first paint
+    // after a reload sits empty until the API answers. Newly resolved markets
+    // show up on the next poll instead.
+    refreshResolutions(trades).catch(() => {
+      /* cache keeps the last known state; retried on the next request */
+    });
     const withResults = trades.map((t) => ({ ...t, result: resultFor(t) }));
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify(withResults));

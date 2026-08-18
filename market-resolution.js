@@ -6,11 +6,22 @@
  * closed AND a winning token is flagged (closed alone isn't enough).
  * Resolved markets are cached forever; unresolved ones are re-checked after
  * recheckMs. Lookup failures conservatively leave the market unresolved.
+ * Overlapping refreshes of the same id share one request, so callers that no
+ * longer await a refresh can't stack duplicate lookups on top of each other.
  */
 function createResolutionCache({ host, fetchJson, recheckMs = 60000, maxLookups = 10 }) {
   const cache = new Map(); // conditionId -> { resolved, tokens, checkedAt }
+  const inFlight = new Map(); // conditionId -> Promise, deduped across callers
 
-  async function check(conditionId) {
+  function check(conditionId) {
+    const pending = inFlight.get(conditionId);
+    if (pending) return pending;
+    const p = doCheck(conditionId).finally(() => inFlight.delete(conditionId));
+    inFlight.set(conditionId, p);
+    return p;
+  }
+
+  async function doCheck(conditionId) {
     const now = Date.now();
     try {
       const m = await fetchJson(`${host}/markets/${conditionId}`);

@@ -664,6 +664,7 @@ function App() {
   const [trades, setTrades] = useState([]);
   const [status, setStatus] = useState(null);
   const [balance, setBalance] = useState(null);
+  const [loaded, setLoaded] = useState(false); // first successful fetch landed
   const [copiedFilter, setCopiedFilter] = useState("all");
   const [copiedSort, setCopiedSort] = useState("none");
   const [outcomeFilter, setOutcomeFilter] = useState("all"); // all | up | down
@@ -671,7 +672,15 @@ function App() {
 
   useEffect(() => {
     let alive = true;
+    // Skip a tick while the previous one is still running. A response slower
+    // than REFRESH_MS otherwise queues a fetch per tick faster than they drain
+    // (the browser serializes same-URL GETs), so each one waits behind a longer
+    // backlog and the data on screen ages without bound: measured against a 6s
+    // response, round-trips grew from 6s to 26s inside a minute.
+    let busy = false;
     const load = async () => {
+      if (busy) return;
+      busy = true;
       try {
         const [t, s, b] = await Promise.all([
           fetch("/api/trades").then((r) => r.json()),
@@ -682,9 +691,12 @@ function App() {
           setTrades(Array.isArray(t) ? t : []);
           setStatus(s);
           setBalance(b?.balance ?? null);
+          setLoaded(true);
         }
       } catch {
         /* server briefly unavailable — keep last data */
+      } finally {
+        busy = false;
       }
     };
     load();
@@ -738,6 +750,21 @@ function App() {
   }
   // net P/L of exactly the rows shown in the copied list (filters applied)
   const shownPl = filteredCopied.reduce((s, t) => s + betValue(t), 0);
+
+  // Before the first response lands there is nothing to distinguish "no trades"
+  // from "haven't asked yet" — rendering the real layout would flash zeroed
+  // tiles and an OFFLINE pill, which reads as lost data rather than a pending
+  // fetch. Stays up if the server is unreachable, which is what it says.
+  if (!loaded) {
+    return html`
+      <div>
+        <div className="header">
+          <h1>Polymarket Copy-Trader</h1>
+          <span className="pill">CONNECTING…</span>
+        </div>
+        <div className="panel"><div className="empty">Loading dashboard…</div></div>
+      </div>`;
+  }
 
   return html`
     <div>
