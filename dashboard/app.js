@@ -72,7 +72,7 @@ function LatencyLine({ t }) {
     `bet placed      ${clockMs(c.copiedAt)}` +
     (tradeToBet == null ? "" : `\ntrade→bet ${dur(tradeToBet)}`);
   return html`<span title=${tip} style=${{ color: tone }}>
-    ${c.source === "ws" ? "⚡" : "⟳"} trader→us ${tradeToBet == null ? "—" : dur(tradeToBet)}
+   ${tradeToBet == null ? "—" : dur(tradeToBet)}
   </span>`;
 }
 
