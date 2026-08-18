@@ -648,6 +648,9 @@ const COPIED_FILTERS = {
     label: "Pending",
     match: (t) => t.status === "success" && t.result !== "win" && t.result !== "loss",
   },
+  // by signal source (copy.source is only recorded on copy attempts)
+  ws: { label: "WS", match: (t) => String(t.copy?.source || "").toLowerCase() === "ws" },
+  poll: { label: "Poll", match: (t) => String(t.copy?.source || "").toLowerCase() === "poll" },
 };
 
 /** Net $ value of a copied bet: win profit, loss as negative, else 0. */
