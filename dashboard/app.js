@@ -588,16 +588,22 @@ function App() {
         ${status?.mode &&
         html`<span className=${`pill ${status.mode}`}>${status.mode === "dry" ? "DRY RUN" : "LIVE"}</span>`}
         <span className=${`pill ${online ? "on" : "off"}`}>${online ? "ENGINE ONLINE" : "ENGINE OFFLINE"}</span>
+        ${online && status &&
+        html`<span
+          className=${`pill ${status.wsConnected ? "on" : "gated"}`}
+          title=${status.wsConnected
+            ? "real-time websocket feed is the active signal (poller runs as backup)"
+            : status.wsEnabled
+              ? "websocket feed is DOWN — polling the activity API as fallback"
+              : "websocket disabled — polling the activity API"}>
+          ${status.wsConnected ? "SIGNAL: WS ⚡" : "SIGNAL: POLLING ⟳"}
+        </span>`}
         ${gate && html`<span className=${`pill ${gate.cls}`} title=${gate.why}>${gate.label}</span>`}
         ${online && status?.startedAt && html`<span className="pill">up ${uptime(status.startedAt)}</span>`}
         ${status && html`
           <span className="stats">
             <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>
             <span>poll ${(status.pollIntervalMs || 0) / 1000}s</span>
-            ${status.wsEnabled != null &&
-            html`<span style=${{ color: status.wsEnabled && !status.wsConnected ? "var(--orange)" : undefined }}>
-              signal ${status.wsConnected ? "ws ⚡" : status.wsEnabled ? "ws down → poll" : "poll"}
-            </span>`}
             <span>placed ${status.tradesPlaced ?? 0}${status.maxTrades ? `/${status.maxTrades}` : ""}</span>
             <span>
               targets:${" "}
