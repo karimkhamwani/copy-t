@@ -300,18 +300,28 @@ function PnlChart({ copied }) {
     </div>`;
 }
 
-/** Line chart of per-copy trader→us latency (trade timestamp -> bet placed). */
+/**
+ * Line chart of per-copy trader→us latency (trade timestamp -> bet placed).
+ * Shows only copies delivered by the ACTIVE signal source (ws when connected,
+ * poll while it covers a ws outage) — mixing the two would be confusing.
+ */
 function LatencyChart({ copied, status }) {
+  const wsActive = !!status?.wsConnected;
+  const activeSource = wsActive ? "ws" : "poll";
   const pts = copied
-    .filter((t) => t.status === "success" && t.tradedAt && t.copy?.copiedAt)
+    .filter((t) =>
+      t.status === "success" && t.tradedAt && t.copy?.copiedAt &&
+      t.copy.source === activeSource)
     .sort((a, b) => a.copy.copiedAt - b.copy.copiedAt)
     .map((t) => ({
       label: new Date(t.copy.copiedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
       latency: Number(((t.copy.copiedAt - t.tradedAt) / 1000).toFixed(1)),
-      source: t.copy.source || "?",
+      source: t.copy.source,
     }));
   if (pts.length < 2)
-    return html`<div className="empty">Need at least 2 copies to chart latency</div>`;
+    return html`<div className="empty">
+      Need at least 2 ${wsActive ? "ws" : "poll"} copies to chart latency
+    </div>`;
 
   const avg = pts.reduce((s, p) => s + p.latency, 0) / pts.length;
   // distinct per-wallet stale cutoffs, shown as red dashed reference lines
@@ -319,17 +329,17 @@ function LatencyChart({ copied, status }) {
     (status?.targets || []).map((w) => w.maxTradeAgeSec).filter((v) => v > 0),
   )];
 
+  const dotColor = wsActive ? "#4c9aff" : "#f0a13a";
   const dot = (p) => html`<circle
     key=${`lat-${p.index}`} cx=${p.cx} cy=${p.cy} r="2.5"
-    fill=${p.payload.source === "ws" ? "#4c9aff" : "#f0a13a"}
-    stroke=${CH.surface} strokeWidth="1.5" />`;
+    fill=${dotColor} stroke=${CH.surface} strokeWidth="1.5" />`;
 
   return html`
     <div>
       <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
-        Copy latency trader→us — avg <b>${dur(avg * 1000)}</b>
-        ${" "}(dots: <span style=${{ color: "#4c9aff" }}>ws ⚡</span> /
-        <span style=${{ color: "#f0a13a" }}> poll ⟳</span>)
+        Copy latency trader→us
+        ${" "}(<span style=${{ color: dotColor }}>${wsActive ? "ws ⚡" : "poll ⟳"}</span>)
+        — avg <b>${dur(avg * 1000)}</b>
       </div>
       <${ResponsiveContainer} width="100%" height=${160}>
         <${LineChart} data=${pts} margin=${{ top: 10, right: 12, left: -16, bottom: 0 }}>
