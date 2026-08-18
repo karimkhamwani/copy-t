@@ -13,11 +13,6 @@ const BADGE_LABEL = {
   baseline: "BASELINE",
   "min-skip": "MIN SKIP",
   "risk-skip": "RISK SKIP",
-  "hedge-skip": "HEDGE SKIP",
-  "market-skip": "MKT CAP",
-  "price-skip": "PRICE SKIP",
-  "slippage-skip": "SLIP SKIP",
-  "their-sell": "THEIR SELL",
 };
 
 function timeAgo(ms) {
