@@ -112,7 +112,54 @@ function ResultBadge({ result, copy }) {
   return html`<span className="badge b-filtered">PENDING</span>`;
 }
 
-function CopiedTradeRow({ t }) {
+/**
+ * Which pipeline delivered the signal we acted on: ws (real-time feed) or poll
+ * (REST fallback). Dedupe on `transactionHash:asset` means exactly one source
+ * ever copies a given trade, so this is the winner — never a pair.
+ */
+function SourceBadge({ source }) {
+  const s = String(source || "").toLowerCase();
+  if (s !== "ws" && s !== "poll") {
+    return html`<span className="badge b-filtered" title="No source recorded for this copy">SRC ?</span>`;
+  }
+  return html`<span
+    className=${`badge b-${s}`}
+    title=${s === "ws" ? "Copied from the real-time websocket feed" : "Copied from the REST activity poller"}
+  >${s.toUpperCase()}</span>`;
+}
+
+/**
+ * Keys copied more than once — i.e. both pipelines paid for the same trade,
+ * the exact thing the ws/poll overlap is meant to make impossible. Normally
+ * empty; a non-empty result is a real-money bug, not a display quirk.
+ *
+ * Compared case-insensitively on purpose: the engine's key keeps the tx hash's
+ * original case, so a casing difference between the ws and REST payloads is
+ * precisely how a double-copy would slip past the `seen` set.
+ */
+function duplicateKeys(copied) {
+  const counts = new Map();
+  for (const t of copied) {
+    if (t.status !== "success") continue;
+    const k = String(t.id || "").toLowerCase();
+    if (k) counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  return new Set([...counts].filter(([, n]) => n > 1).map(([k]) => k));
+}
+
+/** Per-source copy tally for the toolbar. */
+function sourceCounts(copied) {
+  const c = { ws: 0, poll: 0, unknown: 0 };
+  for (const t of copied) {
+    if (t.status !== "success") continue;
+    const s = String(t.copy?.source || "").toLowerCase();
+    if (s === "ws" || s === "poll") c[s]++;
+    else c.unknown++;
+  }
+  return c;
+}
+
+function CopiedTradeRow({ t, dup }) {
   const c = t.copy || {};
   const ok = t.status === "success";
   return html`
@@ -127,8 +174,14 @@ function CopiedTradeRow({ t }) {
           <span className=${`badge ${c.mode === "live" ? "b-failed" : "b-pending"}`}>
             ${(c.mode || "?").toUpperCase()}
           </span>
+          <${SourceBadge} source=${c.source} />
           <${Badge} status=${ok ? "success" : "failed"} />
           ${ok && html`<${ResultBadge} result=${t.result} copy=${c} />`}
+          ${dup &&
+          html`<span
+            className="badge b-dup"
+            title="Copied more than once — the ws feed and the poller both paid for this trade"
+          >DUP</span>`}
         </span>
       </div>
       ${ok &&
@@ -663,6 +716,8 @@ function App() {
   const failures = copied.filter((t) => t.status === "failed").length;
   const wins = copied.filter((t) => t.result === "win").length;
   const losses = copied.filter((t) => t.result === "loss").length;
+  const dupes = duplicateKeys(copied);
+  const srcCounts = sourceCounts(copied);
   let filteredCopied = copied.filter(COPIED_FILTERS[copiedFilter].match);
   if (selectedMarket) {
     filteredCopied = filteredCopied.filter((t) => marketKey(t) === selectedMarket.key);
@@ -761,6 +816,16 @@ function App() {
               <button onClick=${() => setSelectedMarket(null)} aria-label="Clear market filter">✕</button>
             </span>`}
             <span
+              className="srcsum"
+              title="Successful copies by signal source. Each trade is copied by exactly one pipeline; DUP counts trades that were copied twice."
+            >
+              <b className="ws">ws ${srcCounts.ws}</b> · <b className="poll">poll ${srcCounts.poll}</b>${srcCounts.unknown
+                ? html` · <b>? ${srcCounts.unknown}</b>`
+                : null}${dupes.size
+                ? html` · <b className="dup">DUP ${dupes.size}</b>`
+                : null}
+            </span>
+            <span
               className="toolbar-sum"
               title="Net P/L of the entries shown below (wins − losses; pending counts as $0)"
               style=${{ color: shownPl > 0 ? C_WIN : shownPl < 0 ? C_LOSS : "var(--dim)" }}
@@ -772,7 +837,7 @@ function App() {
             ${copied.length === 0 && html`<div className="empty">Nothing copied yet</div>`}
             ${copied.length > 0 && filteredCopied.length === 0 &&
             html`<div className="empty">No copied trades match this filter</div>`}
-            ${filteredCopied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} />`)}
+            ${filteredCopied.map((t) => html`<${CopiedTradeRow} key=${t.id} t=${t} dup=${dupes.has(String(t.id || "").toLowerCase())} />`)}
           </div>
         </div>
       </div>
