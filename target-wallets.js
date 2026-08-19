@@ -19,6 +19,12 @@ module.exports = [
     address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
     category: "crypto",
     sub_category: ["eth-updown-5m"],
-    max_trade_age_sec: 5, // 5m markets expire fast — don't chase old entries
+    max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
   },
+  // {
+  //   address: "0xc2ad03f79ca3f3c17d8c7de2612ce0c89b7d40ed",
+  //   category: "crypto",
+  //   sub_category: ["eth-updown-5m"],
+  //   max_trade_age_sec: 5, // 5m markets expire fast — don't chase old entries
+  // },
 ];
