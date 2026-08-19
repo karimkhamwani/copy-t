@@ -17,7 +17,8 @@
     "restart": "yarn down && yarn reset && yarn up",
     "soft-restart": "yarn down && yarn up",
     "test": "node test.js",
-    "drift-backtest": "node drift-backtest.js"
+    "drift-backtest": "node drift-backtest.js",
+    "test:prefetch": "node test-prefetch.js"
   },
   "dependencies": {
     "@ethersproject/wallet": "^5.7.0",

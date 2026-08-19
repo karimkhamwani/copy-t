@@ -566,16 +566,56 @@ async function execPriceFor(trade, amountUsdc) {
 }
 
 /**
- * Pre-flight price check. Disabled -> always allowed. In dry-run without
- * credentials there is no CLOB client to ask, so the gate cannot run; it
- * reports `unavailable` rather than silently passing, and startup warns.
+ * Warm the market metadata createMarketOrder needs, so the order path does not
+ * stop to fetch it.
+ *
+ * For a token it has not seen, createMarketOrder calls _ensureMarketInfoCached,
+ * which makes TWO sequential requests: /markets-by-token/ to learn the condition
+ * id, then /clob-markets/ for tick size, neg-risk and fees. Measured against the
+ * live CLOB that is ~227ms + ~238ms — and in 5-minute markets every token is new,
+ * so nearly every copy paid it.
+ *
+ * Both are avoidable. The activity payload already tells us the condition id, and
+ * /clob-markets/ populates tick size, neg-risk and fee info for BOTH of the
+ * market's tokens at once — enough for _ensureMarketInfoCached to return without
+ * touching the network. Called concurrently with the price lookup, so it costs no
+ * wall-clock at all.
+ *
+ * Never throws: on failure the order simply fetches what it needs, as before.
+ */
+async function warmMarketInfo(trade) {
+  if (!trade.conditionId) return; // nothing to warm from; order path will resolve it
+  try {
+    const client = await getClobClient();
+    await client.getClobMarketInfo(trade.conditionId);
+  } catch (err) {
+    log(`market info prefetch failed (${err.message}) — the order will fetch it`);
+  }
+}
+
+/**
+ * Pre-flight before an order: read the executable price for the drift gate and
+ * warm the market metadata, both at once.
+ *
+ * The two are independent, so Promise.all makes the metadata free — it finishes
+ * under the price lookup we are waiting for anyway. Together with passing the
+ * price into createMarketOrder (see marketOrderArgs), this leaves the order path
+ * with no metadata or pricing round-trips at all: just the signed POST.
+ *
+ * Disabled guard -> always allowed, but the metadata is still warmed, since that
+ * is a pure latency win and independent of the price check. In dry-run without
+ * credentials there is no CLOB client to ask, so the gate cannot run; it reports
+ * `unavailable` rather than silently passing, and startup warns.
  */
 async function driftGateCheck(trade, amountUsdc) {
-  if (!driftGuard) return { allowed: true, reason: null, execPrice: null };
   if (!PRIVATE_KEY) {
     return { allowed: true, reason: null, execPrice: null, unavailable: true };
   }
-  const execPrice = await execPriceFor(trade, amountUsdc);
+  const [execPrice] = await Promise.all([
+    driftGuard ? execPriceFor(trade, amountUsdc) : Promise.resolve(null),
+    warmMarketInfo(trade),
+  ]);
+  if (!driftGuard) return { allowed: true, reason: null, execPrice: null };
   const v = driftVerdict(execPrice, Number(trade.price));
   return { ...v, execPrice };
 }
