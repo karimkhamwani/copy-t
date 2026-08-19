@@ -13,10 +13,11 @@
     "up": "pm2 start ecosystem.config.js && pm2 logs",
     "logs": "pm2 logs",
     "down": "pm2 delete ecosystem.config.js",
-    "reset": "node -e \"['trades-log.json','seen-trades.json','status.json'].forEach(f=>{try{require('fs').unlinkSync(f)}catch{}}); console.log('state reset — restart the trader to re-baseline')\"",
+    "reset": "node -e \"['trades-log.json','seen-trades.json','status.json'].forEach(f=>{try{require('fs').unlinkSync(f)}catch{}}); console.log('state reset \u2014 restart the trader to re-baseline')\"",
     "restart": "yarn down && yarn reset && yarn up",
     "soft-restart": "yarn down && yarn up",
-    "test": "node test.js"
+    "test": "node test.js",
+    "drift-backtest": "node drift-backtest.js"
   },
   "dependencies": {
     "@ethersproject/wallet": "^5.7.0",

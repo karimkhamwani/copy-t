@@ -426,6 +426,11 @@ function bestAsk(book) {
  *
  * Returns { allowed, reason }. Callers must fail closed when execPrice is null.
  */
+/** Trim float noise for log messages (0.39000012221 -> 0.39). */
+function round4(n) {
+  return Number(Number(n).toFixed(4));
+}
+
 function driftVerdict(
   execPrice,
   theirPrice,
@@ -446,16 +451,16 @@ function driftVerdict(
     return {
       allowed: false,
       reason:
-        `book moved against us: our ${execPrice} is ${Math.abs(drift).toFixed(3)} ` +
-        `below their ${theirPrice} (limit ${adverse})`,
+        `book moved against us: our ${round4(execPrice)} is ${Math.abs(drift).toFixed(3)} ` +
+        `below their ${round4(theirPrice)} (limit ${adverse})`,
     };
   }
   if (Number.isFinite(overpay) && overpay >= 0 && drift > overpay + EPS) {
     return {
       allowed: false,
       reason:
-        `we would overpay: our ${execPrice} is ${drift.toFixed(3)} ` +
-        `above their ${theirPrice} (limit ${overpay})`,
+        `we would overpay: our ${round4(execPrice)} is ${drift.toFixed(3)} ` +
+        `above their ${round4(theirPrice)} (limit ${overpay})`,
     };
   }
   return { allowed: true, reason: null };
@@ -608,7 +613,11 @@ async function placeMarketBuy(trade, amountUsdc, execPrice) {
   if (isDryRun) {
     log(
       `[DRY_RUN] would market-BUY $${amountUsdc} of "${trade.outcome}" ` +
-        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price})`,
+        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price}` +
+        (Number.isFinite(execPrice)
+          ? `, our executable price ${execPrice}`
+          : ", executable price unknown") +
+        `)`,
     );
     return { dryRun: true };
   }
@@ -948,9 +957,17 @@ async function copyTrades(wallet, copyable, state, tag) {
       const spent = resp.dryRun ? amount : fill.spent;
       if (isDryRun) paperBalance -= spent; // paper: debit like a real fill
       balanceCache = { value: null, fetchedAt: 0 }; // live: balance changed, re-fetch
+      // Dry-run fill price: prefer the executable price the drift guard just read
+      // off the book. Assuming the trader's price instead would simulate a fill we
+      // could not actually get, which is precisely how a paper run comes out ahead
+      // of the live one. Falls back to their price only when the guard is off or
+      // could not read the book.
+      const simPrice = Number.isFinite(drift.execPrice)
+        ? drift.execPrice
+        : trade.price;
       const shares = resp.dryRun
-        ? trade.price > 0
-          ? amount / trade.price
+        ? simPrice > 0
+          ? amount / simPrice
           : 0
         : fill.shares;
       journalUpdate(
