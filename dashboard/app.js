@@ -584,6 +584,16 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
     ? active > 0 ? "#4c9aff" : null
     : capUsage >= 0.999 ? C_LOSS : capUsage >= 0.9 ? "#f0a13a" : "#4c9aff";
 
+  // Guard skips: running totals kept by the engine, NOT counted from the
+  // journal. Skip rows carry no `copy`, so they age out of the retention
+  // window and a journal count would drift downward over time. The engine's
+  // totals live in status.json and survive restarts — only `yarn reset` clears
+  // them. Covers the two guards that keep counters (risk cap, price drift);
+  // min-skip and stale rows are visible in the target panel instead.
+  const riskSkips = status?.riskSkipped ?? 0;
+  const driftSkips = status?.driftSkipped ?? 0;
+  const totalSkips = riskSkips + driftSkips;
+
   // copies that spent the full MAX_BET_USDC cap (in mirror mode: the trader
   // bet at least the cap, so our bet was clamped to it)
   const betCap = status?.betUsdc;
@@ -632,6 +642,12 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
           label=${cap != null ? `Active in trading (${status.maxActivePct}% cap)` : "Active in trading"}
           value=${cap != null ? `$${active.toFixed(2)} / $${cap.toFixed(2)}` : `$${active.toFixed(2)}`}
           tone=${activeTone}
+        />
+        <${StatTile}
+          label="Skipped by guards"
+          value=${totalSkips}
+          tone=${totalSkips > 0 ? "#f0a13a" : null}
+          sub=${totalSkips > 0 ? `risk ${riskSkips} · drift ${driftSkips}` : "none skipped"}
         />
       </div>
       <div style=${{ padding: "0 14px 12px" }}>
