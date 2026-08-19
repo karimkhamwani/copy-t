@@ -73,6 +73,9 @@ and ignores everything else that wallet trades. Add more keywords to widen it
 | `MAX_BET_USDC` | USDC spent per copied bet (min $1, default 1). With mirror mode on, this is the cap |
 | `MIRROR_TRADER_BET` | `1` = bet what the trader bet, capped at `MAX_BET_USDC` (min $1). `0` = fixed bet (default) |
 | `MAX_TRADES` | Stop after this many placed trades (0 = unlimited). Use `1` for the first live run |
+| `DRIFT_GUARD` | `1` = refuse an order once the book has moved away from the trader's price (default, recommended). `0` = fill at any price |
+| `MAX_ADVERSE_DRIFT` | Skip if our executable price is this far **below** the trader's — the bet is already going against us (default 0.03) |
+| `MAX_OVERPAY` | Skip if our executable price is this far **above** the trader's (default 0.05) |
 | `POLL_INTERVAL_MS` | Poll interval, default 5000 (5s) |
 | `DASHBOARD_PORT` | Dashboard server port, default 3210 |
 | `DRY_RUN` | `1` = log orders instead of placing (default in .env.example) |

@@ -30,6 +30,9 @@ const {
   SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
   MAX_ACTIVE_PCT = "50", // cap: active bets <= this % of (balance + active). 0 = gate disabled
+  DRIFT_GUARD = "1", // 1 = refuse orders once the book has moved away from the trader's price
+  MAX_ADVERSE_DRIFT = "0.03", // skip if our exec price is this far BELOW theirs (the bet is already going against us)
+  MAX_OVERPAY = "0.05", // skip if our exec price is this far ABOVE theirs (we'd pay up for a worse edge)
   DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
   RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
   FETCH_FAIL_LIMIT = "3", // consecutive all-wallet network-failed polls before self-shutdown (yarn down). 0 = never
@@ -52,6 +55,9 @@ const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() =
 const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
+const driftGuard = DRIFT_GUARD === "1" || DRIFT_GUARD.toLowerCase() === "true";
+const maxAdverseDrift = Number(MAX_ADVERSE_DRIFT);
+const maxOverpay = Number(MAX_OVERPAY);
 let tradesPlaced = 0;
 
 /** Normalize wallet entries: lowercase addresses, drop empties, dedupe by address. */
@@ -262,7 +268,7 @@ function loadPaperBalance() {
 let paperBalance = isDryRun ? loadPaperBalance() : null;
 
 // Last risk-gate snapshot, surfaced to the dashboard via status.json
-let riskSnapshot = { balance: null, activeUsdc: null, riskSkipped: 0 };
+let riskSnapshot = { balance: null, activeUsdc: null, riskSkipped: 0, driftSkipped: 0 };
 
 function writeStatus() {
   try {
@@ -282,6 +288,10 @@ function writeStatus() {
       balance: riskSnapshot.balance,
       activeUsdc: riskSnapshot.activeUsdc,
       riskSkipped: riskSnapshot.riskSkipped,
+      driftGuard,
+      maxAdverseDrift: driftGuard ? maxAdverseDrift : undefined,
+      maxOverpay: driftGuard ? maxOverpay : undefined,
+      driftSkipped: riskSnapshot.driftSkipped,
       updatedAt: Date.now(),
     });
   } catch (err) {
@@ -386,6 +396,72 @@ function splitStale(trades, nowSec, maxAgeSec) {
 }
 
 /**
+ * Best (lowest) ask price from a CLOB order book, or null if there is none.
+ *
+ * The book's `asks` array is ordered WORST-first / BEST-last — the same order
+ * clob-client-v2's own calculateBuyMarketPrice walks in reverse. Reading
+ * `asks[0]` would take the most expensive level in the book, so the last
+ * element is the one to use.
+ */
+function bestAsk(book) {
+  const asks = book && Array.isArray(book.asks) ? book.asks : null;
+  if (!asks || asks.length === 0) return null;
+  const p = Number(asks[asks.length - 1]?.price);
+  return Number.isFinite(p) ? p : null;
+}
+
+/**
+ * Price-deviation gate: is our expected execution price still close enough to
+ * the price the trader actually got?
+ *
+ * Copying is only meaningful while the market still agrees with the trader's
+ * read. Two ways it stops agreeing, and both lose money:
+ *
+ * - execPrice far BELOW theirs — the book has moved against the position while
+ *   we were getting here. A cheap fill is not a discount; in a fast market the
+ *   ask only falls because the bet is already going wrong, and an unbounded
+ *   market order will happily buy it anyway.
+ * - execPrice far ABOVE theirs — we would pay up for a thesis priced at less,
+ *   which is the same trade with the edge removed.
+ *
+ * Returns { allowed, reason }. Callers must fail closed when execPrice is null.
+ */
+function driftVerdict(
+  execPrice,
+  theirPrice,
+  { adverse = maxAdverseDrift, overpay = maxOverpay } = {},
+) {
+  if (!Number.isFinite(execPrice)) {
+    return { allowed: false, reason: "no executable price available (fail-closed)" };
+  }
+  if (!Number.isFinite(theirPrice) || theirPrice <= 0) {
+    return { allowed: false, reason: "trader price unknown (fail-closed)" };
+  }
+  const drift = execPrice - theirPrice;
+  // Prices arrive as decimals whose subtraction is not exact (0.47 - 0.50 is
+  // -0.030000000000000027), so a drift sitting exactly on the limit would trip
+  // or not depending on float representation. Allow the boundary explicitly.
+  const EPS = 1e-9;
+  if (Number.isFinite(adverse) && adverse >= 0 && drift < -adverse - EPS) {
+    return {
+      allowed: false,
+      reason:
+        `book moved against us: our ${execPrice} is ${Math.abs(drift).toFixed(3)} ` +
+        `below their ${theirPrice} (limit ${adverse})`,
+    };
+  }
+  if (Number.isFinite(overpay) && overpay >= 0 && drift > overpay + EPS) {
+    return {
+      allowed: false,
+      reason:
+        `we would overpay: our ${execPrice} is ${drift.toFixed(3)} ` +
+        `above their ${theirPrice} (limit ${overpay})`,
+    };
+  }
+  return { allowed: true, reason: null };
+}
+
+/**
  * USDC to spend on a copied trade.
  * - default: fixed MAX_BET_USDC, ignoring the trader's size
  * - MIRROR_TRADER_BET=1: match the trader's usdcSize, capped at MAX_BET_USDC
@@ -439,7 +515,96 @@ async function getClobClient() {
   return clobClient;
 }
 
-async function placeMarketBuy(trade, amountUsdc) {
+/**
+ * The price our order would actually execute at, for `amountUsdc` of size.
+ *
+ * Uses the client's own calculateMarketPrice — the exact call createMarketOrder
+ * makes to price an unpriced market order — so the guard checks the same number
+ * the order will be built with rather than a top-of-book approximation. It walks
+ * real depth, so a thin best ask that cannot absorb our size is reflected here
+ * instead of flattering the check.
+ *
+ * Returns null when the price cannot be determined (empty book, network error,
+ * insufficient depth under FOK); callers treat null as "do not trade".
+ */
+async function execPriceFor(trade, amountUsdc) {
+  // Never throw: a lookup failure must produce null (-> fail closed -> a clean
+  // drift-skip). Throwing here would abandon the rest of the batch and leave
+  // this trade unmarked, so the next poll would retry it at a staler price.
+  let client;
+  try {
+    client = await getClobClient();
+  } catch (err) {
+    log(`drift guard: CLOB client unavailable (${err.message})`);
+    return null;
+  }
+  try {
+    const p = await client.calculateMarketPrice(
+      trade.asset,
+      client._Side.BUY,
+      amountUsdc,
+      client._OrderType.FAK,
+    );
+    const n = Number(p);
+    if (Number.isFinite(n)) return n;
+  } catch (err) {
+    // "no orderbook" / "no match" (no depth) land here — fall back to the raw
+    // book so a thin-but-present ask can still be evaluated.
+    log(`drift guard: market-price lookup failed (${err.message}) — trying raw book`);
+  }
+  try {
+    return bestAsk(await client.getOrderBook(trade.asset));
+  } catch (err) {
+    log(`drift guard: order book unavailable (${err.message})`);
+    return null;
+  }
+}
+
+/**
+ * Pre-flight price check. Disabled -> always allowed. In dry-run without
+ * credentials there is no CLOB client to ask, so the gate cannot run; it
+ * reports `unavailable` rather than silently passing, and startup warns.
+ */
+async function driftGateCheck(trade, amountUsdc) {
+  if (!driftGuard) return { allowed: true, reason: null, execPrice: null };
+  if (!PRIVATE_KEY) {
+    return { allowed: true, reason: null, execPrice: null, unavailable: true };
+  }
+  const execPrice = await execPriceFor(trade, amountUsdc);
+  const v = driftVerdict(execPrice, Number(trade.price));
+  return { ...v, execPrice };
+}
+
+/**
+ * Arguments for createMarketOrder.
+ *
+ * FAK (fill-and-kill): take whatever liquidity is available at the computed
+ * market price and cancel the rest — partial directional exposure beats the
+ * all-or-nothing FOK, which fails exactly when fast markets move.
+ *
+ * `execPrice` is the price the drift guard already computed from the book, and
+ * passing it through is what keeps the guard free. createMarketOrder only calls
+ * calculateMarketPrice — a /book round-trip, measured at 150-200ms against the
+ * live CLOB — when `price` is absent. Supplying it means the guard reuses that
+ * single fetch rather than adding a second one, so the check costs no extra
+ * network time on the path that matters. Dropping `price` here would silently
+ * double the round-trip and widen the very drift window the guard exists to
+ * close, so it is covered by a test.
+ *
+ * Omitted when the guard is off or could not read a price; the client then
+ * prices the order itself, exactly as it did before the guard existed.
+ */
+function marketOrderArgs({ tokenID, amount, side, orderType, execPrice }) {
+  return {
+    tokenID,
+    amount, // USDC to spend for a BUY market order
+    side,
+    orderType,
+    ...(Number.isFinite(execPrice) ? { price: execPrice } : {}),
+  };
+}
+
+async function placeMarketBuy(trade, amountUsdc, execPrice) {
   if (isDryRun) {
     log(
       `[DRY_RUN] would market-BUY $${amountUsdc} of "${trade.outcome}" ` +
@@ -449,15 +614,15 @@ async function placeMarketBuy(trade, amountUsdc) {
   }
 
   const client = await getClobClient();
-  // FAK (fill-and-kill): take whatever liquidity is available at the computed
-  // market price and cancel the rest — partial directional exposure beats the
-  // all-or-nothing FOK, which fails exactly when fast markets move.
-  const order = await client.createMarketOrder({
-    tokenID: trade.asset,
-    amount: amountUsdc, // USDC to spend for a BUY market order
-    side: client._Side.BUY,
-    orderType: client._OrderType.FAK,
-  });
+  const order = await client.createMarketOrder(
+    marketOrderArgs({
+      tokenID: trade.asset,
+      amount: amountUsdc,
+      side: client._Side.BUY,
+      orderType: client._OrderType.FAK,
+      execPrice,
+    }),
+  );
   const resp = await client.postOrder(order, client._OrderType.FAK);
   log("order response:", JSON.stringify(resp));
   // The client can return API errors as a normal response instead of throwing —
@@ -625,7 +790,7 @@ function observedEntry(trade, wallet, status) {
     theirPrice: trade.price,
     theirUsdc: trade.usdcSize,
     theirShares: trade.size,
-    status, // baseline | filtered | stale | pending | min-skip | success | failed
+    status, // baseline | filtered | stale | pending | min-skip | drift-skip | success | failed
     copy: null, // filled in when we attempt the copy
   };
 }
@@ -748,12 +913,34 @@ async function copyTrades(wallet, copyable, state, tag) {
       continue;
     }
 
+    // Price-deviation gate: the trader's price only justifies the copy while the
+    // book still agrees with it. Skipped for good like a risk-skip — re-checking
+    // later means an even staler read, never a better one.
+    const drift = await driftGateCheck(trade, amount);
+    if (!drift.allowed) {
+      riskSnapshot.driftSkipped++;
+      state.seen.add(tradeKey(trade));
+      saveState(state);
+      journalUpdate(
+        tradeKey(trade),
+        {
+          status: "drift-skip",
+          driftReason: drift.reason,
+          ourPrice: drift.execPrice,
+        },
+        observedEntry(trade, wallet, "drift-skip"),
+      );
+      log(`${tag} DRIFT SKIP "${trade.title}": ${drift.reason}`);
+      writeStatus();
+      continue;
+    }
+
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
         `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
     );
     try {
-      const resp = await placeMarketBuy(trade, amount);
+      const resp = await placeMarketBuy(trade, amount, drift.execPrice);
       const fill = resp.dryRun ? null : parseLiveFill(resp, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
@@ -996,6 +1183,29 @@ async function main() {
     );
     process.exit(1);
   }
+  if (driftGuard) {
+    for (const [name, v] of [
+      ["MAX_ADVERSE_DRIFT", maxAdverseDrift],
+      ["MAX_OVERPAY", maxOverpay],
+    ]) {
+      if (!Number.isFinite(v) || v < 0 || v > 1) {
+        console.error(`${name} must be a number between 0 and 1 (got "${v}")`);
+        process.exit(1);
+      }
+    }
+    if (!PRIVATE_KEY) {
+      log(
+        "WARNING: DRIFT_GUARD is on but PRIVATE_KEY is unset, so the order book " +
+          "cannot be read — the price-deviation gate will NOT run. Dry-run results " +
+          "will overstate what a guarded live run would take.",
+      );
+    }
+  } else {
+    log(
+      "WARNING: DRIFT_GUARD=0 — orders will be placed at any price the book " +
+        "offers, however far it has moved from the trader's price.",
+    );
+  }
 
   log(
     `copy-trader started: targets=[${targetWallets
@@ -1010,11 +1220,28 @@ async function main() {
         mirrorBet ? `mirror (cap $${BET_USDC})` : `$${BET_USDC} (fixed)`
       } dryRun=${isDryRun} ` +
       `maxTrades=${maxTrades || "unlimited"} ` +
-      `skipBelowMin=${skipBelowMin ? "on" : "off"}`,
+      `skipBelowMin=${skipBelowMin ? "on" : "off"} ` +
+      `driftGuard=${
+        driftGuard ? `-${maxAdverseDrift}/+${maxOverpay}` : "off"
+      }`,
   );
 
   const state = loadState();
   writeStatus();
+
+  // Build the CLOB client before the first signal arrives. Deriving API creds is
+  // a signature plus a round-trip, and it would otherwise land on the first
+  // trade's critical path — the one moment latency costs money. Non-fatal: if it
+  // fails here, the normal lazy path retries and reports errors as it always did.
+  if (PRIVATE_KEY) {
+    const t0 = Date.now();
+    try {
+      await getClobClient();
+      log(`clob client ready (warmed in ${Date.now() - t0}ms)`);
+    } catch (err) {
+      log(`clob client warm-up failed (${err.message}) — will retry on first use`);
+    }
+  }
 
   if (wsEnabled) {
     startWsFeed(state);
@@ -1042,6 +1269,9 @@ module.exports = {
   normalizeWallets,
   splitStale,
   matchesSubCategory,
+  bestAsk,
+  driftVerdict,
+  marketOrderArgs,
   pollUser,
   riskGateCheck,
   getActiveUsdc,

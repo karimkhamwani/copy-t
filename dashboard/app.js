@@ -13,6 +13,7 @@ const BADGE_LABEL = {
   baseline: "BASELINE",
   "min-skip": "MIN SKIP",
   "risk-skip": "RISK SKIP",
+  "drift-skip": "DRIFT SKIP",
 };
 
 function timeAgo(ms) {
@@ -93,7 +94,9 @@ function TargetTradeRow({ t }) {
         <span>${money(t.theirUsdc)} (${t.theirShares} sh)</span>
         <span>${t.category}</span>
         <span>${timeAgo(t.tradedAt)}</span>
+        ${t.ourPrice != null && html`<span>our ${t.ourPrice}</span>`}
       </div>
+      ${t.driftReason && html`<div className="skip">${t.driftReason}</div>`}
     </div>`;
 }
 
@@ -790,6 +793,16 @@ function App() {
             <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>
             <span>poll ${(status.pollIntervalMs || 0) / 1000}s</span>
             <span>placed ${status.tradesPlaced ?? 0}${status.maxTrades ? `/${status.maxTrades}` : ""}</span>
+            <span
+              title=${status.driftGuard
+                ? `Price-deviation guard active: skip if our price is more than ${status.maxAdverseDrift} below the trader's, or ${status.maxOverpay} above it. A rising count means the book is moving away before orders land.`
+                : "Price-deviation guard is OFF — orders fill at whatever price the book offers"}
+              style=${{ color: status.driftGuard ? undefined : "var(--red)" }}
+            >
+              drift ${status.driftGuard
+                ? `-${status.maxAdverseDrift}/+${status.maxOverpay} · skipped ${status.driftSkipped ?? 0}`
+                : "OFF"}
+            </span>
             <span>
               targets:${" "}
               ${(status.targets || [])

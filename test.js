@@ -1,6 +1,6 @@
 /** Offline tests for the copy-trader logic (no network needed). */
 const assert = require("assert");
-const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory } = require("./copy-trader");
+const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory, bestAsk, driftVerdict, marketOrderArgs } = require("./copy-trader");
 
 const sample = [
   { type: "TRADE", side: "BUY", transactionHash: "0xaaa", asset: "111", usdcSize: 50, price: 0.42, timestamp: 100, title: "Market A", outcome: "Yes" },
@@ -86,6 +86,86 @@ assert.strictEqual(
   // normalizeWallets carries sub_category through, lowercased
   const [w] = normalizeWallets([{ address: "0xA", category: "crypto", sub_category: [" BTC ", ""] }]);
   assert.deepStrictEqual(w.subCategories, ["btc"]);
+}
+
+
+// 10. Price-deviation guard
+{
+  // bestAsk: the book's asks run WORST-first / BEST-last, so the last level is
+  // the best ask. Taking asks[0] would read the most expensive level instead.
+  const book = { asks: [{ price: "0.72", size: "5" }, { price: "0.61", size: "9" }, { price: "0.55", size: "20" }] };
+  assert.strictEqual(bestAsk(book), 0.55);
+  assert.strictEqual(bestAsk({ asks: [] }), null);
+  assert.strictEqual(bestAsk({}), null);
+  assert.strictEqual(bestAsk(null), null);
+  assert.strictEqual(bestAsk({ asks: [{ price: "not-a-number" }] }), null);
+
+  const band = { adverse: 0.03, overpay: 0.05 };
+  // inside the band, either direction -> allowed
+  assert.strictEqual(driftVerdict(0.50, 0.50, band).allowed, true);
+  assert.strictEqual(driftVerdict(0.48, 0.50, band).allowed, true); // 2c adverse
+  assert.strictEqual(driftVerdict(0.54, 0.50, band).allowed, true); // 4c overpay
+  // exactly at the limit is allowed, and must not hinge on float representation
+  // (0.47 - 0.50 is -0.030000000000000027 in IEEE754)
+  assert.strictEqual(driftVerdict(0.47, 0.50, band).allowed, true);
+  assert.strictEqual(driftVerdict(0.55, 0.50, band).allowed, true);
+  // past the limit -> blocked
+  assert.strictEqual(driftVerdict(0.4699, 0.50, band).allowed, false);
+  assert.strictEqual(driftVerdict(0.5501, 0.50, band).allowed, false);
+
+  // the real losing case from the Aug 18 session: trader got 0.81, book had
+  // fallen to 0.39 by the time the order landed. Must be refused.
+  const worst = driftVerdict(0.39, 0.81, band);
+  assert.strictEqual(worst.allowed, false);
+  assert.match(worst.reason, /moved against us/);
+  assert.match(worst.reason, /0\.420/); // reports the actual drift
+
+  // fail closed on unusable inputs
+  for (const bad of [null, undefined, NaN, "0.4"]) {
+    assert.strictEqual(driftVerdict(bad, 0.5, band).allowed, false, `execPrice ${bad}`);
+  }
+  for (const bad of [null, undefined, NaN, 0, -1]) {
+    assert.strictEqual(driftVerdict(0.5, bad, band).allowed, false, `theirPrice ${bad}`);
+  }
+  assert.match(driftVerdict(null, 0.5, band).reason, /fail-closed/);
+
+  // a zero band means exact-price-or-nothing, not "disabled"
+  assert.strictEqual(driftVerdict(0.49, 0.50, { adverse: 0, overpay: 0 }).allowed, false);
+  assert.strictEqual(driftVerdict(0.50, 0.50, { adverse: 0, overpay: 0 }).allowed, true);
+
+  // overpay is checked independently of adverse drift
+  assert.strictEqual(driftVerdict(0.90, 0.50, { adverse: 1, overpay: 0.05 }).allowed, false);
+  assert.match(driftVerdict(0.90, 0.50, { adverse: 1, overpay: 0.05 }).reason, /overpay/);
+}
+
+
+// 11. The drift guard must not add a network round-trip.
+//
+// clob-client-v2's createMarketOrder only calls calculateMarketPrice — a /book
+// fetch, ~180ms against the live CLOB — when `price` is absent. The guard has
+// already paid for that fetch, so its price must be threaded into the order.
+// If this regresses, every copy costs a second round-trip and the drift window
+// the guard exists to close gets WIDER.
+{
+  const base = { tokenID: "tok", amount: 10, side: "BUY", orderType: "FAK" };
+
+  // guard produced a price -> it is passed through, so the client will not re-fetch
+  const withPrice = marketOrderArgs({ ...base, execPrice: 0.6 });
+  assert.strictEqual(withPrice.price, 0.6);
+  assert.ok("price" in withPrice, "price must be present or the client re-fetches the book");
+
+  // 0 is a real price and must survive (it is finite, even though it is falsy)
+  assert.strictEqual(marketOrderArgs({ ...base, execPrice: 0 }).price, 0);
+
+  // no usable price (guard off / dry-run without a key) -> omit the key entirely
+  // rather than sending undefined, so the client prices it as it always did
+  for (const bad of [undefined, null, NaN, "0.6"]) {
+    const args = marketOrderArgs({ ...base, execPrice: bad });
+    assert.strictEqual("price" in args, false, `execPrice ${bad} must not set price`);
+  }
+
+  // the rest of the order is unchanged
+  assert.deepStrictEqual(marketOrderArgs(base), base);
 }
 
 console.log("all tests passed");

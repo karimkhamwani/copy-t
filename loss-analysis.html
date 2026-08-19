@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Copy-Trader Loss Autopsy</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{
+  --bg:#fbfaf8; --surface:#ffffff; --surface2:#f4f2ee; --border:#e3ded5;
+  --ink:#1c1a17; --ink2:#575049; --ink3:#8a8178;
+  --pos:#1f7a4d; --neg:#a83244; --warn:#9a6410; --accent:#2b5f8f;
+  --posbg:rgba(31,122,77,.10); --negbg:rgba(168,50,68,.10); --warnbg:rgba(154,100,16,.10);
+  --onbar:#ffffff;
+}
+:root:not([data-theme=light]){}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+  --bg:#12100e; --surface:#1a1815; --surface2:#221f1b; --border:#332e28;
+  --ink:#ece7df; --ink2:#b3aaa0; --ink3:#847a70;
+  --pos:#4cc98a; --neg:#e8737f; --warn:#e0a94a; --accent:#7fb3e0;
+  --posbg:rgba(76,201,138,.12); --negbg:rgba(232,115,127,.12); --warnbg:rgba(224,169,74,.12);
+  --onbar:#12100e;
+}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+ font:16px/1.65 ui-serif,Georgia,"Iowan Old Style",serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:880px;margin:0 auto;padding:56px 24px 96px}
+h1,h2,h3,.ui{font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+h1{font-size:34px;line-height:1.2;margin:0 0 8px;letter-spacing:-.02em}
+.sub{color:var(--ink3);font-size:14px;font-family:ui-sans-serif,-apple-system,sans-serif;margin:0 0 40px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink3);
+ margin:56px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--border)}
+h3{font-size:18px;margin:32px 0 8px;letter-spacing:-.01em}
+p{margin:0 0 14px}
+strong{font-weight:600}
+code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--surface2);
+ border:1px solid var(--border);border-radius:4px;padding:1px 5px}
+pre{background:var(--surface2);border:1px solid var(--border);border-radius:8px;
+ padding:14px 16px;overflow-x:auto;margin:14px 0}
+pre code{background:none;border:none;padding:0;font-size:12.5px;line-height:1.6}
+.hero{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+ padding:24px;margin:0 0 8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:20px}
+.k{font-family:ui-sans-serif,-apple-system,sans-serif}
+.k .lab{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--ink3)}
+.k .val{font-size:26px;font-weight:650;letter-spacing:-.02em;margin-top:2px;font-variant-numeric:tabular-nums}
+.neg{color:var(--neg)} .pos{color:var(--pos)} .warn{color:var(--warn)}
+table{width:100%;border-collapse:collapse;margin:16px 0;font-family:ui-sans-serif,-apple-system,sans-serif;font-size:14px}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+th,td{text-align:left;padding:9px 12px;border-bottom:1px solid var(--border)}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink3);font-weight:600}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+tr.hl td{background:var(--negbg)}
+tr.hlp td{background:var(--posbg)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:18px 20px;margin:18px 0}
+.card.bad{border-left:3px solid var(--neg)}
+.card.good{border-left:3px solid var(--pos)}
+.card.warn{border-left:3px solid var(--warn)}
+.card h4{font-family:ui-sans-serif,-apple-system,sans-serif;font-size:14px;margin:0 0 8px;letter-spacing:.01em}
+.card p:last-child{margin-bottom:0}
+figure{margin:20px 0}
+figcaption{font-family:ui-sans-serif,-apple-system,sans-serif;font-size:12.5px;color:var(--ink3);margin-top:8px}
+svg{display:block;width:100%;height:auto;overflow:visible}
+.grid{stroke:var(--border);stroke-width:1}
+.zero{stroke:var(--ink3);stroke-width:1;stroke-dasharray:3 3}
+.mark{stroke:var(--ink3);stroke-width:1;stroke-dasharray:2 3;opacity:.6}
+.line{fill:none;stroke:var(--accent);stroke-width:2.5;stroke-linejoin:round}
+.fillneg{fill:var(--negbg);stroke:none}
+.dotpos{fill:var(--pos);stroke:var(--surface);stroke-width:1.5}
+.dotneg{fill:var(--neg);stroke:var(--surface);stroke-width:1.5}
+.bpos{fill:var(--pos)} .bneg{fill:var(--neg)}
+.ax,.bl,.bv,.note{font-family:ui-sans-serif,-apple-system,sans-serif;fill:var(--ink3);font-size:11px}
+.bl{fill:var(--ink2);font-size:12px} .bv{font-weight:600;font-size:11.5px}
+.bvin{font-family:ui-sans-serif,-apple-system,sans-serif;font-size:11.5px;font-weight:700;fill:var(--onbar)}
+.note{fill:var(--ink3);font-size:11px}
+.walk{background:var(--surface);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin:18px 0}
+.walk .step{display:grid;grid-template-columns:64px 1fr;gap:14px;padding:13px 18px;border-bottom:1px solid var(--border);font-size:14.5px}
+.walk .step:last-child{border-bottom:none}
+.walk .t{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:var(--ink3);padding-top:3px}
+.walk .step.fail{background:var(--negbg)}
+ol.steps{counter-reset:s;list-style:none;padding:0;margin:20px 0}
+ol.steps>li{counter-increment:s;position:relative;padding:0 0 4px 46px;margin-bottom:26px}
+ol.steps>li::before{content:counter(s);position:absolute;left:0;top:0;width:30px;height:30px;
+ border-radius:50%;background:var(--accent);color:var(--bg);font:600 14px/30px ui-sans-serif,sans-serif;
+ text-align:center}
+ol.steps h3{margin:2px 0 6px;font-size:17px}
+.tag{display:inline-block;font-family:ui-sans-serif,sans-serif;font-size:10.5px;font-weight:700;
+ letter-spacing:.06em;text-transform:uppercase;padding:2px 7px;border-radius:4px;vertical-align:2px;margin-left:8px}
+.tag.p1{background:var(--negbg);color:var(--neg)}
+.tag.p2{background:var(--warnbg);color:var(--warn)}
+.tag.p3{background:var(--surface2);color:var(--ink3)}
+blockquote{margin:16px 0;padding:2px 0 2px 18px;border-left:3px solid var(--border);color:var(--ink2)}
+hr{border:none;border-top:1px solid var(--border);margin:44px 0}
+.foot{color:var(--ink3);font-size:13px;font-family:ui-sans-serif,sans-serif}
+@media(max-width:640px){.wrap{padding:32px 16px 64px}h1{font-size:27px}.walk .step{grid-template-columns:1fr}.walk .t{padding-top:0}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Why the live session lost $150</h1>
+<p class="sub">Autopsy of 111 settled live bets · Aug 18 2026, 17:40–20:31 UTC · source <code>trades-log (4).json</code></p>
+
+<div class="hero">
+  <div class="k"><div class="lab">Staked</div><div class="val">$941.83</div></div>
+  <div class="k"><div class="lab">Returned</div><div class="val">$791.74</div></div>
+  <div class="k"><div class="lab">Net</div><div class="val neg">−$150.09</div></div>
+  <div class="k"><div class="lab">Win rate</div><div class="val">40.5%</div></div>
+  <div class="k"><div class="lab">Needed to break even</div><div class="val warn">50.4%</div></div>
+</div>
+<p class="foot">45 wins / 66 losses across <strong>28 distinct markets</strong>. All 111 rows settled; P/L reconciles two independent ways; every market's outcomes are internally coherent.</p>
+
+<h2>The short version</h2>
+<p>Two things went wrong, and they are roughly 60/40 by dollar. <strong>First, the trader you copied was losing money on these same picks</strong> — priced at their own entries they were down 9.1%. <strong>Second, you have no price guard</strong>, so when the market moved against a position during the seconds before your order landed, you bought it anyway at the new, worse-informed price. That second flaw carries 94% of the realized loss.</p>
+<p>There is also a third thing that is not a cause of <em>this</em> loss but is the reason the loss was able to reach $150 so fast: your 111 bets were really only <strong>28 independent coin flips</strong>, because the engine piles many bets into the same 5-minute market — up to 18 of them.</p>
+<div class="card warn">
+  <h4>Read the statistics section before concluding the strategy is broken</h4>
+  <p>At the correct unit of analysis the $150 is <strong>not statistically distinguishable from bad luck</strong> (p ≈ 0.15). The two structural flaws are real and worth fixing regardless — but one 2.9-hour session cannot tell you whether the trader can pick.</p>
+</div>
+
+<h2>First, the arithmetic these markets run on</h2>
+<p>Every market here is a binary claim — "will ETH be up at 4:35 PM?" — that settles at exactly <strong>$1.00 if true and $0.00 if false</strong>. The price you pay per share <em>is</em> the market's probability estimate. Buy at 0.40 and you are paying 40¢ for a coin that pays a dollar 40% of the time.</p>
+<p>This gives one unforgiving rule that governs everything below:</p>
+<blockquote>Your break-even win rate equals your average entry price. Pay 0.40 on average, and you must win more than 40% of the time. Pay 0.62, you must win more than 62%.</blockquote>
+<p>You paid <strong>0.504 on average and won 40.5%</strong>. That gap — about 10 percentage points — is the entire loss. Nothing else needs explaining at the top level; the rest of this document is about <em>why</em> the gap opened.</p>
+
+<h2>Cause 1 · The trader had no edge to copy</h2>
+<p>Because you bought the same side of the same markets, you and the trader always shared the same win or loss. That makes a clean comparison possible: re-price the identical 111 picks at the trader's own entry prices and see how <em>they</em> did.</p>
+<div class="scroll"><table>
+<tr><th></th><th class="n">Staked</th><th class="n">Returned</th><th class="n">Net</th><th class="n">ROI</th><th class="n">Break-even needed</th></tr>
+<tr><td>The trader</td><td class="n">$1148.47</td><td class="n">$1044.07</td><td class="n neg">−$104.40</td><td class="n neg">−9.1%</td><td class="n">49.1%</td></tr>
+<tr class="hl"><td>You</td><td class="n">$941.83</td><td class="n">$791.74</td><td class="n neg">−$150.09</td><td class="n neg">−15.9%</td><td class="n">50.4%</td></tr>
+</table></div>
+<p>The picks needed a 49.1% win rate to break even and delivered 40.5%. <strong>There was no profitable signal in this session to copy.</strong> Copying it faithfully would have cost about 9%; your execution turned that into 16%.</p>
+<p>Splitting the loss into those two parts, holding your stake sizes constant and re-pricing only the fills:</p>
+<div class="scroll"><table>
+<tr><th>Component</th><th class="n">Cost</th><th class="n">Share</th></tr>
+<tr><td>The strategy itself — copying picks that lost</td><td class="n neg">−$89.30</td><td class="n">59%</td></tr>
+<tr><td>Execution — filling worse than the trader's price</td><td class="n neg">−$60.80</td><td class="n">41%</td></tr>
+</table></div>
+
+<h2>Cause 2 · You buy positions the market has already written off</h2>
+<p>This is the mechanical flaw, and it is where nearly all the money went. The engine places an unbounded <code>createMarketOrder</code> — it accepts whatever price the order book is showing when the order arrives, however far that has drifted from the price the trader got.</p>
+<p>Split every trade by which way the price moved in the seconds between the trader's fill and yours:</p>
+<div class="scroll"><table>
+<tr><th>During your delay, the price…</th><th class="n">Trades</th><th class="n">Win rate</th><th class="n">P/L</th><th class="n">ROI</th></tr>
+<tr class="hl"><td>moved <strong>against</strong> the position — you filled cheaper</td><td class="n">35</td><td class="n">23%</td><td class="n neg">−$141.25</td><td class="n neg">−56.6%</td></tr>
+<tr><td>moved <strong>with</strong> the position — you filled dearer</td><td class="n">53</td><td class="n">53%</td><td class="n">−$1.11</td><td class="n">−0.2%</td></tr>
+</table></div>
+<p><strong>32% of the trades produced 94% of the loss.</strong> The other two-thirds of the book was almost exactly break-even.</p>
+
+<h3>Why a cheaper fill is bad news, not a bargain</h3>
+<p>This is the counter-intuitive heart of it. A market order filling below the trader's price feels like a discount. It is the opposite. In a market this fast, the price only drops because <strong>the underlying moved and the bet is now losing</strong>. The book is repricing the claim in real time, and a lower ask means the market has revised the probability downward. You are not buying the trader's bet at a discount — you are buying a materially worse bet that happens to be cheap.</p>
+<p>Here is the single worst trade in the session, step by step:</p>
+<div class="walk">
+  <div class="step"><div class="t">+0.0s</div><div>Trader buys <strong>Up</strong> on the 3:45–3:50 PM ETH market at <strong>0.81</strong>. The market thinks this is an 81% favourite.</div></div>
+  <div class="step"><div class="t">+0.0s</div><div>Your poller has not seen it yet. The signal arrives over the REST activity feed.</div></div>
+  <div class="step"><div class="t">+6.8s</div><div>In those seconds ETH ticks down. "Up" is no longer an 81% favourite — the book now shows <strong>0.39</strong>.</div></div>
+  <div class="step fail"><div class="t">+6.8s</div><div>Your unbounded market order fills <strong>$28.72 at 0.39</strong> — 73.6 shares. Nothing checks that 0.39 is nowhere near the 0.81 that justified the trade.</div></div>
+  <div class="step fail"><div class="t">settle</div><div>ETH closes down. The position pays <strong>$0.00</strong>. <span class="neg"><strong>−$28.72</strong></span> — the largest single loss of the session.</div></div>
+</div>
+<p>The same pattern repeats: filled at 0.18 where the trader paid 0.50; at 0.20 where they paid 0.48; at 0.26 where they paid 0.51. All four of the worst-drift trades lost in full.</p>
+
+<figure><svg viewBox="0 0 760 220" role="img" aria-label="ROI by price drift"><line x1="463" y1="0" x2="463" y2="210" class="zero"/><text x="214" y="21" class="bl" text-anchor="end">moved against by >15c</text><rect x="224.0" y="6" width="239.0" height="18" rx="2" class="bneg"><title>moved against by >15c: -100.0% — n=4, win 0%, P/L $-52.84</title></rect><text x="230.0" y="19" class="bvin" text-anchor="start">-100%</text><text x="214" y="51" class="bl" text-anchor="end">against by 5–15c</text><rect x="338.2" y="36" width="124.8" height="18" rx="2" class="bneg"><title>against by 5–15c: -52.2% — n=16, win 25%, P/L $-41.17</title></rect><text x="344.2" y="49" class="bvin" text-anchor="start">-52%</text><text x="214" y="81" class="bl" text-anchor="end">against by 1–5c</text><rect x="367.3" y="66" width="95.7" height="18" rx="2" class="bneg"><title>against by 1–5c: -40.1% — n=15, win 27%, P/L $-47.24</title></rect><text x="373.3" y="79" class="bvin" text-anchor="start">-40%</text><text x="214" y="111" class="bl" text-anchor="end">essentially unchanged</text><rect x="444.4" y="96" width="18.6" height="18" rx="2" class="bneg"><title>essentially unchanged: -7.8% — n=22, win 36%, P/L $-13.78</title></rect><text x="438.4" y="109" class="bv" text-anchor="end">-8%</text><text x="214" y="141" class="bl" text-anchor="end">with us by 1–5c</text><rect x="463.0" y="126" width="17.0" height="18" rx="2" class="bpos"><title>with us by 1–5c: 7.1% — n=25, win 52%, P/L $13.58</title></rect><text x="486.0" y="139" class="bv" text-anchor="start">+7%</text><text x="214" y="171" class="bl" text-anchor="end">with us by 5–15c</text><rect x="463.0" y="156" width="26.0" height="18" rx="2" class="bpos"><title>with us by 5–15c: 10.9% — n=19, win 63%, P/L $24.85</title></rect><text x="495.0" y="169" class="bv" text-anchor="start">+11%</text><text x="214" y="201" class="bl" text-anchor="end">with us by >15c (overpaid)</text><rect x="379.0" y="186" width="84.0" height="18" rx="2" class="bneg"><title>with us by >15c (overpaid): -35.2% — n=10, win 40%, P/L $-33.50</title></rect><text x="385.0" y="199" class="bvin" text-anchor="start">-35%</text></svg>
+<figcaption>Return on investment by how far the price drifted before your fill. Adverse drift is catastrophic and the effect is monotone. Note the bottom row — drifting far in your <em>favour</em> also loses, because it means you overpaid relative to the trader's read.</figcaption></figure>
+
+<h3>The same fact seen through entry price</h3>
+<p>Because adverse drift produces cheap fills, sorting by the price you actually paid shows the identical story. Long-shot fills are almost entirely drift victims:</p>
+<div class="scroll"><table>
+<tr><th>Your fill price</th><th class="n">Trades</th><th class="n">Needed</th><th class="n">Got</th><th class="n">P/L</th><th class="n">ROI</th></tr>
+<tr class="hl"><td>under 0.30</td><td class="n">16</td><td class="n">21%</td><td class="n">0%</td><td class="n neg">−$67.86</td><td class="n neg">−100.0%</td></tr><tr class="hl"><td>0.30 – 0.45</td><td class="n">36</td><td class="n">39%</td><td class="n">14%</td><td class="n neg">−$155.93</td><td class="n neg">−68.5%</td></tr><tr class="hl"><td>0.45 – 0.55</td><td class="n">18</td><td class="n">50%</td><td class="n">39%</td><td class="n neg">−$24.66</td><td class="n neg">−27.8%</td></tr><tr class="hlp"><td>0.55 – 0.70</td><td class="n">22</td><td class="n">62%</td><td class="n">73%</td><td class="n pos">$56.67</td><td class="n pos">+25.3%</td></tr><tr class="hlp"><td>over 0.70</td><td class="n">19</td><td class="n">85%</td><td class="n">89%</td><td class="n pos">$41.69</td><td class="n pos">+12.5%</td></tr>
+</table></div>
+<p>Sixteen bets filled under 0.30 went <strong>0-for-16</strong>. At an average price of 0.205 you would expect roughly three winners; getting none is the signature of buying already-dead positions rather than genuine long shots.</p>
+
+<h2>Cause 3 · 111 bets were really 28 coin flips</h2>
+<p>The engine caps total exposure through <code>MAX_ACTIVE_PCT</code>, but <strong>nothing caps exposure per market</strong>. Each time the trader added to a position, you opened another one, so single 5-minute candles absorbed many independent bets:</p>
+<div class="scroll"><table>
+<tr><th>Market (Aug 18, ET)</th><th class="n">Bets</th><th class="n">Staked</th><th class="n">P/L</th><th>Sides bought</th></tr>
+<tr><td>1:55PM-2:00PM ET</td><td class="n">18</td><td class="n">$128.55</td><td class="n pos">$25.92</td><td>Up and Down</td></tr><tr class="hl"><td>2:20PM-2:25PM ET</td><td class="n">10</td><td class="n">$86.45</td><td class="n neg">−$42.36</td><td>Up and Down</td></tr><tr><td>2:00PM-2:05PM ET</td><td class="n">11</td><td class="n">$75.79</td><td class="n pos">$5.77</td><td>Up and Down</td></tr><tr><td>2:35PM-2:40PM ET</td><td class="n">5</td><td class="n">$58.37</td><td class="n pos">$12.34</td><td>Up and Down</td></tr><tr><td>4:15PM-4:20PM ET</td><td class="n">2</td><td class="n">$57.81</td><td class="n pos">$0.58</td><td>Down</td></tr><tr class="hl"><td>3:45PM-3:50PM ET</td><td class="n">4</td><td class="n">$56.34</td><td class="n neg">−$38.90</td><td>Up and Down</td></tr>
+</table></div>
+<p>One market took <strong>18 bets and $128.55</strong> — 4.3× your largest single bet — on the outcome of one five-minute candle. And the loss is correspondingly lumpy: the <strong>worst 5 markets account for −$170.25</strong>, which is 113% of the total. Every other market combined was slightly profitable.</p>
+<div class="card bad">
+  <h4>You bought both sides of the same market in 14 of 28 cases</h4>
+  <p>In 8 of those the two fill prices summed to more than 1.00 — worst case <strong>1.263</strong>. Buying Up at 0.834 and Down at 0.393 means paying $1.26 for a position that pays exactly $1.00 whatever happens. The directly offsetting portion locked in about <strong>$5 of guaranteed loss</strong>, and it churned $684 of stake through the spread to no purpose. It is a small number, but it is free money handed away, and it is a sign the engine has no notion of a coherent position.</p>
+</div>
+
+<figure><svg viewBox="0 0 760 240" role="img" aria-label="Cumulative profit and loss over the session"><path d="M52.0,66.5 L109.7,42.1 L167.3,16.0 L225.0,90.5 L282.7,78.9 L340.3,79.7 L398.0,95.8 L455.7,98.6 L513.3,105.0 L571.0,145.1 L628.7,165.3 L686.3,202.6 L744.0,206.0 L744.0,64.6 L52.0,64.6 Z" class="fillneg"/><line x1="52" y1="16.0" x2="744" y2="16.0" class="grid"/><text x="44" y="20.0" class="ax" text-anchor="end">$52</text><line x1="52" y1="111.0" x2="744" y2="111.0" class="grid"/><text x="44" y="115.0" class="ax" text-anchor="end">$-49</text><line x1="52" y1="206.0" x2="744" y2="206.0" class="grid"/><text x="44" y="210.0" class="ax" text-anchor="end">$-150</text><line x1="52" y1="64.6" x2="744" y2="64.6" class="zero"/><line x1="167.3" y1="16" x2="167.3" y2="206" class="mark"/><text x="173.3" y="28" class="note">peak +$52</text><path d="M52.0,66.5 L109.7,42.1 L167.3,16.0 L225.0,90.5 L282.7,78.9 L340.3,79.7 L398.0,95.8 L455.7,98.6 L513.3,105.0 L571.0,145.1 L628.7,165.3 L686.3,202.6 L744.0,206.0" class="line"/><circle cx="52.0" cy="66.5" r="3" class="dotneg"><title>17:30 — cum $-2.00 (1 bets, 0% won)</title></circle><circle cx="109.7" cy="42.1" r="3" class="dotpos"><title>17:45 — cum $23.92 (18 bets, 56% won)</title></circle><circle cx="167.3" cy="16.0" r="3" class="dotpos"><title>18:00 — cum $51.57 (14 bets, 57% won)</title></circle><circle cx="225.0" cy="90.5" r="3" class="dotneg"><title>18:15 — cum $-27.54 (18 bets, 17% won)</title></circle><circle cx="282.7" cy="78.9" r="3" class="dotneg"><title>18:30 — cum $-15.20 (5 bets, 80% won)</title></circle><circle cx="340.3" cy="79.7" r="3" class="dotneg"><title>18:45 — cum $-16.00 (5 bets, 40% won)</title></circle><circle cx="398.0" cy="95.8" r="3" class="dotneg"><title>19:00 — cum $-33.14 (5 bets, 20% won)</title></circle><circle cx="455.7" cy="98.6" r="3" class="dotneg"><title>19:15 — cum $-36.10 (5 bets, 60% won)</title></circle><circle cx="513.3" cy="105.0" r="3" class="dotneg"><title>19:30 — cum $-42.93 (4 bets, 50% won)</title></circle><circle cx="571.0" cy="145.1" r="3" class="dotneg"><title>19:45 — cum $-85.46 (12 bets, 42% won)</title></circle><circle cx="628.7" cy="165.3" r="3" class="dotneg"><title>20:00 — cum $-106.94 (10 bets, 20% won)</title></circle><circle cx="686.3" cy="202.6" r="3" class="dotneg"><title>20:15 — cum $-146.45 (11 bets, 36% won)</title></circle><circle cx="744.0" cy="206.0" r="3" class="dotneg"><title>20:30 — cum $-150.09 (3 bets, 33% won)</title></circle><text x="52.0" y="228" class="ax" text-anchor="middle">17:30</text><text x="167.3" y="228" class="ax" text-anchor="middle">18:00</text><text x="282.7" y="228" class="ax" text-anchor="middle">18:30</text><text x="398.0" y="228" class="ax" text-anchor="middle">19:00</text><text x="513.3" y="228" class="ax" text-anchor="middle">19:30</text><text x="628.7" y="228" class="ax" text-anchor="middle">20:00</text><text x="744.0" y="228" class="ax" text-anchor="middle">20:30</text></svg>
+<figcaption>Cumulative P/L through the session. You were up $51.57 an hour in, then one 15-minute window (18:15 UTC, 18 bets, 17% win rate) gave back $79.11. The steady bleed after 19:45 is consistent with a lagging copier being run over by a sustained directional move.</figcaption></figure>
+
+<h2>The statistics · why 111 is not 111</h2>
+<p>Taken as 111 independent bets, the result looks conclusive: z = −2.08, <strong>p ≈ 0.02</strong>. You would reject the hypothesis that this strategy breaks even.</p>
+<p>That is the wrong unit, for two reasons. Bets cluster about four to a market, and <strong>in 14 of 28 markets every single bet shared one outcome</strong> — they were one wager wearing several hats. The independent unit is the market, not the bet.</p>
+<div class="scroll"><table>
+<tr><th>Unit of analysis</th><th class="n">n</th><th class="n">z</th><th class="n">p</th><th>Verdict</th></tr>
+<tr><td>Individual bets (naive)</td><td class="n">111</td><td class="n">−2.08</td><td class="n">0.02</td><td>Looks like a real losing edge</td></tr>
+<tr class="hlp"><td>Distinct markets (correct)</td><td class="n">28</td><td class="n">−1.05</td><td class="n">0.15</td><td>Indistinguishable from luck</td></tr>
+</table></div>
+<p>So: <strong>this session does not prove the strategy loses money, and it certainly does not prove it works.</strong> 28 correlated coin flips over 2.9 hours is not enough to measure a trader's skill either way. What the session <em>does</em> establish, independently of sample size, is that the two structural flaws above exist in the code — those are logic errors visible in single trades, not statistical claims.</p>
+
+<h2>What does <em>not</em> fix this</h2>
+<p>The obvious instinct is "copy faster." The data rejects it. Sweeping the staleness cutoff over the actual fills makes results steadily <strong>worse</strong>, not better:</p>
+<figure><svg viewBox="0 0 760 220" role="img" aria-label="ROI by latency cutoff"><line x1="463" y1="0" x2="463" y2="210" class="zero"/><text x="214" y="21" class="bl" text-anchor="end">cutoff 15s</text><rect x="374.0" y="6" width="89.0" height="18" rx="2" class="bneg"><title>cutoff 15s: -15.9% — kept 111, P/L $-150.09</title></rect><text x="380.0" y="19" class="bvin" text-anchor="start">-16%</text><text x="214" y="51" class="bl" text-anchor="end">cutoff 10s</text><rect x="400.1" y="36" width="62.9" height="18" rx="2" class="bneg"><title>cutoff 10s: -11.3% — kept 96, P/L $-93.64</title></rect><text x="406.1" y="49" class="bvin" text-anchor="start">-11%</text><text x="214" y="81" class="bl" text-anchor="end">cutoff 8s</text><rect x="378.8" y="66" width="84.2" height="18" rx="2" class="bneg"><title>cutoff 8s: -15.1% — kept 76, P/L $-82.65</title></rect><text x="384.8" y="79" class="bvin" text-anchor="start">-15%</text><text x="214" y="111" class="bl" text-anchor="end">cutoff 6s</text><rect x="343.3" y="96" width="119.7" height="18" rx="2" class="bneg"><title>cutoff 6s: -21.4% — kept 48, P/L $-59.68</title></rect><text x="349.3" y="109" class="bvin" text-anchor="start">-21%</text><text x="214" y="141" class="bl" text-anchor="end">cutoff 5s</text><rect x="319.5" y="126" width="143.5" height="18" rx="2" class="bneg"><title>cutoff 5s: -25.7% — kept 32, P/L $-49.12</title></rect><text x="325.5" y="139" class="bvin" text-anchor="start">-26%</text><text x="214" y="171" class="bl" text-anchor="end">cutoff 4s</text><rect x="261.4" y="156" width="201.6" height="18" rx="2" class="bneg"><title>cutoff 4s: -36.1% — kept 22, P/L $-41.43</title></rect><text x="267.4" y="169" class="bvin" text-anchor="start">-36%</text><text x="214" y="201" class="bl" text-anchor="end">cutoff 3s</text><rect x="224.0" y="186" width="239.0" height="18" rx="2" class="bneg"><title>cutoff 3s: -42.8% — kept 11, P/L $-28.79</title></rect><text x="230.0" y="199" class="bvin" text-anchor="start">-43%</text></svg>
+<figcaption>ROI if you had only taken trades under each latency cutoff. Your fastest copies were not your better copies — the 3-second subset lost 42.8%.</figcaption></figure>
+<p>Median latency was 6.5 seconds on markets that live for 300 seconds, and the REST poller (median 8.1s) carried −$108.60 of the loss versus −$41.49 for the websocket. Latency clearly <em>enables</em> adverse drift — but cutting it does not fix the loss, because the guard you are missing is about <strong>price</strong>, not time. A 2-second-old trade whose price has collapsed is just as dead as a 12-second-old one. Fix the price check; treat latency as a secondary optimisation.</p>
+
+<hr>
+
+<h2>Next steps</h2>
+<p>In priority order. Steps 1–3 are code changes that address demonstrated logic errors. Step 4 is the one that decides whether this strategy is worth running at all — and it must be done in dry run.</p>
+
+<ol class="steps">
+
+<li>
+<h3>Add a price-deviation guard before every order<span class="tag p1">do first</span></h3>
+<p>This is the single highest-value change and it fixes a genuine missing check rather than a fitted pattern. Before placing, read the current best ask for the token and compare it to the price the trader paid. If it has drifted against you beyond a small band, <strong>skip the trade entirely</strong>.</p>
+<p>Backtested against this session's fills:</p>
+<div class="scroll"><table>
+<tr><th>Guard</th><th class="n">Trades kept</th><th class="n">P/L</th><th class="n">ROI</th></tr>
+<tr><td>none — what happened</td><td class="n">111</td><td class="n neg">−$150.09</td><td class="n neg">−15.9%</td></tr>
+<tr class="hlp"><td>skip if ask < theirs − 10c</td><td class="n">103</td><td class="n neg">−$97.31</td><td class="n neg">−11.2%</td></tr><tr class="hlp"><td>skip if ask < theirs − 5c</td><td class="n">92</td><td class="n neg">−$55.45</td><td class="n neg">−6.8%</td></tr><tr class="hlp"><td>skip if ask < theirs − 3c</td><td class="n">86</td><td class="n neg">−$36.59</td><td class="n neg">−4.7%</td></tr><tr class="hlp"><td>skip if ask < theirs − 2c</td><td class="n">83</td><td class="n neg">−$30.63</td><td class="n neg">−4.1%</td></tr><tr class="hlp"><td>skip if ask < theirs − 1c</td><td class="n">76</td><td class="n neg">−$8.85</td><td class="n neg">−1.3%</td></tr>
+</table></div>
+<p>A 1–3¢ band removes the loss almost entirely while still taking 76–86 of the 111 trades. <strong>Implemented</strong> in <code>copy-trader.js</code>, gated behind <code>DRIFT_GUARD</code> with the band set by <code>MAX_ADVERSE_DRIFT</code> (default 0.03) and <code>MAX_OVERPAY</code> (default 0.05):</p>
+<pre><code>const drift = await driftGateCheck(trade, amount);
+if (!drift.allowed) { /* journal as drift-skip, mark seen, continue */ }</code></pre>
+<div class="card good">
+  <h4>Two corrections to the obvious implementation</h4>
+  <p><strong>Do not read <code>asks[0]</code>.</strong> Polymarket returns the asks array <em>worst-price first, best last</em> — the library's own <code>calculateBuyMarketPrice</code> walks it in reverse. Taking index 0 reads the most expensive level in the book and would make the guard fire more or less at random.</p>
+  <p><strong>Do not use top-of-book at all.</strong> The guard calls <code>client.calculateMarketPrice(token, BUY, amount, FAK)</code> — the exact function <code>createMarketOrder</code> uses to price an unpriced order. It walks real depth, so it returns the price your size will actually clear at, and the check tests the same number the order will be built with rather than an approximation of it. With a thin best ask of 0.41 backed by only $0.82 of size, a $10 order really executes at 0.60; top-of-book would have skipped a trade that was in fact only 2¢ away from the trader's price.</p>
+</div>
+<p>Make the skip a first-class journal status (<code>drift-skip</code>) so the dashboard shows how often it fires — that number is your early warning that latency has degraded.</p>
+</li>
+
+<li>
+<h3>Replace the unbounded market order with a bounded one<span class="tag p1">do first</span></h3>
+<p>The guard above is a pre-flight check; it can still be beaten by movement in the milliseconds after you read the book. Close the hole properly at <a href="copy-trader.js:455">copy-trader.js:455</a> by sending a <strong>limit order priced at your worst acceptable fill</strong> with FAK time-in-force, instead of <code>createMarketOrder</code>, which by construction accepts any price.</p>
+<pre><code>const limit = Math.min(1, trade.price + MAX_OVERPAY);
+const order = await client.createOrder({
+  tokenID: trade.asset, side: client._Side.BUY,
+  price: limit, size: amountUsdc / limit,
+}, { tickSize, negRisk });
+await client.postOrder(order, client._OrderType.FAK);</code></pre>
+<p>You keep the fill-and-kill behaviour you wanted — partial fills are fine — but you can no longer be filled at an arbitrary price. Unfilled is a perfectly good outcome; being filled at 0.39 on an 0.81 thesis is not.</p>
+</li>
+
+<li>
+<h3>Cap exposure per market, and never hold both sides<span class="tag p2">then</span></h3>
+<p>Two independent rules, both cheap to add and both aimed at the concentration that let a normal losing streak reach $150:</p>
+<ul>
+<li><strong>One stake budget per <code>conditionId</code></strong> — e.g. <code>MAX_PER_MARKET_USDC</code>, refusing further buys once a market's cumulative stake hits it. On this session a $30 cap would have prevented the 18-bet, $128.55 pile-up.</li>
+<li><strong>Refuse a buy on a side when you already hold the opposite side</strong> of the same <code>conditionId</code>. There is no version of this that is correct, and it silently pays the spread to nobody.</li>
+</ul>
+<p>Both belong beside the existing risk gate, which already walks the journal for active positions and so has the data in hand.</p>
+</li>
+
+<li>
+<h3>Re-validate the trader in dry run before risking money again<span class="tag p1">the real decision</span></h3>
+<p>Everything above is damage control on execution. It does not answer the question that actually determines whether this is worth running: <strong>can this wallet pick?</strong> This session says their picks lost 9.1% at their own prices, but on 28 clustered markets that reading is not significant.</p>
+<p>Run the engine in dry run, with the guards from steps 1–3 active, and do not go live until you can answer these:</p>
+<ul>
+<li><strong>Several hundred distinct markets</strong>, not several hundred bets. Track <code>conditionId</code> count as your real sample size — it is the only number that matters for significance.</li>
+<li><strong>Trader ROI at their own entry prices</strong>, computed exactly as in Cause 1 above. If that is not clearly positive over a large market count, no amount of execution tuning makes copying them profitable. This is the go/no-go metric.</li>
+<li><strong>Your ROI after guards</strong>, versus theirs. The gap is your true execution cost and should be small and stable.</li>
+<li><strong>Drift-skip rate.</strong> If the guard is rejecting most signals, you are structurally too slow to copy this trader at all, and that is a valid reason to stop — a strategy you cannot execute is not a strategy.</li>
+</ul>
+</li>
+
+<li>
+<h3>Treat the profitable-looking price filters as unproven<span class="tag p3">resist</span></h3>
+<p>You will notice in the tables above that simply skipping cheap entries flips this session strongly positive — filtering to fills at or above 0.50 yields +18.5% ROI and a 76% win rate. <strong>Do not deploy that.</strong> I tested roughly 25 filter variants against 28 independent clusters; a result that good appearing among them is exactly what overfitting looks like. It is also partly circular, because a high entry price in a nearly-expired market is itself downstream of the outcome.</p>
+<p>The honest version of that finding is already captured by step 1: cheap fills were bad <em>because</em> they were drift victims. Fix the cause, and do not add a price floor on top of it until several hundred markets of dry-run data say the floor earns its keep independently.</p>
+</li>
+
+</ol>
+
+<h2>How to reproduce any figure here</h2>
+<p>Every number comes from the journal alone — win/loss from the <code>copy.won</code> flags the trader writes after CLOB resolution, P/L as <code>shares − spentUsdc</code> on wins and <code>−spentUsdc</code> on losses. Your realised fill price is <code>spentUsdc / shares</code>, which agreed with the recorded <code>copy.price</code> within 2¢ on all 111 rows. Sanity checks passed: both sides never won the same market, all rows settled, and the total reconciles two independent ways to −$150.09.</p>
+<pre><code>node -e '
+const live = require("./trades-log (4).json")
+  .filter(e => e.copy &amp;&amp; e.status === "success" &amp;&amp; e.copy.mode === "live");
+const spent = live.reduce((s,e) => s + e.copy.spentUsdc, 0);
+const paid  = live.reduce((s,e) => s + (e.copy.won ? e.copy.shares : 0), 0);
+console.log(live.length, "bets", spent.toFixed(2), "staked", (paid-spent).toFixed(2), "net");
+'</code></pre>
+<p class="foot">One caveat on the backtests in step 1: they filter on your <em>realised</em> fill price as a stand-in for the ask you would have seen a moment earlier. Those are close but not identical, so treat the recovered dollar figures as indicative rather than exact. The direction and magnitude of the effect are not in doubt; the precise cent is.</p>
+
+</div>
+</body>
+</html>
