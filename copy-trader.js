@@ -684,6 +684,26 @@ function refreshResolutions() {
 }
 
 /**
+ * Refresh the resolution cache and settle whatever became resolved, off the copy
+ * path. Called from the poll loop's idle gap and once at startup, never from the
+ * risk gate — that is the whole point, see riskGateCheck.
+ *
+ * Never throws: a failed lookup leaves the market unresolved, which the gate
+ * treats as still-active. Losing a refresh is harmless; crashing the poll loop
+ * is not.
+ */
+async function warmResolutions() {
+  try {
+    await refreshResolutions();
+    await serialize(() => {
+      settleResolvedCopies();
+    });
+  } catch (err) {
+    log("resolution refresh failed:", err.message || err);
+  }
+}
+
+/**
  * Mark resolved copies as settled (so they leave "active" permanently).
  * Dry-run: also credit win payouts to the paper balance — winners pay $1/share,
  * losers pay nothing (the spend was already debited at bet time).
@@ -745,7 +765,16 @@ async function getUsdcBalance() {
  */
 async function riskGateCheck(amountUsdc) {
   if (!maxActivePct) return { allowed: true, disabled: true };
-  await refreshResolutions();
+  // Deliberately does NOT refresh resolutions: that is a /markets round-trip
+  // (~200ms) and this runs on the copy path, where every millisecond widens the
+  // price drift we are trying to avoid. The poll loop keeps the cache warm in
+  // its idle gap instead, so this reads it for free.
+  //
+  // Safe because staleness only ever errs toward caution: a market that resolved
+  // but has not been re-checked still counts toward `active`, overstating
+  // exposure and making the gate stricter, never looser. And the cache was
+  // already allowed to be RESOLUTION_RECHECK_MS (60s) old — refreshing on the
+  // poll tick makes it fresher than the old inline call did, not staler.
   settleResolvedCopies();
   const active = getActiveUsdc();
   let balance;
@@ -1260,6 +1289,12 @@ async function main() {
     }
   }
 
+  // Populate the resolution cache before any signal can arrive. The ws feed
+  // starts below and can copy before the first poll completes, and an empty
+  // cache makes every past position look unresolved — which would over-count
+  // active exposure and could gate the first trade for no reason.
+  await warmResolutions();
+
   if (wsEnabled) {
     startWsFeed(state);
     log(`ws: real-time feed enabled (${WS_URL}) — poller runs as fallback`);
@@ -1270,7 +1305,13 @@ async function main() {
     // through the same queue as ws events, so the two sources never interleave
     await serialize(() => pollOnce(state));
     writeStatus();
-    await new Promise((r) => setTimeout(r, pollInterval));
+    // Refresh resolutions while we are idle anyway, overlapping the sleep so it
+    // costs no wall-clock and never delays a copy. Settling mutates the journal,
+    // so it goes through the same queue as poll/ws work.
+    await Promise.all([
+      new Promise((r) => setTimeout(r, pollInterval)),
+      warmResolutions(),
+    ]);
   }
 }
 
