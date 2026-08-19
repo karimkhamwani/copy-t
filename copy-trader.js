@@ -396,6 +396,19 @@ function splitStale(trades, nowSec, maxAgeSec) {
 }
 
 /**
+ * A copy of `trades` ordered oldest-first.
+ *
+ * The activity API returns newest-first (sortDirection=DESC) and journalAdd
+ * unshifts each row onto the front, so feeding it the API order reverses every
+ * batch: the oldest trade of a poll ends up above the newest. Journaling
+ * oldest-first makes the unshifts come out newest-at-top, which is the order the
+ * dashboard lists them in.
+ */
+function oldestFirst(trades) {
+  return [...trades].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+}
+
+/**
  * Best (lowest) ask price from a CLOB order book, or null if there is none.
  *
  * The book's `asks` array is ordered WORST-first / BEST-last — the same order
@@ -889,7 +902,10 @@ async function pollUser(wallet, state) {
     fresh.forEach((t) => state.seen.add(tradeKey(t)));
     state.baselined.add(address);
     saveState(state);
-    allBuys.forEach((t) => journalAdd(observedEntry(t, wallet, "baseline")));
+    // oldest first: journalAdd unshifts, so this lands newest-at-top
+    oldestFirst(allBuys).forEach((t) =>
+      journalAdd(observedEntry(t, wallet, "baseline")),
+    );
     log(`${tag} baseline: marked ${fresh.length} existing BUY trades as seen`);
     return;
   }
@@ -898,7 +914,7 @@ async function pollUser(wallet, state) {
   // Skip trades already decided (in `seen`) whose journal row was evicted by
   // the observed-pool cap — re-adding them would create zombie "pending" rows
   // that never receive a verdict (the copy loop never revisits seen keys).
-  for (const t of allBuys) {
+  for (const t of oldestFirst(allBuys)) {
     const key = tradeKey(t);
     if (journalIds.has(key) || state.seen.has(key)) continue;
     const status = matchesSubCategory(t, wallet.subCategories)
@@ -1367,6 +1383,7 @@ module.exports = {
   normalizeWallets,
   splitStale,
   matchesSubCategory,
+  oldestFirst,
   bestAsk,
   driftVerdict,
   marketOrderArgs,

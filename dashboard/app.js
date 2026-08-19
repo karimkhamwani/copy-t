@@ -712,7 +712,21 @@ function App() {
     status?.updatedAt &&
     Date.now() - status.updatedAt < Math.max(15000, (status.pollIntervalMs || 5000) * 3);
 
-  const copied = trades.filter((t) => t.copy);
+  // The journal is in insertion order, which is not reliably chronological: ws and
+  // poll rows interleave, and journals written before the ordering fix have each
+  // poll batch reversed (the API returns newest-first, and rows were unshifted in
+  // that order). Sort for display so the newest is always on top, whatever wrote
+  // the file.
+  const sortedTrades = [...trades].sort(
+    (a, b) => (b.tradedAt || b.observedAt || 0) - (a.tradedAt || a.observedAt || 0),
+  );
+  const copied = sortedTrades
+    .filter((t) => t.copy)
+    // for copies, order by when WE bet — that is the timeline of our own activity
+    .sort(
+      (a, b) =>
+        (b.copy?.copiedAt || b.tradedAt || 0) - (a.copy?.copiedAt || a.tradedAt || 0),
+    );
 
   // Risk-gate state for the header pill: TRADING while there's room under the
   // cap, GATED when active has reached it (or the live balance is unreadable).
@@ -826,10 +840,10 @@ function App() {
 
       <div className="cols">
         <div className="panel">
-          <h2>Target trades (${trades.length})</h2>
+          <h2>Target trades (${sortedTrades.length})</h2>
           <div className="list">
-            ${trades.length === 0 && html`<div className="empty">No trades observed yet</div>`}
-            ${trades.map((t) => html`<${TargetTradeRow} key=${t.id} t=${t} />`)}
+            ${sortedTrades.length === 0 && html`<div className="empty">No trades observed yet</div>`}
+            ${sortedTrades.map((t) => html`<${TargetTradeRow} key=${t.id} t=${t} />`)}
           </div>
         </div>
 
