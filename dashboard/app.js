@@ -4,6 +4,9 @@ const { useState, useEffect } = React;
 
 const REFRESH_MS = 3000;
 
+// Rows listed in the target-trades panel; matches MAX_OBSERVED_ENTRIES in the engine.
+const TARGET_ROWS = 300;
+
 const BADGE_LABEL = {
   success: "COPIED",
   failed: "FAILED",
@@ -720,6 +723,11 @@ function App() {
   const sortedTrades = [...trades].sort(
     (a, b) => (b.tradedAt || b.observedAt || 0) - (a.tradedAt || a.observedAt || 0),
   );
+  // The target panel lists the newest TARGET_ROWS whatever their status
+  // (baseline/filtered/stale/pending and every skip) — the engine's retention
+  // window is the same size, so this is a display cap, not a filter. Copied
+  // rows are kept for life and stay in the panel on the right regardless.
+  const shownTrades = sortedTrades.slice(0, TARGET_ROWS);
   const copied = sortedTrades
     .filter((t) => t.copy)
     // for copies, order by when WE bet — that is the timeline of our own activity
@@ -840,10 +848,10 @@ function App() {
 
       <div className="cols">
         <div className="panel">
-          <h2>Target trades (${sortedTrades.length})</h2>
+          <h2>Target trades (${shownTrades.length}${sortedTrades.length > shownTrades.length ? `/${sortedTrades.length}` : ""})</h2>
           <div className="list">
-            ${sortedTrades.length === 0 && html`<div className="empty">No trades observed yet</div>`}
-            ${sortedTrades.map((t) => html`<${TargetTradeRow} key=${t.id} t=${t} />`)}
+            ${shownTrades.length === 0 && html`<div className="empty">No trades observed yet</div>`}
+            ${shownTrades.map((t) => html`<${TargetTradeRow} key=${t.id} t=${t} />`)}
           </div>
         </div>
 

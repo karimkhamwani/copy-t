@@ -1,6 +1,6 @@
 /** Offline tests for the copy-trader logic (no network needed). */
 const assert = require("assert");
-const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory, bestAsk, driftVerdict, marketOrderArgs } = require("./copy-trader");
+const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory, bestAsk, driftVerdict, marketOrderArgs, oldestFirst, prunedJournal } = require("./copy-trader");
 
 const sample = [
   { type: "TRADE", side: "BUY", transactionHash: "0xaaa", asset: "111", usdcSize: 50, price: 0.42, timestamp: 100, title: "Market A", outcome: "Yes" },
@@ -167,5 +167,56 @@ assert.strictEqual(
   // the rest of the order is unchanged
   assert.deepStrictEqual(marketOrderArgs(base), base);
 }
+
+// 12. Retention keeps the newest `cap` rows whatever their status.
+//
+// The previous rule was "no copy -> evictable", which rotated skip decisions
+// (min/risk/drift carry no `copy`) out of the journal: the dashboard showed a
+// rising drift-skipped counter with no rows explaining it. The window the panel
+// lists must be untouchable, so status plays no part in eviction.
+{
+  const rows = [];
+  const statuses = ["baseline", "filtered", "stale", "pending", "min-skip", "risk-skip", "drift-skip"];
+  // 350 rows, newest first, cycling through every status
+  for (let i = 0; i < 350; i++) {
+    rows.push({ id: `t${i}`, tradedAt: 1_000_000 - i * 1000, status: statuses[i % statuses.length], copy: null });
+  }
+  const kept = prunedJournal(rows, 300);
+  assert.strictEqual(kept.length, 300);
+  // every one of the newest 300 survives, no matter what status it carries
+  for (let i = 0; i < 300; i++) {
+    assert.ok(kept.some((e) => e.id === `t${i}`), `t${i} (${rows[i].status}) must be kept`);
+  }
+  for (let i = 300; i < 350; i++) {
+    assert.ok(!kept.some((e) => e.id === `t${i}`), `t${i} is past the window`);
+  }
+  // display order is preserved — pruning must not reshuffle the journal
+  assert.deepStrictEqual(kept.map((e) => e.id), rows.slice(0, 300).map((e) => e.id));
+}
+
+// A copy attempt outlives the window: it is the lifetime P/L record.
+{
+  const rows = [];
+  for (let i = 0; i < 320; i++) rows.push({ id: `n${i}`, tradedAt: 900_000 - i, status: "filtered", copy: null });
+  rows.push({ id: "old-copy", tradedAt: 1, status: "success", copy: { spentUsdc: 5 } });
+  const kept = prunedJournal(rows, 300);
+  assert.ok(kept.some((e) => e.id === "old-copy"), "copied rows are never evicted");
+}
+
+// Rows ranked by time, not position: an out-of-order journal still keeps its newest.
+{
+  const rows = [
+    { id: "old", tradedAt: 100, status: "stale", copy: null },
+    { id: "new", tradedAt: 900, status: "stale", copy: null },
+    { id: "mid", observedAt: 500, status: "stale", copy: null }, // no tradedAt -> observedAt
+  ];
+  assert.deepStrictEqual(prunedJournal(rows, 2).map((e) => e.id), ["new", "mid"]);
+}
+
+// 13. Journal writes go in oldest-first so unshift lands newest-at-top.
+assert.deepStrictEqual(
+  oldestFirst([{ timestamp: 300 }, { timestamp: 100 }, { timestamp: 200 }]).map((t) => t.timestamp),
+  [100, 200, 300],
+);
 
 console.log("all tests passed");

@@ -159,10 +159,36 @@ function tradeKey(t) {
 // Trade journal + status (read by the dashboard)
 // ---------------------------------------------------------------------------
 
-// Rows WITHOUT a copy attempt (baseline/filtered/stale/pending) rotate in a
-// small pool so observation churn can't bloat the journal. Rows WITH a copy
-// attempt are NEVER evicted — the full lifetime copy history is kept.
+// Retention: the most recent MAX_OBSERVED_ENTRIES rows are kept whatever their
+// status — that window is exactly what the dashboard's target-trades panel
+// lists, so nothing can vanish out of the view it is sized to. Older rows are
+// dropped unless they carry a copy attempt; the lifetime copy history is never
+// evicted. Status is deliberately NOT part of this decision: skip rows
+// (min/risk/drift) have no `copy`, and evicting them by status deleted the only
+// record of a trade we saw and declined.
 const MAX_OBSERVED_ENTRIES = 300;
+
+/** Trade time for ordering, falling back to when we observed it. */
+function journalTime(e) {
+  return e.tradedAt || e.observedAt || 0;
+}
+
+/**
+ * The rows to keep: the `cap` newest by trade time, plus every copy attempt.
+ *
+ * Pure so it can be tested; insertion order is not reliably chronological (ws
+ * and poll rows interleave), so recency is ranked by time, not position.
+ */
+function prunedJournal(rows, cap = MAX_OBSERVED_ENTRIES) {
+  if (rows.length <= cap) return [...rows];
+  const recent = new Set(
+    [...rows]
+      .sort((a, b) => journalTime(b) - journalTime(a))
+      .slice(0, cap)
+      .map((e) => e.id),
+  );
+  return rows.filter((e) => e.copy || recent.has(e.id));
+}
 
 function loadJournal() {
   try {
@@ -193,17 +219,16 @@ function saveJournal() {
   writeJsonAtomic(TRADES_LOG_FILE, journal);
 }
 
-/** Evict oldest observed-only rows past the cap. Copied rows are never evicted. */
+/** Apply `prunedJournal` to the live journal in place, keeping ids in sync. */
 function trimJournal() {
-  const isObserved = (e) => !e.copy;
-  let count = journal.reduce((n, e) => n + (isObserved(e) ? 1 : 0), 0);
-  for (let i = journal.length - 1; i >= 0 && count > MAX_OBSERVED_ENTRIES; i--) {
-    if (isObserved(journal[i])) {
-      journalIds.delete(journal[i].id);
-      journal.splice(i, 1);
-      count--;
-    }
+  const kept = prunedJournal(journal);
+  if (kept.length === journal.length) return;
+  const keptSet = new Set(kept);
+  for (const e of journal) {
+    if (!keptSet.has(e)) journalIds.delete(e.id);
   }
+  journal.length = 0;
+  journal.push(...kept);
 }
 
 /** Record a newly observed target trade (id = tradeKey). No-op if already logged. */
@@ -1384,6 +1409,7 @@ module.exports = {
   splitStale,
   matchesSubCategory,
   oldestFirst,
+  prunedJournal,
   bestAsk,
   driftVerdict,
   marketOrderArgs,
