@@ -292,8 +292,37 @@ function loadPaperBalance() {
 }
 let paperBalance = isDryRun ? loadPaperBalance() : null;
 
-// Last risk-gate snapshot, surfaced to the dashboard via status.json
-let riskSnapshot = { balance: null, activeUsdc: null, riskSkipped: 0, driftSkipped: 0 };
+/**
+ * Skip counters carried over from the previous status file.
+ *
+ * These are running totals of trades the guards turned away, and a restart is
+ * not a new session: pm2 restarts and redeploys must not erase the record, the
+ * same way startedAt and paperBalance survive them. Only a true fresh start
+ * (`yarn reset`, which deletes status.json) begins at 0.
+ *
+ * Pure so it can be tested; a missing, negative or non-numeric field reads as 0
+ * rather than poisoning the total with NaN.
+ */
+function resumedSkipCounts(prev) {
+  const count = (v) => (Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0);
+  return {
+    riskSkipped: count(prev?.riskSkipped),
+    driftSkipped: count(prev?.driftSkipped),
+  };
+}
+
+function loadSkipCounts() {
+  try {
+    return resumedSkipCounts(JSON.parse(fs.readFileSync(STATUS_FILE, "utf8")));
+  } catch {
+    /* no/unreadable status file -> fresh start */
+    return resumedSkipCounts(null);
+  }
+}
+
+// Last risk-gate snapshot, surfaced to the dashboard via status.json. The skip
+// totals resume from the previous run; balance/activeUsdc are live-only reads.
+let riskSnapshot = { balance: null, activeUsdc: null, ...loadSkipCounts() };
 
 function writeStatus() {
   try {
@@ -1410,6 +1439,7 @@ module.exports = {
   matchesSubCategory,
   oldestFirst,
   prunedJournal,
+  resumedSkipCounts,
   bestAsk,
   driftVerdict,
   marketOrderArgs,

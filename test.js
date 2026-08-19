@@ -1,6 +1,6 @@
 /** Offline tests for the copy-trader logic (no network needed). */
 const assert = require("assert");
-const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory, bestAsk, driftVerdict, marketOrderArgs, oldestFirst, prunedJournal } = require("./copy-trader");
+const { filterBuys, pickNewTrades, betAmount, tradeKey, normalizeWallets, splitStale, matchesSubCategory, bestAsk, driftVerdict, marketOrderArgs, oldestFirst, prunedJournal, resumedSkipCounts } = require("./copy-trader");
 
 const sample = [
   { type: "TRADE", side: "BUY", transactionHash: "0xaaa", asset: "111", usdcSize: 50, price: 0.42, timestamp: 100, title: "Market A", outcome: "Yes" },
@@ -218,5 +218,23 @@ assert.deepStrictEqual(
   oldestFirst([{ timestamp: 300 }, { timestamp: 100 }, { timestamp: 200 }]).map((t) => t.timestamp),
   [100, 200, 300],
 );
+
+// 14. Skip counters resume from the previous status file across restarts.
+assert.deepStrictEqual(
+  resumedSkipCounts({ riskSkipped: 7, driftSkipped: 12 }),
+  { riskSkipped: 7, driftSkipped: 12 },
+);
+// no status file (fresh start / yarn reset) -> zeroed, not NaN
+assert.deepStrictEqual(resumedSkipCounts(null), { riskSkipped: 0, driftSkipped: 0 });
+// a status file written before the counters existed reads as 0
+assert.deepStrictEqual(resumedSkipCounts({ mode: "dry" }), { riskSkipped: 0, driftSkipped: 0 });
+// junk never poisons the running total
+for (const bad of [NaN, -3, "5", null, undefined, Infinity]) {
+  assert.deepStrictEqual(
+    resumedSkipCounts({ riskSkipped: bad, driftSkipped: bad }),
+    { riskSkipped: 0, driftSkipped: 0 },
+    `bad skip count ${String(bad)} should read as 0`,
+  );
+}
 
 console.log("all tests passed");
