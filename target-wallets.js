@@ -28,6 +28,7 @@ module.exports = [
   //   sub_category: ["eth-updown-5m"],
   //   max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
   // },
+  // btc good win rate over 11h 60%
   {
     address: "0xdf4c6a942bd95bf903d6066b4ba7051e6f914f22",
     category: "crypto",
