@@ -436,32 +436,43 @@ function ActiveChart({ copied }) {
     return html`<div className="empty">No copies to chart exposure yet</div>`;
 
   events.sort((a, b) => a.ts - b.ts);
+  const now = Math.max(Date.now(), events[events.length - 1].ts);
   let cur = 0;
+  let area = 0; // $ x ms under the step line, for the time-weighted mean
+  let prevTs = events[0].ts;
   const pts = events.map((e) => {
+    area += cur * (e.ts - prevTs);
+    prevTs = e.ts;
     cur += e.delta;
-    return {
-      label: new Date(e.ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
-      active: Number(cur.toFixed(2)),
-    };
+    return { ts: e.ts, active: Number(cur.toFixed(2)) };
   });
   // extend the line to "now" so current exposure is visible at the right edge
-  pts.push({
-    label: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
-    active: Number(cur.toFixed(2)),
-  });
+  area += cur * (now - prevTs);
+  pts.push({ ts: now, active: Number(cur.toFixed(2)) });
+  const span = now - events[0].ts;
+  const avg = span > 0 ? area / span : cur;
+
+  const fmtTs = (ts) =>
+    new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 
   return html`
     <div>
       <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
         Active in trading over time ($ at risk) — currently${" "}
         <b style=${{ color: cur > 0 ? "#4c9aff" : "var(--dim)" }}>$${cur.toFixed(2)}</b>
+        ${" · avg "}
+        <b style=${{ color: "var(--ink, #dbe2ee)" }}>$${avg.toFixed(2)}</b>
       </div>
       <${ResponsiveContainer} width="100%" height=${160}>
         <${LineChart} data=${pts} margin=${{ top: 10, right: 12, left: -16, bottom: 0 }}>
           <${CartesianGrid} vertical=${false} stroke=${CH.grid} />
-          <${XAxis} dataKey="label" tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} interval="preserveStartEnd" minTickGap=${30} />
+          <${XAxis} dataKey="ts" type="number" domain=${["dataMin", "dataMax"]} tickCount=${6}
+            tickFormatter=${fmtTs} tick=${{ fontSize: 10, fill: CH.ink }}
+            axisLine=${{ stroke: CH.grid }} tickLine=${false} interval="preserveStartEnd" minTickGap=${40} />
           <${YAxis} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false} tickFormatter=${(v) => `$${v}`} allowDecimals=${false} domain=${[0, "auto"]} />
-          <${Tooltip} ...${TIP_STYLE} formatter=${(v) => [`$${Number(v).toFixed(2)}`, "At risk"]} />
+          <${Tooltip} ...${TIP_STYLE} labelFormatter=${fmtTs} formatter=${(v) => [`$${Number(v).toFixed(2)}`, "At risk"]} />
+          <${ReferenceLine} y=${avg} stroke=${CH.ink} strokeDasharray="4 4"
+            label=${{ value: `avg $${avg.toFixed(2)}`, position: "insideTopRight", fontSize: 10, fill: CH.ink }} />
           <${Line} type="stepAfter" dataKey="active" name="At risk" stroke="#4c9aff" strokeWidth=${2}
             dot=${false} activeDot=${{ r: 4 }} isAnimationActive=${false} />
         <//>
