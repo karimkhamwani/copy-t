@@ -913,24 +913,26 @@ function App() {
                 .join(", ")}
             </span>
           </span>`}
-        <span className="balance">
-          <span className="balance-label">
-            Balance${status?.mode === "dry" && status?.paperBalance != null ? " (paper)" : ""}
+        <span className="balances">
+          <span className="balance">
+            <span className="balance-label">
+              Balance${status?.mode === "dry" && status?.paperBalance != null ? " (paper)" : ""}
+            </span>
+            <span className="balance-value">
+              ${status?.mode === "dry" && status?.paperBalance != null
+                ? money(status.paperBalance)
+                : balance != null ? money(balance) : "—"}
+            </span>
           </span>
-          <span className="balance-value">
-            ${status?.mode === "dry" && status?.paperBalance != null
-              ? money(status.paperBalance)
-              : balance != null ? money(balance) : "—"}
-          </span>
+          ${status?.mode !== "dry" && portfolio != null &&
+          html`<span
+            className="balance"
+            title=${`cash ${money(balance)} + open positions ${money(portfolio.positionsValue)}`}
+          >
+            <span className="balance-label">Portfolio</span>
+            <span className="balance-value">${money(portfolio.portfolio)}</span>
+          </span>`}
         </span>
-        ${status?.mode !== "dry" && portfolio != null &&
-        html`<span
-          className="balance"
-          title=${`cash ${money(balance)} + open positions ${money(portfolio.positionsValue)}`}
-        >
-          <span className="balance-label">Portfolio</span>
-          <span className="balance-value">${money(portfolio.portfolio)}</span>
-        </span>`}
       </div>
 
       <${Analytics} copied=${copied} status=${status} selectedMarket=${selectedMarket} onSelectMarket=${setSelectedMarket} />
