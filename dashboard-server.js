@@ -142,7 +142,7 @@ async function getClobClient() {
   return clobClient;
 }
 
-const BALANCE_TTL_MS = 30000;
+const BALANCE_TTL_MS = 15000;
 let balanceCache = { balance: null, fetchedAt: 0 };
 
 async function getUsdcBalance() {
