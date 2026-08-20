@@ -421,22 +421,31 @@ function parseMarketEnd(t) {
 /** Step chart of $ actively at risk: +spent at copy time, -spent at market close once resolved. */
 function ActiveChart({ copied }) {
   const events = [];
+  const nowTs = Date.now();
   for (const t of copied) {
     if (t.status !== "success" || !t.copy?.copiedAt) continue;
     const spent = t.copy?.spentUsdc || 0;
     if (!spent) continue;
     events.push({ ts: t.copy.copiedAt, delta: spent });
-    if (t.result === "win" || t.result === "loss") {
-      // exposure ends when the market closes; fall back to entry time if unparseable
-      const end = parseMarketEnd(t);
-      events.push({ ts: Math.max(end || 0, t.copy.copiedAt), delta: -spent });
+    // Exposure ends when the market closes — even before the resolution lookup
+    // confirms win/loss. Keying the exit on resolution instead would rewrite
+    // history retroactively: pending bets draw a peak that collapses minutes
+    // later when results arrive. Market close is fixed, so the line is stable.
+    const end = parseMarketEnd(t);
+    const resolved = t.result === "win" || t.result === "loss";
+    if (end && end <= nowTs) {
+      events.push({ ts: Math.max(end, t.copy.copiedAt), delta: -spent });
+    } else if (resolved) {
+      // resolved but close time unparseable (or in the future): exit at entry
+      events.push({ ts: Math.min(Math.max(end || 0, t.copy.copiedAt), nowTs), delta: -spent });
     }
+    // otherwise the market is still open: money stays at risk
   }
   if (events.length === 0)
     return html`<div className="empty">No copies to chart exposure yet</div>`;
 
   events.sort((a, b) => a.ts - b.ts);
-  const now = Math.max(Date.now(), events[events.length - 1].ts);
+  const now = Math.max(nowTs, events[events.length - 1].ts);
   let cur = 0;
   let area = 0; // $ x ms under the step line, for the time-weighted mean
   let prevTs = events[0].ts;
@@ -454,12 +463,14 @@ function ActiveChart({ copied }) {
 
   const fmtTs = (ts) =>
     new Date(ts).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  // float residue from +/- pairs can leave cur at -1e-13, which prints "-0.00"
+  const curR = Math.round(cur * 100) / 100 || 0;
 
   return html`
     <div>
       <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
         Active in trading over time ($ at risk) — currently${" "}
-        <b style=${{ color: cur > 0 ? "#4c9aff" : "var(--dim)" }}>$${cur.toFixed(2)}</b>
+        <b style=${{ color: curR > 0 ? "#4c9aff" : "var(--dim)" }}>$${curR.toFixed(2)}</b>
         ${" · avg "}
         <b style=${{ color: "var(--ink, #dbe2ee)" }}>$${avg.toFixed(2)}</b>
       </div>
