@@ -24,6 +24,8 @@
   .pill.off { background: rgba(231,76,91,.12); color: var(--red); border-color: var(--red); }
   .pill.gated { background: rgba(240,161,58,.15); color: var(--orange); border-color: var(--orange); }
   .balances { margin-left: auto; display: inline-flex; gap: 8px; }
+  .balances .balance { transition: opacity .35s ease; }
+  .balances.fetching .balance { opacity: .45; }
   .balance { display: inline-flex; align-items: baseline; gap: 8px;
              background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
              padding: 6px 12px; }

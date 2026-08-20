@@ -746,6 +746,7 @@ function App() {
   const [status, setStatus] = useState(null);
   const [balance, setBalance] = useState(null);
   const [portfolio, setPortfolio] = useState(null); // { positionsValue, portfolio } from /api/balance (live mode)
+  const [balanceFetching, setBalanceFetching] = useState(false); // /api/balance request in flight
   const [loaded, setLoaded] = useState(false); // first successful fetch landed
   const [copiedFilter, setCopiedFilter] = useState("all");
   const [copiedSort, setCopiedSort] = useState("none");
@@ -764,10 +765,13 @@ function App() {
       if (busy) return;
       busy = true;
       try {
+        setBalanceFetching(true);
         const [t, s, b] = await Promise.all([
           fetch("/api/trades").then((r) => r.json()),
           fetch("/api/status").then((r) => r.json()),
-          fetch("/api/balance").then((r) => r.json()),
+          fetch("/api/balance")
+            .then((r) => r.json())
+            .finally(() => alive && setBalanceFetching(false)),
         ]);
         if (alive) {
           setTrades(Array.isArray(t) ? t : []);
@@ -913,7 +917,7 @@ function App() {
                 .join(", ")}
             </span>
           </span>`}
-        <span className="balances">
+        <span className=${`balances${balanceFetching ? " fetching" : ""}`}>
           <span className="balance">
             <span className="balance-label">
               Balance${status?.mode === "dry" && status?.paperBalance != null ? " (paper)" : ""}
