@@ -19,6 +19,7 @@ const {
   TRADES_LOG_FILE = path.join(__dirname, "trades-log.json"),
   STATUS_FILE = path.join(__dirname, "status.json"),
   CLOB_API_HOST = "https://clob.polymarket.com",
+  DATA_API_HOST = "https://data-api.polymarket.com",
   FUNDER_ADDRESS,
   PRIVATE_KEY,
   SIGNATURE_TYPE = "1",
@@ -166,6 +167,35 @@ async function getUsdcBalance() {
   return balanceCache.balance;
 }
 
+// ---------------------------------------------------------------------------
+// Open-positions value via the public data API (no key needed, just the
+// funder address). Portfolio = USDC cash + value of open positions.
+// ---------------------------------------------------------------------------
+
+let positionsCache = { value: null, fetchedAt: 0 };
+
+async function getPositionsValue() {
+  if (!FUNDER_ADDRESS) return null;
+  const now = Date.now();
+  if (now - positionsCache.fetchedAt < BALANCE_TTL_MS) return positionsCache.value;
+  try {
+    const resp = await fetch(
+      `${DATA_API_HOST}/positions?user=${FUNDER_ADDRESS}&sizeThreshold=0.01&limit=500`,
+    );
+    if (!resp.ok) throw new Error(`positions API ${resp.status}`);
+    const positions = await resp.json();
+    const value = (Array.isArray(positions) ? positions : []).reduce((sum, p) => {
+      const v = Number(p.currentValue ?? Number(p.curPrice) * Number(p.size));
+      return sum + (Number.isFinite(v) ? v : 0);
+    }, 0);
+    positionsCache = { value, fetchedAt: now };
+  } catch {
+    // keep last known value, retry after the TTL
+    positionsCache.fetchedAt = now;
+  }
+  return positionsCache.value;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = req.url.split("?")[0];
 
@@ -190,9 +220,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url === "/api/balance") {
-    const balance = await getUsdcBalance();
+    const [balance, positionsValue] = await Promise.all([
+      getUsdcBalance(),
+      getPositionsValue(),
+    ]);
+    const portfolio =
+      balance != null && positionsValue != null ? balance + positionsValue : null;
     res.writeHead(200, { "content-type": "application/json" });
-    return res.end(JSON.stringify({ balance }));
+    return res.end(JSON.stringify({ balance, positionsValue, portfolio }));
   }
 
   const entry = STATIC_FILES[url];

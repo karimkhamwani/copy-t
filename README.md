@@ -48,6 +48,18 @@ The trader writes `trades-log.json` (journal, capped at 500 entries) and
 `status.json` (heartbeat) next to the script; the dashboard server just reads them,
 so it works identically in dry and live mode. Run both processes side by side.
 
+## Running per-asset instances (e.g. BTC + ETH)
+
+Run one checkout per asset — clone the repo twice (e.g. `copy-t-btc/`,
+`copy-t-eth/`), give each its own `target-wallets.js`, and set a distinct
+`DASHBOARD_PORT` in each checkout's `.env` (e.g. 3210 and 3211). Each checkout
+keeps its own `trades-log.json` / `seen-trades.json` / `status.json`, so
+journals and baselines never mix; start each with `npm run up` as usual.
+
+Both traders share the same wallet if the `.env` keys match. Note the
+`MAX_ACTIVE_PCT` gate is computed per instance against the same balance, so
+two instances can together put up to 2x the single-instance cap at risk.
+
 ## Env vars
 
 Target wallets live in their own file (target-wallets.js):

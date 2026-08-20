@@ -745,6 +745,7 @@ function App() {
   const [trades, setTrades] = useState([]);
   const [status, setStatus] = useState(null);
   const [balance, setBalance] = useState(null);
+  const [portfolio, setPortfolio] = useState(null); // { positionsValue, portfolio } from /api/balance (live mode)
   const [loaded, setLoaded] = useState(false); // first successful fetch landed
   const [copiedFilter, setCopiedFilter] = useState("all");
   const [copiedSort, setCopiedSort] = useState("none");
@@ -772,6 +773,11 @@ function App() {
           setTrades(Array.isArray(t) ? t : []);
           setStatus(s);
           setBalance(b?.balance ?? null);
+          setPortfolio(
+            b?.portfolio != null
+              ? { positionsValue: b.positionsValue, portfolio: b.portfolio }
+              : null,
+          );
           setLoaded(true);
         }
       } catch {
@@ -917,6 +923,14 @@ function App() {
               : balance != null ? money(balance) : "—"}
           </span>
         </span>
+        ${status?.mode !== "dry" && portfolio != null &&
+        html`<span
+          className="balance"
+          title=${`cash ${money(balance)} + open positions ${money(portfolio.positionsValue)}`}
+        >
+          <span className="balance-label">Portfolio</span>
+          <span className="balance-value">${money(portfolio.portfolio)}</span>
+        </span>`}
       </div>
 
       <${Analytics} copied=${copied} status=${status} selectedMarket=${selectedMarket} onSelectMarket=${setSelectedMarket} />
