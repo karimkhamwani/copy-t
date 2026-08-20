@@ -491,6 +491,42 @@ function ActiveChart({ copied }) {
     </div>`;
 }
 
+/** Histogram of bet sizes: how many bets landed in each $10 band (0-10 ... 91-100, 100+).
+ * Trader bars count every copy-attempted trade by theirUsdc; "us" bars count our
+ * successful copies by what we actually spent. */
+function BetSizeChart({ copied }) {
+  const LABELS = ["0\u201310", "11\u201320", "21\u201330", "31\u201340", "41\u201350",
+    "51\u201360", "61\u201370", "71\u201380", "81\u201390", "91\u2013100", "100+"];
+  const bucketOf = (amt) =>
+    amt <= 10 ? 0 : Math.min(Math.floor((amt - 0.01) / 10), LABELS.length - 1);
+  const buckets = LABELS.map((label) => ({ label, trader: 0, us: 0 }));
+  for (const t of copied) {
+    if (t.theirUsdc != null && t.theirUsdc >= 0) buckets[bucketOf(t.theirUsdc)].trader++;
+    if (t.status === "success" && t.copy?.spentUsdc != null)
+      buckets[bucketOf(t.copy.spentUsdc)].us++;
+  }
+  if (!buckets.some((b) => b.trader || b.us))
+    return html`<div className="empty">No bets to chart sizes yet</div>`;
+
+  return html`
+    <div>
+      <div style=${{ fontSize: 12, color: "var(--dim)", margin: "10px 0 2px" }}>
+        Bets per size band ($ per bet)
+      </div>
+      <${ResponsiveContainer} width="100%" height=${180}>
+        <${BarChart} data=${buckets} margin=${{ top: 14, right: 8, left: -24, bottom: 0 }} barCategoryGap="25%">
+          <${CartesianGrid} vertical=${false} stroke=${CH.grid} />
+          <${XAxis} dataKey="label" tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${{ stroke: CH.grid }} tickLine=${false} interval=${0} />
+          <${YAxis} allowDecimals=${false} tick=${{ fontSize: 10, fill: CH.ink }} axisLine=${false} tickLine=${false} />
+          <${Tooltip} ...${TIP_STYLE} />
+          <${Legend} wrapperStyle=${{ fontSize: 12 }} />
+          <${Bar} dataKey="trader" name="Trader" fill=${C_PENDING} stroke=${CH.surface} strokeWidth=${1} />
+          <${Bar} dataKey="us" name="Us" fill="#4c9aff" stroke=${CH.surface} strokeWidth=${1} />
+        <//>
+      <//>
+    </div>`;
+}
+
 /** Stable market identity for grouping/filtering. */
 function marketKey(t) {
   return t.conditionId || t.slug || t.title || "";
@@ -677,6 +713,7 @@ function Analytics({ copied, status, selectedMarket, onSelectMarket }) {
         <${PnlChart} copied=${copied} />
         <${LatencyChart} copied=${copied} status=${status} />
         <${ActiveChart} copied=${copied} />
+        <${BetSizeChart} copied=${copied} />
         <${MarketBetsChart} copied=${copied} selectedMarket=${selectedMarket} onSelectMarket=${onSelectMarket} />
       </div>
     </div>`;
