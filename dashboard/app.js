@@ -765,13 +765,19 @@ function App() {
       if (busy) return;
       busy = true;
       try {
-        setBalanceFetching(true);
+        // Fade the balance chips only when the fetch is genuinely slow (the
+        // server is refreshing from Polymarket). Cache-hit polls answer in a
+        // few ms — fading those made the chips flicker on every 3s tick.
+        const fadeTimer = setTimeout(() => alive && setBalanceFetching(true), 250);
         const [t, s, b] = await Promise.all([
           fetch("/api/trades").then((r) => r.json()),
           fetch("/api/status").then((r) => r.json()),
           fetch("/api/balance")
             .then((r) => r.json())
-            .finally(() => alive && setBalanceFetching(false)),
+            .finally(() => {
+              clearTimeout(fadeTimer);
+              if (alive) setBalanceFetching(false);
+            }),
         ]);
         if (alive) {
           setTrades(Array.isArray(t) ? t : []);
