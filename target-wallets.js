@@ -15,10 +15,23 @@ module.exports = [
   //   category: "crypto",
   //   sub_category: ["btc"],
   // },
+  // {
+  //   address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
+  //   category: "crypto",
+  //   sub_category: ["eth-updown-5m"],
+  //   max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
+  // },
+  // good
+  // {
+  //   address: "0xb55fa1296e6ec55d0ce53d93b9237389f11764d4",
+  //   category: "crypto",
+  //   sub_category: ["eth-updown-5m"],
+  //   max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
+  // },
   {
-    address: "0xeebde7a0e019a63e6b476eb425505b7b3e6eba30",
+    address: "0xdf4c6a942bd95bf903d6066b4ba7051e6f914f22",
     category: "crypto",
-    sub_category: ["eth-updown-5m"],
+    sub_category: ["btc-updown-5m"],
     max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
   },
   // {
@@ -28,3 +41,5 @@ module.exports = [
   //   max_trade_age_sec: 5, // 5m markets expire fast — don't chase old entries
   // },
 ];
+
+// 0xdf4c6a942bd95bf903d6066b4ba7051e6f914f22
