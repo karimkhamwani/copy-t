@@ -134,7 +134,15 @@ async function discoverMarket(slug) {
   outcomes.forEach((o, i) => (byOutcome[String(o).toLowerCase()] = tokenIds[i]));
   const up = byOutcome.up ?? tokenIds[0];
   const down = byOutcome.down ?? tokenIds[1];
-  return { slug, conditionId: m.conditionId, upToken: up, downToken: down };
+  return {
+    slug,
+    // human title like "Bitcoin Up or Down - August 22, 2:45PM ET" for the
+    // dashboard; falls back to the slug if gamma has no question text
+    title: m.question || m.title || slug,
+    conditionId: m.conditionId,
+    upToken: up,
+    downToken: down,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +204,7 @@ function emitPairSignals(pair, kind) {
     kind, // post -> GTC at this price; take -> FAK at this price
     slug: state.slug,
     conditionId: state.market.conditionId,
-    title: state.slug,
+    title: state.market.title || state.slug,
     size: pair.shares,
     timestamp: Math.floor(Date.now() / 1000),
   };
