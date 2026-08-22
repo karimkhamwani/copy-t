@@ -903,7 +903,11 @@ function App() {
         ${online && status?.startedAt && html`<span className="pill">up ${uptime(status.startedAt)}</span>`}
         ${status && html`
           <span className="stats">
-            <span>bet ${status.betMode === "mirror" ? `mirror (cap ${money(status.betUsdc)})` : money(status.betUsdc)}</span>
+            <span>bet ${status.betMode === "mirror-shares"
+              ? `mirror shares (cap ${money(status.betUsdc)})`
+              : status.betMode === "mirror"
+                ? `mirror (cap ${money(status.betUsdc)})`
+                : money(status.betUsdc)}${status.orderType ? ` · ${status.orderType}` : ""}</span>
             <span>poll ${(status.pollIntervalMs || 0) / 1000}s</span>
             <span>placed ${status.tradesPlaced ?? 0}${status.maxTrades ? `/${status.maxTrades}` : ""}</span>
             <span

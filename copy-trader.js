@@ -27,12 +27,14 @@ const {
   POLL_INTERVAL_MS = "5000",
   MAX_BET_USDC = "1",
   MIRROR_TRADER_BET = "0", // 1 = bet what the trader bet (capped by MAX_BET_USDC)
+  MIRROR_UNIT = "usdc", // "usdc" = mirror their $ spend; "shares" = mirror their share count (forces limit orders)
+  ORDER_TYPE = "market", // "market" = FAK market order ($1 min); "limit" = marketable FAK limit at their price + MAX_OVERPAY (5-share min)
   SKIP_BELOW_MIN = "0", // 1 = in mirror mode, skip trades under Polymarket's $1 minimum instead of rounding up to $1
   MAX_TRADES = "0", // stop after this many placed trades (0 = unlimited)
+  MAX_ADVERSE_DRIFT = "0.03", // skip if our exec price is this far BELOW theirs (the bet is already going against us)
+  MAX_OVERPAY = "0.05", // skip if our exec price is this far ABOVE theirs (we'd pay up for a worse edge); with ORDER_TYPE=limit also the limit price cap
   MAX_ACTIVE_PCT = "50", // cap: active bets <= this % of (balance + active). 0 = gate disabled
   DRIFT_GUARD = "1", // 1 = refuse orders once the book has moved away from the trader's price
-  MAX_ADVERSE_DRIFT = "0.03", // skip if our exec price is this far BELOW theirs (the bet is already going against us)
-  MAX_OVERPAY = "0.05", // skip if our exec price is this far ABOVE theirs (we'd pay up for a worse edge)
   DRY_RUN_BALANCE_USDC = "100", // paper balance used by the risk gate in dry-run
   RESOLUTION_RECHECK_MS = "60000", // how often unresolved markets are re-checked
   FETCH_FAIL_LIMIT = "3", // consecutive all-wallet network-failed polls before self-shutdown (yarn down). 0 = never
@@ -47,11 +49,15 @@ const {
 
 const CHAIN_ID = 137; // Polygon mainnet
 const MIN_ORDER_USDC = 1; // Polymarket minimum for market orders
+const MIN_LIMIT_SHARES = 5; // Polymarket minimum size for limit orders
 const BET_USDC = Number(MAX_BET_USDC); // USDC spent per copied bet (from env, default $1)
 
 const isDryRun = DRY_RUN === "1" || DRY_RUN.toLowerCase() === "true";
 const maxActivePct = Math.max(0, Number(MAX_ACTIVE_PCT) || 0); // 0 = disabled
 const mirrorBet = MIRROR_TRADER_BET === "1" || MIRROR_TRADER_BET.toLowerCase() === "true";
+const mirrorShares = mirrorBet && MIRROR_UNIT.trim().toLowerCase() === "shares";
+// Share-mirroring is only expressible as a limit order, so it forces limit mode.
+const useLimitOrders = mirrorShares || ORDER_TYPE.trim().toLowerCase() === "limit";
 const skipBelowMin = SKIP_BELOW_MIN === "1" || SKIP_BELOW_MIN.toLowerCase() === "true";
 const pollInterval = Number(POLL_INTERVAL_MS);
 const maxTrades = Number(MAX_TRADES) || 0; // 0 = unlimited
@@ -329,7 +335,8 @@ function writeStatus() {
     writeJsonAtomic(STATUS_FILE, {
       mode: isDryRun ? "dry" : "live",
       betUsdc: BET_USDC,
-      betMode: mirrorBet ? "mirror" : "fixed",
+      betMode: mirrorBet ? (mirrorShares ? "mirror-shares" : "mirror") : "fixed",
+      orderType: useLimitOrders ? "limit" : "market",
       pollIntervalMs: pollInterval,
       maxTrades,
       tradesPlaced,
@@ -546,6 +553,31 @@ function betAmount(trade, { mirror = mirrorBet, cap = BET_USDC } = {}) {
   return Math.max(MIN_ORDER_USDC, Math.min(theirs, cap));
 }
 
+/**
+ * Share-mirror mode: the highest price we are willing to pay per share.
+ * The trader's price plus the drift guard's overpay allowance, floored to a
+ * cent (every Polymarket tick size divides 0.01) and clamped inside the book.
+ */
+function limitPriceFor(trade) {
+  const theirs = Number(trade?.price);
+  if (!Number.isFinite(theirs) || theirs <= 0) return null;
+  const cap = Math.min(0.99, theirs + maxOverpay);
+  return Math.max(0.01, Math.floor(cap * 100) / 100);
+}
+
+/**
+ * Share-mirror mode: how many shares to buy — the trader's share count,
+ * capped so the worst-case cost (size x limit price) stays within MAX_BET_USDC.
+ * Returns the size trimmed to 2 decimals; caller enforces MIN_LIMIT_SHARES.
+ */
+function shareAmount(trade, limitPrice, { cap = BET_USDC } = {}) {
+  const theirs = Number(trade?.size);
+  if (!Number.isFinite(theirs) || theirs <= 0) return null;
+  if (!Number.isFinite(limitPrice) || limitPrice <= 0) return null;
+  const maxAffordable = cap / limitPrice;
+  return Math.floor(Math.min(theirs, maxAffordable) * 100) / 100;
+}
+
 // ---------------------------------------------------------------------------
 // Order placement (CLOB)
 // ---------------------------------------------------------------------------
@@ -743,6 +775,39 @@ async function placeMarketBuy(trade, amountUsdc, execPrice) {
   log("order response:", JSON.stringify(resp));
   // The client can return API errors as a normal response instead of throwing —
   // a rejected order must NOT count as placed or be marked seen.
+  if (!resp || resp.error || resp.success === false) {
+    throw new Error(
+      `order rejected: ${resp?.error || resp?.errorMsg || "unknown error"}`,
+    );
+  }
+  return resp;
+}
+
+/**
+ * Share-mirror mode: marketable FAK limit BUY — "buy up to `sizeShares` at up
+ * to `limitPrice` each, fill what the book offers, cancel the rest." Unlike a
+ * market order (denominated in $), a limit order is denominated in shares,
+ * which is what lets us copy the trader's share count exactly.
+ */
+async function placeLimitBuy(trade, sizeShares, limitPrice) {
+  if (isDryRun) {
+    log(
+      `[DRY_RUN] would limit-BUY ${sizeShares} shares of "${trade.outcome}" ` +
+        `in "${trade.title}" (token ${trade.asset}, their price ${trade.price}, ` +
+        `limit ${limitPrice}, worst-case $${(sizeShares * limitPrice).toFixed(2)})`,
+    );
+    return { dryRun: true };
+  }
+
+  const client = await getClobClient();
+  const order = await client.createOrder({
+    tokenID: trade.asset,
+    price: limitPrice,
+    side: client._Side.BUY,
+    size: sizeShares,
+  });
+  const resp = await client.postOrder(order, client._OrderType.FAK);
+  log("order response:", JSON.stringify(resp));
   if (!resp || resp.error || resp.success === false) {
     throw new Error(
       `order rejected: ${resp?.error || resp?.errorMsg || "unknown error"}`,
@@ -1021,8 +1086,10 @@ async function copyTrades(wallet, copyable, state, tag) {
 
     // Exact mirroring below Polymarket's $1 order minimum is impossible —
     // optionally skip those trades instead of rounding the bet up to $1.
+    // (Share-mirror mode has its own minimum, handled below.)
     if (
       mirrorBet &&
+      !useLimitOrders &&
       skipBelowMin &&
       Number(trade.usdcSize) > 0 &&
       Number(trade.usdcSize) < MIN_ORDER_USDC
@@ -1041,7 +1108,49 @@ async function copyTrades(wallet, copyable, state, tag) {
       continue;
     }
 
-    const amount = betAmount(trade);
+    // Limit-order mode: size the order in shares (the trader's share count in
+    // share-mirror mode, otherwise the $ budget converted at the limit price),
+    // enforce the CLOB's 5-share limit-order minimum, and derive the
+    // worst-case $ cost for the risk gate.
+    let sizeShares = null;
+    let limitPrice = null;
+    let amount;
+    if (useLimitOrders) {
+      limitPrice = limitPriceFor(trade);
+      sizeShares =
+        limitPrice == null
+          ? null
+          : mirrorShares
+            ? shareAmount(trade, limitPrice)
+            : Math.floor((betAmount(trade) / limitPrice) * 100) / 100;
+      if (sizeShares == null || limitPrice == null) {
+        amount = betAmount(trade); // unusable trade row; fall through to $ copy
+        sizeShares = null;
+      } else if (sizeShares < MIN_LIMIT_SHARES) {
+        // Below the 5-share minimum: bump to 5 unless the user opted to skip,
+        // or 5 shares would blow the per-bet cap.
+        if (skipBelowMin || MIN_LIMIT_SHARES * limitPrice > BET_USDC) {
+          state.seen.add(tradeKey(trade));
+          saveState(state);
+          journalUpdate(
+            tradeKey(trade),
+            { status: "min-skip" },
+            observedEntry(trade, wallet, "min-skip"),
+          );
+          log(
+            `${tag} ${sizeShares} shares is under the ${MIN_LIMIT_SHARES}-share ` +
+              `limit-order minimum — skipping "${trade.title}"`,
+          );
+          continue;
+        }
+        sizeShares = MIN_LIMIT_SHARES;
+      }
+      if (sizeShares != null) {
+        amount = Number((sizeShares * limitPrice).toFixed(2)); // worst-case cost
+      }
+    } else {
+      amount = betAmount(trade);
+    }
 
     // Risk gate: never let active-in-trading exceed MAX_ACTIVE_PCT of the
     // bankroll. Blocked trades are skipped for good (chasing them minutes
@@ -1085,15 +1194,25 @@ async function copyTrades(wallet, copyable, state, tag) {
 
     log(
       `${tag} new BUY: "${trade.title}" / ${trade.outcome} ` +
-        `@ ${trade.price} ($${trade.usdcSize}) -> copying with $${amount}`,
+        `@ ${trade.price} ($${trade.usdcSize}) -> copying with ` +
+        (sizeShares != null ? `${sizeShares} shares (limit ${limitPrice}, worst-case $${amount})` : `$${amount}`),
     );
     try {
-      const resp = await placeMarketBuy(trade, amount, drift.execPrice);
+      const resp = sizeShares != null
+        ? await placeLimitBuy(trade, sizeShares, limitPrice)
+        : await placeMarketBuy(trade, amount, drift.execPrice);
       const fill = resp.dryRun ? null : parseLiveFill(resp, amount);
       state.seen.add(tradeKey(trade));
       saveState(state);
       tradesPlaced++;
-      const spent = resp.dryRun ? amount : fill.spent;
+      // Dry-run cost: in share-mirror mode the realistic spend is shares x the
+      // simulated fill price (the worst-case limit amount would overstate it).
+      const simPriceEarly = Number.isFinite(drift.execPrice) ? drift.execPrice : trade.price;
+      const spent = resp.dryRun
+        ? sizeShares != null
+          ? Number((sizeShares * simPriceEarly).toFixed(6))
+          : amount
+        : fill.spent;
       if (isDryRun) paperBalance -= spent; // paper: debit like a real fill
       balanceCache = { value: null, fetchedAt: 0 }; // live: balance changed, re-fetch
       // Dry-run fill price: prefer the executable price the drift guard just read
@@ -1105,9 +1224,11 @@ async function copyTrades(wallet, copyable, state, tag) {
         ? drift.execPrice
         : trade.price;
       const shares = resp.dryRun
-        ? simPrice > 0
-          ? amount / simPrice
-          : 0
+        ? sizeShares != null
+          ? sizeShares
+          : simPrice > 0
+            ? amount / simPrice
+            : 0
         : fill.shares;
       journalUpdate(
         tradeKey(trade),
@@ -1373,7 +1494,10 @@ async function main() {
       .join(
         ", ",
       )}] interval=${pollInterval}ms bet=${
-        mirrorBet ? `mirror (cap $${BET_USDC})` : `$${BET_USDC} (fixed)`
+        (mirrorBet
+          ? `mirror ${mirrorShares ? "shares" : "$"} (cap $${BET_USDC})`
+          : `$${BET_USDC} (fixed)`) +
+          ` · ${useLimitOrders ? "limit" : "market"} orders`
       } dryRun=${isDryRun} ` +
       `maxTrades=${maxTrades || "unlimited"} ` +
       `skipBelowMin=${skipBelowMin ? "on" : "off"} ` +
@@ -1433,6 +1557,8 @@ module.exports = {
   filterBuys,
   pickNewTrades,
   betAmount,
+  shareAmount,
+  limitPriceFor,
   tradeKey,
   normalizeWallets,
   splitStale,
