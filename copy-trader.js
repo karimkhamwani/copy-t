@@ -1611,11 +1611,20 @@ function startLocalSignals(state) {
   // stays as the fallback/replay path; duplicates are harmless because every
   // buy signal dedupes on its id (seen set) and cancels are idempotent.
   const net = require("net");
-  const SIGNAL_SOCKET = `${LOCAL_SIGNALS_FILE}.sock`;
-  try {
-    fs.unlinkSync(SIGNAL_SOCKET);
-  } catch {
-    /* no stale socket */
+  const SIGNAL_FILE_BASE = LOCAL_SIGNALS_FILE;
+  // Cross-platform IPC endpoint: a unix socket path on macOS/Linux, a named
+  // pipe on Windows (unix sockets can't be created there). Derived from the
+  // project dir so two checkouts never collide.
+  const SIGNAL_SOCKET =
+    process.platform === "win32"
+      ? "\\\\.\\pipe\\" + __dirname.replace(/[^a-zA-Z0-9]/g, "-") + "-updown-signals"
+      : `${SIGNAL_FILE_BASE}.sock`;
+  if (process.platform !== "win32") {
+    try {
+      fs.unlinkSync(SIGNAL_SOCKET); // stale unix socket from a crash
+    } catch {
+      /* none */
+    }
   }
   try {
     const server = net.createServer((conn) => {

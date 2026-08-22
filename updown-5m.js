@@ -92,25 +92,46 @@ function bookTop(book) {
 const round2 = (p) => Math.round(p * 100) / 100;
 
 /**
- * Split the combined target between Up and Down proportionally to where the
- * book prices each side, then clamp both bids passive (below the ask — a bid
- * at/above the ask would fill immediately at a combined cost near 1.00, which
- * is exactly the losing trade this strategy exists to avoid).
+ * Price the pair for maximum fill probability within the budget: each side
+ * bids as aggressively as allowed — one tick ABOVE the current best bid
+ * (front of the queue), capped one tick below the ask (stay passive; crossing
+ * would buy at a combined ~1.00+, the losing trade). When the target can't
+ * afford top-of-book on both sides, both back off equally — an asymmetric
+ * backoff would leave one leg deep in the queue, which is exactly how
+ * one-legged fills happen.
  * Returns { up, down } or null when the books can't support a sane quote.
  */
 function pairPrices(upTop, downTop, target = totalCost) {
   if (!upTop || !downTop) return null;
-  const midUp = upTop.bid != null && upTop.ask != null ? (upTop.bid + upTop.ask) / 2 : null;
-  const midDown = downTop.bid != null && downTop.ask != null ? (downTop.bid + downTop.ask) / 2 : null;
-  if (midUp == null || midDown == null || midUp + midDown <= 0) return null;
+  if (upTop.bid == null || upTop.ask == null || downTop.bid == null || downTop.ask == null)
+    return null;
 
-  let up = round2((target * midUp) / (midUp + midDown));
-  let down = round2(target - up);
-  // stay passive: never cross the ask
-  if (upTop.ask != null) up = Math.min(up, round2(upTop.ask - 0.01));
-  if (downTop.ask != null) down = Math.min(down, round2(downTop.ask - 0.01));
+  // most aggressive passive price each book allows
+  const agg = (t) => Math.min(round2(t.ask - 0.01), round2(t.bid + 0.01));
+  const aggUp = agg(upTop);
+  const aggDown = agg(downTop);
+  let up = aggUp;
+  let down = aggDown;
+
+  const excess = round2(up + down - target);
+  if (excess > 0) {
+    // split the backoff evenly, in whole cents
+    up = round2(up - Math.ceil(excess * 50) / 100);
+    down = round2(target - up);
+    // rounding can push one side past its cap; rebalance within the budget
+    if (down > aggDown) {
+      down = aggDown;
+      up = round2(target - down);
+    }
+    if (up > aggUp) {
+      up = aggUp;
+      down = round2(target - up);
+    }
+  }
+
   if (up < 0.01 || down < 0.01) return null;
-  if (up + down > target + 1e-9) return null; // clamping can only lower; guard anyway
+  if (up + down > target + 1e-9) return null;
+  if (up > aggUp || down > aggDown) return null; // never cross either ask
   return { up, down };
 }
 
@@ -197,7 +218,14 @@ async function placeLimitBuy(tokenID, price, size, orderOpts, type = "GTC") {
  * ndjson file as durable fallback — the copier dedupes, so both delivering
  * the same line is harmless. */
 const net = require("net");
-const SIGNAL_SOCKET = `${SIGNAL_FILE}.sock`;
+const SIGNAL_FILE_BASE = SIGNAL_FILE;
+// Cross-platform IPC endpoint: a unix socket path on macOS/Linux, a named
+// pipe on Windows (unix sockets can't be created there). Derived from the
+// project dir so two checkouts never collide.
+const SIGNAL_SOCKET =
+  process.platform === "win32"
+    ? "\\\\.\\pipe\\" + __dirname.replace(/[^a-zA-Z0-9]/g, "-") + "-updown-signals"
+    : `${SIGNAL_FILE_BASE}.sock`;
 let sigSock = null;
 let sigSockOk = false;
 
