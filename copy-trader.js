@@ -1654,11 +1654,15 @@ async function pollOnce(state) {
 }
 
 async function main() {
-  if (targetWallets.length === 0) {
+  if (targetWallets.length === 0 && !botSignals) {
     console.error(
-      "target-wallets.js is empty — add at least one {address, category}",
+      "target-wallets.js is empty — add at least one {address, category}, " +
+        "or enable BOT_SIGNALS=1 to run on strategy-bot signals alone",
     );
     process.exit(1);
+  }
+  if (targetWallets.length === 0) {
+    log("no target wallets — running on strategy-bot signals only (BOT_SIGNALS=1)");
   }
   if (!isDryRun && (!PRIVATE_KEY || !FUNDER_ADDRESS)) {
     console.error(
