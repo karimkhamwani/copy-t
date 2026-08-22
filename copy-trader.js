@@ -1356,6 +1356,226 @@ function serialize(fn) {
 
 const walletsByAddress = new Map(targetWallets.map((w) => [w.address, w]));
 
+// ---------------------------------------------------------------------------
+// Local strategy signals (LOCAL_SIGNALS_FILE): a strategy process (e.g.
+// updown-5m.js in signal mode) appends ndjson rows to a file and this engine
+// executes them — same journal, risk gate, dashboard and dedupe as chain
+// copies. Two deliberate differences from chain copies:
+//   1. orders are placed at the SIGNAL's exact price and size ("post" rests
+//      as GTC, "take" fires as FAK) — never re-priced off the book;
+//   2. the drift guard is skipped — a below-market post price IS the
+//      strategy, not a stale read of someone else's fill.
+// A {type:"cancel", slug} row cancels every order still resting for a slug.
+// ---------------------------------------------------------------------------
+
+// BOT_SIGNALS (shared with updown-5m.js): 1 = the strategy bot writes its
+// trades to updown-signals.ndjson and this copier executes them; 0 = the two
+// run independently. Tailing a missing file is harmless.
+const BOT_SIGNALS = process.env.BOT_SIGNALS ?? "1";
+const botSignals = BOT_SIGNALS === "1" || BOT_SIGNALS.toLowerCase() === "true";
+const LOCAL_SIGNALS_FILE = path.join(__dirname, "updown-signals.ndjson");
+const localWallet = normalizeWallets([
+  { address: "local:strategy", category: "strategy" },
+])[0];
+const localOrders = new Map(); // slug -> [orderIDs] resting from "post" signals
+
+/** Limit BUY at an exact price/size. GTC rests on the book; FAK takes-or-kills. */
+async function placeLimitAt(trade, size, price, type) {
+  if (isDryRun) {
+    log(
+      `[DRY_RUN] would ${type} limit-BUY ${size} sh of "${trade.outcome}" ` +
+        `in "${trade.slug}" @ ${price}`,
+    );
+    return { dryRun: true };
+  }
+  const client = await getClobClient();
+  const order = await client.createOrder({
+    tokenID: trade.asset,
+    price,
+    side: client._Side.BUY,
+    size,
+  });
+  const resp = await client.postOrder(order, client._OrderType[type]);
+  log("order response:", JSON.stringify(resp));
+  if (!resp || resp.error || resp.success === false) {
+    throw new Error(
+      `order rejected: ${resp?.error || resp?.errorMsg || "unknown error"}`,
+    );
+  }
+  return resp;
+}
+
+async function handleLocalSignal(sig, state) {
+  if (sig.type === "cancel") {
+    const ids = localOrders.get(sig.slug) || [];
+    localOrders.delete(sig.slug);
+    if (isDryRun || ids.length === 0) return;
+    try {
+      const client = await getClobClient();
+      await client.cancelOrders(ids);
+      log(`[local] cancelled ${ids.length} resting orders for ${sig.slug}`);
+    } catch (err) {
+      log(`[local] cancel failed for ${sig.slug}:`, err.message || err);
+    }
+    return;
+  }
+  if (sig.type !== "buy" || !sig.asset || !sig.id) return;
+
+  const trade = {
+    proxyWallet: localWallet.address,
+    transactionHash: sig.id,
+    asset: sig.asset,
+    conditionId: sig.conditionId || "",
+    title: sig.title || sig.slug || "",
+    slug: sig.slug || "",
+    eventSlug: sig.slug || "",
+    outcome: sig.outcome || "",
+    outcomeIndex: sig.outcomeIndex ?? null,
+    price: Number(sig.price),
+    size: Number(sig.size),
+    usdcSize: Number((Number(sig.price) * Number(sig.size)).toFixed(6)),
+    side: "BUY",
+    timestamp: sig.timestamp || Math.floor(Date.now() / 1000),
+  };
+  const key = tradeKey(trade);
+  if (state.seen.has(key)) return;
+  const tag = `[local:${sig.kind || "post"}]`;
+  if (!journalIds.has(key)) {
+    journalAdd(observedEntry(trade, localWallet, "pending"));
+  }
+
+  // stale guard: signals for 5m markets are worthless after ~2 minutes
+  if (Math.floor(Date.now() / 1000) - trade.timestamp > 120) {
+    state.seen.add(key);
+    saveState(state);
+    journalUpdate(key, { status: "stale" });
+    return;
+  }
+
+  // per-bet cap: scale the size down when the signal exceeds MAX_BET_USDC
+  let size = Number(sig.size);
+  let cost = Number((size * trade.price).toFixed(2));
+  if (cost > BET_USDC) {
+    size = Math.floor((BET_USDC / trade.price) * 100) / 100;
+    cost = Number((size * trade.price).toFixed(2));
+  }
+  if (!(trade.price > 0) || size < MIN_LIMIT_SHARES) {
+    state.seen.add(key);
+    saveState(state);
+    journalUpdate(key, { status: "min-skip" });
+    log(
+      `${tag} ${trade.slug} ${trade.outcome}: ${size} sh is under the ` +
+        `${MIN_LIMIT_SHARES}-share limit-order minimum — skipped`,
+    );
+    return;
+  }
+
+  const gate = await riskGateCheck(cost);
+  if (!gate.allowed) {
+    riskSnapshot.riskSkipped++;
+    state.seen.add(key);
+    saveState(state);
+    journalUpdate(key, { status: "risk-skip", riskReason: gate.reason });
+    log(`${tag} RISK SKIP ${trade.slug}: ${gate.reason}`);
+    writeStatus();
+    return;
+  }
+
+  try {
+    const type = sig.kind === "take" ? "FAK" : "GTC";
+    const resp = await placeLimitAt(trade, size, trade.price, type);
+    state.seen.add(key);
+    saveState(state);
+    tradesPlaced++;
+    const spent = Number((size * trade.price).toFixed(6)); // post: worst case; take: cap
+    if (isDryRun) paperBalance -= spent;
+    balanceCache = { value: null, fetchedAt: 0 };
+    if (!resp.dryRun && type === "GTC" && resp.orderID) {
+      const ids = localOrders.get(trade.slug) || [];
+      ids.push(resp.orderID);
+      localOrders.set(trade.slug, ids);
+    }
+    journalUpdate(key, {
+      status: "success",
+      copy: {
+        mode: isDryRun ? "dry" : "live",
+        source: "local",
+        copiedAt: Date.now(),
+        spentUsdc: spent,
+        shares: size,
+        price: trade.price,
+        orderID: resp.orderID || null,
+        txHashes: resp.transactionsHashes || [],
+      },
+    });
+    log(`${tag} placed ${type} ${size} sh ${trade.outcome} @ ${trade.price} in ${trade.slug}`);
+    if (maxTrades && tradesPlaced >= maxTrades) {
+      log(`MAX_TRADES limit reached (${tradesPlaced}/${maxTrades}) — stopping.`);
+      writeStatus();
+      process.exit(0);
+    }
+  } catch (err) {
+    log(`${tag} FAILED ${trade.slug} ${trade.outcome}:`, err.message || err);
+    // a post signal is for one moment in one 5m market — never retry it later
+    state.seen.add(key);
+    saveState(state);
+    journalUpdate(key, {
+      status: "failed",
+      copy: {
+        mode: isDryRun ? "dry" : "live",
+        source: "local",
+        copiedAt: Date.now(),
+        error: String(err.message || err),
+      },
+    });
+  }
+  writeStatus();
+}
+
+/** Tail the ndjson signal file from EOF; each complete new line is a signal. */
+function startLocalSignals(state) {
+  let offset = 0;
+  try {
+    offset = fs.statSync(LOCAL_SIGNALS_FILE).size; // old signals are history
+  } catch {
+    offset = 0;
+  }
+  let buf = "";
+  setInterval(() => {
+    let size = 0;
+    try {
+      size = fs.statSync(LOCAL_SIGNALS_FILE).size;
+    } catch {
+      return; // file not created yet
+    }
+    if (size < offset) {
+      offset = 0; // truncated/rotated — start over
+      buf = "";
+    }
+    if (size === offset) return;
+    const stream = fs.createReadStream(LOCAL_SIGNALS_FILE, { start: offset, end: size - 1 });
+    offset = size;
+    let chunk = "";
+    stream.on("data", (d) => (chunk += d));
+    stream.on("end", () => {
+      buf += chunk;
+      const lines = buf.split("\n");
+      buf = lines.pop(); // keep any trailing partial line for the next tick
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        let sig;
+        try {
+          sig = JSON.parse(line);
+        } catch {
+          continue;
+        }
+        serialize(() => handleLocalSignal(sig, state));
+      }
+    });
+  }, 300);
+  log(`local signals: tailing ${LOCAL_SIGNALS_FILE} (every 300ms)`);
+}
+
 /**
  * One trade row arriving from the websocket (already activity-API shaped).
  * Mirrors the poller's pipeline: baseline guard, journal, sub-category filter,
@@ -1534,6 +1754,8 @@ async function main() {
     log(`ws: real-time feed enabled (${WS_URL}) — poller runs as fallback`);
   }
 
+  if (botSignals) startLocalSignals(state);
+
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // through the same queue as ws events, so the two sources never interleave
@@ -1574,5 +1796,6 @@ module.exports = {
   getActiveUsdc,
   parseLiveFill,
   handleWsTrade,
+  handleLocalSignal,
   TARGET_WALLETS,
 };

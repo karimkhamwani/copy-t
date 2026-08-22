@@ -12,3 +12,4 @@ status.json
 # Misc
 .DS_Store
 npm-debug.log*
+updown-signals.ndjson

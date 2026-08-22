@@ -1,0 +1,90 @@
+[
+  {
+    "slug": "btc-updown-5m-1787414400",
+    "start": 1787414400,
+    "conditionId": "0x2eea28aa905ace2f5cace17ea2b9e0e7b85a27f32ee14ed292f02fa104956bc4",
+    "mode": "dry",
+    "pairs": [
+      {
+        "n": 1,
+        "at": 1787414528469,
+        "kind": "post",
+        "up": 0.65,
+        "down": 0.32,
+        "sum": 0.97,
+        "shares": 5,
+        "maxProfit": 0.15,
+        "mode": "dry",
+        "orderIds": []
+      },
+      {
+        "n": 2,
+        "at": 1787414528740,
+        "kind": "post",
+        "up": 0.65,
+        "down": 0.32,
+        "sum": 0.97,
+        "shares": 5,
+        "maxProfit": 0.15,
+        "mode": "dry",
+        "orderIds": []
+      }
+    ]
+  },
+  {
+    "slug": "btc-updown-5m-1787414100",
+    "start": 1787414100,
+    "conditionId": "0x5b9eb23638e38cdec7fc077f42485deeb1e4061e276cadb34b847d3f40a64575",
+    "mode": "dry",
+    "pairs": [
+      {
+        "n": 1,
+        "at": 1787414233172,
+        "kind": "post",
+        "up": 0.82,
+        "down": 0.15,
+        "sum": 0.97,
+        "shares": 5,
+        "maxProfit": 0.15,
+        "mode": "signal",
+        "orderIds": []
+      },
+      {
+        "n": 2,
+        "at": 1787414233356,
+        "kind": "post",
+        "up": 0.82,
+        "down": 0.15,
+        "sum": 0.97,
+        "shares": 5,
+        "maxProfit": 0.15,
+        "mode": "signal",
+        "orderIds": []
+      },
+      {
+        "n": 3,
+        "at": 1787414233509,
+        "kind": "post",
+        "up": 0.82,
+        "down": 0.15,
+        "sum": 0.97,
+        "shares": 5,
+        "maxProfit": 0.15,
+        "mode": "signal",
+        "orderIds": []
+      },
+      {
+        "n": 4,
+        "at": 1787414233658,
+        "kind": "post",
+        "up": 0.82,
+        "down": 0.15,
+        "sum": 0.97,
+        "shares": 5,
+        "maxProfit": 0.15,
+        "mode": "signal",
+        "orderIds": []
+      }
+    ]
+  }
+]
