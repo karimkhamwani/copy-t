@@ -191,11 +191,43 @@ async function placeLimitBuy(tokenID, price, size, orderOpts, type = "GTC") {
   return resp.orderID || null;
 }
 
-/** Signal mode: this process never touches the CLOB — it appends ndjson rows
- * that copy-trader.js (LOCAL_SIGNALS_FILE) tails and executes under its own
- * wallet, journal, risk gate and dashboard. */
+/** Signal mode: this process never touches the CLOB — it hands trades to
+ * copy-trader.js, which executes them under its own wallet, journal, risk
+ * gate and dashboard. Delivery is a unix socket (sub-ms push) with the
+ * ndjson file as durable fallback — the copier dedupes, so both delivering
+ * the same line is harmless. */
+const net = require("net");
+const SIGNAL_SOCKET = `${SIGNAL_FILE}.sock`;
+let sigSock = null;
+let sigSockOk = false;
+
+function connectSignalSocket() {
+  if (!signalMode || sigSock) return;
+  const s = net.createConnection(SIGNAL_SOCKET);
+  s.on("connect", () => {
+    sigSockOk = true;
+    log("signal socket connected (sub-ms delivery to copy-trader)");
+  });
+  s.on("error", () => {});
+  s.on("close", () => {
+    sigSockOk = false;
+    sigSock = null;
+    setTimeout(connectSignalSocket, 1000).unref(); // retry until the copier is up
+  });
+  sigSock = s;
+}
+connectSignalSocket();
+
 function emitSignal(obj) {
-  fs.appendFileSync(SIGNAL_FILE, JSON.stringify(obj) + "\n");
+  const line = JSON.stringify(obj) + "\n";
+  if (sigSockOk) {
+    try {
+      sigSock.write(line); // fast path
+    } catch {
+      /* file below still delivers */
+    }
+  }
+  fs.appendFileSync(SIGNAL_FILE, line); // durable record + fallback path
 }
 
 function emitPairSignals(pair, kind) {

@@ -1555,7 +1555,9 @@ async function handleLocalSignal(sig, state) {
   writeStatus();
 }
 
-/** Tail the ndjson signal file from EOF; each complete new line is a signal. */
+/** Tail the ndjson signal file from EOF; each complete new line is a signal.
+ * Push-driven: fs.watch fires the read within ~1-2ms of the bot's append; a
+ * slow poll remains as a safety net for missed watch events. */
 function startLocalSignals(state) {
   let offset = 0;
   try {
@@ -1564,7 +1566,10 @@ function startLocalSignals(state) {
     offset = 0;
   }
   let buf = "";
-  setInterval(() => {
+  let reading = false;
+
+  const readNewLines = () => {
+    if (reading) return; // one reader at a time; the poll re-checks anyway
     let size = 0;
     try {
       size = fs.statSync(LOCAL_SIGNALS_FILE).size;
@@ -1576,14 +1581,17 @@ function startLocalSignals(state) {
       buf = "";
     }
     if (size === offset) return;
+    reading = true;
     const stream = fs.createReadStream(LOCAL_SIGNALS_FILE, { start: offset, end: size - 1 });
     offset = size;
     let chunk = "";
     stream.on("data", (d) => (chunk += d));
+    stream.on("error", () => (reading = false));
     stream.on("end", () => {
+      reading = false;
       buf += chunk;
       const lines = buf.split("\n");
-      buf = lines.pop(); // keep any trailing partial line for the next tick
+      buf = lines.pop(); // keep any trailing partial line for the next read
       for (const line of lines) {
         if (!line.trim()) continue;
         let sig;
@@ -1594,9 +1602,60 @@ function startLocalSignals(state) {
         }
         serialize(() => handleLocalSignal(sig, state));
       }
+      readNewLines(); // catch appends that landed while we were reading
     });
-  }, 50);
-  log(`local signals: tailing ${LOCAL_SIGNALS_FILE} (every 50ms)`);
+  };
+
+  // Primary path: a unix-domain socket the bot writes each signal line to —
+  // sub-millisecond delivery, no filesystem in the loop. The file tail below
+  // stays as the fallback/replay path; duplicates are harmless because every
+  // buy signal dedupes on its id (seen set) and cancels are idempotent.
+  const net = require("net");
+  const SIGNAL_SOCKET = `${LOCAL_SIGNALS_FILE}.sock`;
+  try {
+    fs.unlinkSync(SIGNAL_SOCKET);
+  } catch {
+    /* no stale socket */
+  }
+  try {
+    const server = net.createServer((conn) => {
+      let sbuf = "";
+      conn.on("data", (d) => {
+        sbuf += d;
+        const lines = sbuf.split("\n");
+        sbuf = lines.pop();
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          let sig;
+          try {
+            sig = JSON.parse(line);
+          } catch {
+            continue;
+          }
+          serialize(() => handleLocalSignal(sig, state));
+        }
+      });
+      conn.on("error", () => {});
+    });
+    server.on("error", (err) => log(`signal socket error: ${err.message}`));
+    server.listen(SIGNAL_SOCKET, () =>
+      log(`local signals: socket ${SIGNAL_SOCKET} (push, <1ms) + file tail fallback`),
+    );
+  } catch (err) {
+    log(`signal socket unavailable (${err.message}) — file tail only`);
+  }
+
+  // Fallback: watch + slow poll on the ndjson file (also replays anything
+  // written while the copier was down, from EOF-at-start onward).
+  const sigName = path.basename(LOCAL_SIGNALS_FILE);
+  try {
+    fs.watch(path.dirname(LOCAL_SIGNALS_FILE), (event, filename) => {
+      if (!filename || filename === sigName) readNewLines();
+    });
+  } catch {
+    /* polling still covers it */
+  }
+  setInterval(readNewLines, 250);
 }
 
 /**
