@@ -451,6 +451,11 @@ async function tick() {
       const market = await discoverMarket(state.slug);
       state.warm = await prewarmMarket(market);
       state.market = market; // set last: pairs only fire once fully warmed
+      if (signalMode) {
+        // let the copier warm its order path (tick size, neg-risk, client)
+        // for these tokens before the first buy signal lands
+        emitSignal({ type: "prewarm", slug: state.slug, assets: [market.upToken, market.downToken] });
+      }
       log(`market found + prewarmed: ${state.slug} (condition ${market.conditionId.slice(0, 10)}…)`);
     } catch (err) {
       log(`discovery failed for ${state.slug}: ${err.message}`);

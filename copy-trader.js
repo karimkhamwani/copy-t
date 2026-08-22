@@ -1378,6 +1378,27 @@ const localWallet = normalizeWallets([
   { address: "local:strategy", category: "strategy" },
 ])[0];
 const localOrders = new Map(); // slug -> [orderIDs] resting from "post" signals
+const localWarm = new Map(); // tokenID -> { tickSize, negRisk }, from "prewarm" signals
+
+/** Resolve tick-size/neg-risk for signal tokens ahead of the first order, so
+ * placing it costs one postOrder round-trip instead of three lookups. */
+async function prewarmLocalTokens(assets) {
+  if (isDryRun || !PRIVATE_KEY) return;
+  const client = await getClobClient();
+  await Promise.all(
+    (assets || []).map(async (tokenID) => {
+      try {
+        const [tickSize, negRisk] = await Promise.all([
+          client.getTickSize(tokenID),
+          client.getNegRisk(tokenID),
+        ]);
+        localWarm.set(tokenID, { tickSize, negRisk });
+      } catch {
+        /* order path resolves them lazily as before */
+      }
+    }),
+  );
+}
 
 /** Limit BUY at an exact price/size. GTC rests on the book; FAK takes-or-kills. */
 async function placeLimitAt(trade, size, price, type) {
@@ -1389,12 +1410,10 @@ async function placeLimitAt(trade, size, price, type) {
     return { dryRun: true };
   }
   const client = await getClobClient();
-  const order = await client.createOrder({
-    tokenID: trade.asset,
-    price,
-    side: client._Side.BUY,
-    size,
-  });
+  const order = await client.createOrder(
+    { tokenID: trade.asset, price, side: client._Side.BUY, size },
+    localWarm.get(trade.asset), // prewarmed {tickSize,negRisk} -> zero lookups
+  );
   const resp = await client.postOrder(order, client._OrderType[type]);
   log("order response:", JSON.stringify(resp));
   if (!resp || resp.error || resp.success === false) {
@@ -1406,6 +1425,10 @@ async function placeLimitAt(trade, size, price, type) {
 }
 
 async function handleLocalSignal(sig, state) {
+  if (sig.type === "prewarm") {
+    await prewarmLocalTokens(sig.assets);
+    return;
+  }
   if (sig.type === "cancel") {
     const ids = localOrders.get(sig.slug) || [];
     localOrders.delete(sig.slug);
@@ -1572,8 +1595,8 @@ function startLocalSignals(state) {
         serialize(() => handleLocalSignal(sig, state));
       }
     });
-  }, 300);
-  log(`local signals: tailing ${LOCAL_SIGNALS_FILE} (every 300ms)`);
+  }, 50);
+  log(`local signals: tailing ${LOCAL_SIGNALS_FILE} (every 50ms)`);
 }
 
 /**
