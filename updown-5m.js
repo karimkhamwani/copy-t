@@ -30,9 +30,9 @@ const {
   UPDOWN_SLUG_PREFIX = "btc-updown-5m",
   UPDOWN_PAIRS = "5", // paired bets per market
   UPDOWN_SHARES = "5", // shares per order (CLOB limit-order minimum is 5)
-  UPDOWN_ENTRY_START_SEC = "60", // entry window inside the 5m market
-  UPDOWN_ENTRY_END_SEC = "180",
-  UPDOWN_TOTAL_COST = "0.97", // target Up+Down combined bid (must be < 1.00)
+  UPDOWN_ENTRY_START_SEC = "20", // entry window inside the 5m market
+  UPDOWN_ENTRY_END_SEC = "200",
+  UPDOWN_TOTAL_COST = "0.98", // target Up+Down combined bid (must be < 1.00)
   UPDOWN_TAKE_SUM = "0.99", // instant-arb: if askUp+askDown <= this, take both asks immediately (must be < 1.00)
   UPDOWN_CANCEL_BEFORE_CLOSE_SEC = "30",
   UPDOWN_JOURNAL_FILE = path.join(__dirname, "updown-journal.json"),
