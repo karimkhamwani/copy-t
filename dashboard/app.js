@@ -125,6 +125,9 @@ function ResultBadge({ result, copy }) {
  */
 function SourceBadge({ source }) {
   const s = String(source || "").toLowerCase();
+  if (s === "local") {
+    return html`<span className="badge b-pending" title="Placed from a local strategy-bot signal (updown-5m.js)">BOT</span>`;
+  }
   if (s !== "ws" && s !== "poll") {
     return html`<span className="badge b-filtered" title="No source recorded for this copy">SRC ?</span>`;
   }

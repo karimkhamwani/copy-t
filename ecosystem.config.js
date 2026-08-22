@@ -25,6 +25,14 @@ module.exports = {
       restart_delay: 5000,
     },
     {
+      name: "updown-bot",
+      script: "updown-5m.js",
+      watch: ["updown-5m.js", ".env"],
+      watch_delay: 2000,
+      max_restarts: 10,
+      restart_delay: 5000,
+    },
+    {
       name: "dashboard",
       script: "dashboard-server.js",
       watch: ["dashboard-server.js", "dashboard", ".env"],
