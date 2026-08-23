@@ -27,7 +27,7 @@ const {
   FUNDER_ADDRESS,
   SIGNATURE_TYPE = "1",
   UPDOWN_DRY_RUN = "1",
-  UPDOWN_SLUG_PREFIX = "btc-updown-5m",
+  UPDOWN_SLUG_PREFIX = "btc-updown-5m", // comma-separated for multiple markets, e.g. "btc-updown-5m,eth-updown-5m"
   UPDOWN_PAIRS = "5", // paired bets per market
   UPDOWN_SHARES = "5", // shares per order (CLOB limit-order minimum is 5)
   UPDOWN_ENTRY_START_SEC = "20", // entry window inside the 5m market
@@ -258,20 +258,20 @@ function emitSignal(obj) {
   fs.appendFileSync(SIGNAL_FILE, line); // durable record + fallback path
 }
 
-function emitPairSignals(pair, kind) {
+function emitPairSignals(st, pair, kind) {
   const base = {
     type: "buy",
     kind, // post -> GTC at this price; take -> FAK at this price
-    slug: state.slug,
-    conditionId: state.market.conditionId,
-    title: state.market.title || state.slug,
+    slug: st.slug,
+    conditionId: st.market.conditionId,
+    title: st.market.title || st.slug,
     size: pair.shares,
     timestamp: Math.floor(Date.now() / 1000),
   };
-  emitSignal({ ...base, id: `${state.slug}-p${pair.n}-up`, asset: state.market.upToken, outcome: "Up", outcomeIndex: 0, price: pair.up });
-  emitSignal({ ...base, id: `${state.slug}-p${pair.n}-down`, asset: state.market.downToken, outcome: "Down", outcomeIndex: 1, price: pair.down });
+  emitSignal({ ...base, id: `${st.slug}-p${pair.n}-up`, asset: st.market.upToken, outcome: "Up", outcomeIndex: 0, price: pair.up });
+  emitSignal({ ...base, id: `${st.slug}-p${pair.n}-down`, asset: st.market.downToken, outcome: "Down", outcomeIndex: 1, price: pair.down });
   log(
-    `pair ${pair.n} ${kind.toUpperCase()} -> signals emitted: ` +
+    `[${st.prefix}] pair ${pair.n} ${kind.toUpperCase()} -> signals emitted: ` +
       `${pair.shares} Up @ ${pair.up} + ${pair.shares} Down @ ${pair.down} (sum ${pair.sum})`,
   );
 }
@@ -329,12 +329,15 @@ function journalMarket(entry) {
 // Per-market state machine
 // ---------------------------------------------------------------------------
 
-let state = null; // { start, slug, market, warm, pairs, orderIds, cancelled, bookPrefetch }
+// One independent state machine per market prefix (btc, eth, ...).
+const prefixes = UPDOWN_SLUG_PREFIX.split(",").map((s) => s.trim()).filter(Boolean);
+const states = new Map(); // prefix -> { start, slug, market, warm, pairs, orderIds, cancelled, bookPrefetch }
 
-function freshState(start) {
+function freshState(prefix, start) {
   return {
+    prefix,
     start,
-    slug: `${UPDOWN_SLUG_PREFIX}-${start}`,
+    slug: `${prefix}-${start}`,
     market: null,
     warm: { up: undefined, down: undefined }, // prewarmed {tickSize, negRisk} per side
     pairs: [],
@@ -352,9 +355,9 @@ function pairTime(i) {
 
 /** Start fetching both books; done ahead of the pair time so the quote
  * computation has fresh data with zero wait on the placement path. */
-function prefetchBooks(forPair) {
-  const { upToken, downToken } = state.market;
-  state.bookPrefetch = {
+function prefetchBooks(st, forPair) {
+  const { upToken, downToken } = st.market;
+  st.bookPrefetch = {
     forPair,
     promise: Promise.all([
       fetchJson(`${CLOB_API_HOST}/book?token_id=${upToken}`),
@@ -363,12 +366,12 @@ function prefetchBooks(forPair) {
   };
 }
 
-async function placePair(i) {
+async function placePair(st, i) {
   // use the prefetched books when they're for this pair; fall back to a live fetch
   const prefetched =
-    state.bookPrefetch?.forPair === i ? await state.bookPrefetch.promise : null;
-  state.bookPrefetch = null;
-  const { upToken, downToken } = state.market;
+    st.bookPrefetch?.forPair === i ? await st.bookPrefetch.promise : null;
+  st.bookPrefetch = null;
+  const { upToken, downToken } = st.market;
   const [upBook, downBook] =
     prefetched ||
     (await Promise.all([
@@ -387,7 +390,10 @@ async function placePair(i) {
     downTop.ask != null &&
     upTop.ask + downTop.ask <= takeSum + 1e-9 &&
     upTop.askSize >= sharesPerOrder &&
-    downTop.askSize >= sharesPerOrder
+    downTop.askSize >= sharesPerOrder &&
+    // the exchange rejects marketable BUYs under $1 notional — and a leg that
+    // cheap means the market is basically decided anyway
+    Math.min(upTop.ask, downTop.ask) * sharesPerOrder >= 1
   ) {
     const pair = {
       n: i + 1,
@@ -403,7 +409,7 @@ async function placePair(i) {
     };
     if (signalMode) {
       pair.mode = "signal";
-      emitPairSignals(pair, "take");
+      emitPairSignals(st, pair, "take");
     } else if (isDryRun) {
       log(
         `[DRY_RUN] pair ${pair.n} TAKE: asks sum ${pair.sum} <= ${takeSum} — would ` +
@@ -412,19 +418,19 @@ async function placePair(i) {
       );
     } else {
       const [upId, downId] = await Promise.all([
-        placeLimitBuy(state.market.upToken, pair.up, sharesPerOrder, state.warm.up, "FAK"),
-        placeLimitBuy(state.market.downToken, pair.down, sharesPerOrder, state.warm.down, "FAK"),
+        placeLimitBuy(st.market.upToken, pair.up, sharesPerOrder, st.warm.up, "FAK"),
+        placeLimitBuy(st.market.downToken, pair.down, sharesPerOrder, st.warm.down, "FAK"),
       ]);
       pair.orderIds = [upId, downId].filter(Boolean); // FAK never rests; kept for the journal only
-      log(`pair ${pair.n} TAKE: bought both asks, sum ${pair.sum} (profit $${pair.maxProfit})`);
+      log(`[${st.prefix}] pair ${pair.n} TAKE: bought both asks, sum ${pair.sum} (profit $${pair.maxProfit})`);
     }
-    state.pairs.push(pair);
+    st.pairs.push(pair);
     const snapshot = {
-      slug: state.slug,
-      start: state.start,
-      conditionId: state.market.conditionId,
+      slug: st.slug,
+      start: st.start,
+      conditionId: st.market.conditionId,
       mode: isDryRun ? "dry" : "live",
-      pairs: [...state.pairs],
+      pairs: [...st.pairs],
     };
     setImmediate(() => journalMarket(snapshot));
     return true;
@@ -432,8 +438,21 @@ async function placePair(i) {
 
   const prices = pairPrices(upTop, downTop);
   if (!prices) {
-    log(`pair ${i + 1}/${pairsPerMarket}: book too thin/skewed for a ${totalCost} quote — retrying`);
+    log(`[${st.prefix}] pair ${i + 1}/${pairsPerMarket}: book too thin/skewed for a ${totalCost} quote — retrying`);
     return false; // slot not consumed; retried next tick until the window closes
+  }
+  // Cheap-leg floor: if a bid crosses the book by the time it lands, the CLOB
+  // treats it as marketable and enforces a $1 minimum — a sub-$1 leg can be
+  // rejected. A leg that cheap also means the market is nearly decided:
+  // worst completion odds, worst legging risk. Skip and retry; if the skew
+  // persists, this market simply gets no pair.
+  if (Math.min(prices.up, prices.down) * sharesPerOrder < 1) {
+    log(
+      `[${st.prefix}] pair ${i + 1}/${pairsPerMarket}: cheap leg ` +
+        `$${(Math.min(prices.up, prices.down) * sharesPerOrder).toFixed(2)} is under the ` +
+        `$1 exchange minimum (market too decided) — retrying`,
+    );
+    return false;
   }
 
   const pair = {
@@ -451,7 +470,7 @@ async function placePair(i) {
 
   if (signalMode) {
     pair.mode = "signal";
-    emitPairSignals(pair, "post");
+    emitPairSignals(st, pair, "post");
   } else if (isDryRun) {
     log(
       `[DRY_RUN] pair ${pair.n}: would bid ${sharesPerOrder} Up @ ${prices.up} + ` +
@@ -460,96 +479,103 @@ async function placePair(i) {
     );
   } else {
     const [upId, downId] = await Promise.all([
-      placeLimitBuy(state.market.upToken, prices.up, sharesPerOrder, state.warm.up, "GTC"),
-      placeLimitBuy(state.market.downToken, prices.down, sharesPerOrder, state.warm.down, "GTC"),
+      placeLimitBuy(st.market.upToken, prices.up, sharesPerOrder, st.warm.up, "GTC"),
+      placeLimitBuy(st.market.downToken, prices.down, sharesPerOrder, st.warm.down, "GTC"),
     ]);
     pair.orderIds = [upId, downId].filter(Boolean);
-    state.orderIds.push(...pair.orderIds);
+    st.orderIds.push(...pair.orderIds);
     log(
-      `pair ${pair.n}: placed ${sharesPerOrder} Up @ ${prices.up} + ` +
+      `[${st.prefix}] pair ${pair.n}: placed ${sharesPerOrder} Up @ ${prices.up} + ` +
         `${sharesPerOrder} Down @ ${prices.down} (sum ${pair.sum})`,
     );
   }
 
-  state.pairs.push(pair);
+  st.pairs.push(pair);
   // journal off the hot path — the disk write must never delay the next pair
   const snapshot = {
-    slug: state.slug,
-    start: state.start,
-    conditionId: state.market.conditionId,
+    slug: st.slug,
+    start: st.start,
+    conditionId: st.market.conditionId,
     mode: isDryRun ? "dry" : "live",
-    pairs: [...state.pairs],
+    pairs: [...st.pairs],
   };
   setImmediate(() => journalMarket(snapshot));
   return true;
 }
 
-async function cancelOpenOrders() {
-  state.cancelled = true;
+async function cancelOpenOrders(st) {
+  st.cancelled = true;
   if (signalMode) {
-    if (state.pairs.some((p) => p.kind === "post")) {
-      emitSignal({ type: "cancel", slug: state.slug });
-      log(`cancel signal emitted for ${state.slug}`);
+    if (st.pairs.some((p) => p.kind === "post")) {
+      emitSignal({ type: "cancel", slug: st.slug });
+      log(`[${st.prefix}] cancel signal emitted for ${st.slug}`);
     }
     return;
   }
-  if (isDryRun || state.orderIds.length === 0) return;
+  if (isDryRun || st.orderIds.length === 0) return;
   try {
     const client = await getClobClient();
-    await client.cancelOrders(state.orderIds);
-    log(`cancelled ${state.orderIds.length} resting orders before close`);
+    await client.cancelOrders(st.orderIds);
+    log(`[${st.prefix}] cancelled ${st.orderIds.length} resting orders before close`);
   } catch (err) {
     log("cancel failed (orders may already be filled/expired):", err.message || err);
   }
 }
 
-async function tick() {
+async function tickMarket(prefix) {
   const nowSec = Date.now() / 1000;
   const start = currentMarketStart();
-  if (!state || state.start !== start) {
-    if (state && !state.cancelled) await cancelOpenOrders(); // safety on window roll
-    state = freshState(start);
-    log(`new market window: ${state.slug} (${new Date(start * 1000).toISOString()})`);
+  let st = states.get(prefix);
+  if (!st || st.start !== start) {
+    if (st && !st.cancelled) await cancelOpenOrders(st); // safety on window roll
+    st = freshState(prefix, start);
+    states.set(prefix, st);
+    log(`[${prefix}] new market window: ${st.slug} (${new Date(start * 1000).toISOString()})`);
   }
   const t = nowSec - start;
 
   // discover tokens + prewarm creds/tick-size/connections well before entry
-  if (!state.market && t >= Math.max(0, entryStart - 20)) {
+  if (!st.market && t >= Math.max(0, entryStart - 20)) {
     try {
-      const market = await discoverMarket(state.slug);
-      state.warm = await prewarmMarket(market);
-      state.market = market; // set last: pairs only fire once fully warmed
+      const market = await discoverMarket(st.slug);
+      st.warm = await prewarmMarket(market);
+      st.market = market; // set last: pairs only fire once fully warmed
       if (signalMode) {
         // let the copier warm its order path (tick size, neg-risk, client)
         // for these tokens before the first buy signal lands
-        emitSignal({ type: "prewarm", slug: state.slug, assets: [market.upToken, market.downToken] });
+        emitSignal({ type: "prewarm", slug: st.slug, assets: [market.upToken, market.downToken] });
       }
-      log(`market found + prewarmed: ${state.slug} (condition ${market.conditionId.slice(0, 10)}…)`);
+      log(`[${prefix}] market found + prewarmed: ${st.slug} (condition ${market.conditionId.slice(0, 10)}…)`);
     } catch (err) {
-      log(`discovery failed for ${state.slug}: ${err.message}`);
+      log(`[${prefix}] discovery failed for ${st.slug}: ${err.message}`);
       return; // retried next tick
     }
   }
 
   // place pairs on schedule inside the entry window
-  if (state.market && state.pairs.length < pairsPerMarket && t <= entryEnd) {
-    const next = state.pairs.length;
+  if (st.market && st.pairs.length < pairsPerMarket && t <= entryEnd) {
+    const next = st.pairs.length;
     const due = pairTime(next);
     // start the book fetch ~400ms early so placement only waits on postOrder
-    if (t >= due - 0.4 && state.bookPrefetch?.forPair !== next) prefetchBooks(next);
+    if (t >= due - 0.4 && st.bookPrefetch?.forPair !== next) prefetchBooks(st, next);
     if (t >= due) {
       try {
-        await placePair(next);
+        await placePair(st, next);
       } catch (err) {
-        log(`pair ${next + 1} failed: ${err.message}`);
+        log(`[${prefix}] pair ${next + 1} failed: ${err.message}`);
       }
     }
   }
 
   // cancel whatever is still resting shortly before the market closes
-  if (!state.cancelled && t >= MARKET_SECONDS - cancelBefore) {
-    await cancelOpenOrders();
+  if (!st.cancelled && t >= MARKET_SECONDS - cancelBefore) {
+    await cancelOpenOrders(st);
   }
+}
+
+async function tick() {
+  // markets are independent; run their machines concurrently each tick
+  await Promise.all(prefixes.map((p) => tickMarket(p)));
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +604,7 @@ function validate() {
 if (require.main === module) {
   validate();
   log(
-    `updown-5m strategy starting: ${UPDOWN_SLUG_PREFIX}, ${pairsPerMarket} pairs x ` +
+    `updown-5m strategy starting: [${prefixes.join(", ")}], ${pairsPerMarket} pairs x ` +
       `${sharesPerOrder}+${sharesPerOrder} shares, entry ${entryStart}-${entryEnd}s, ` +
       `target sum ${totalCost}, mode ${signalMode ? "SIGNAL -> copy-trader" : isDryRun ? "DRY" : "LIVE"}`,
   );
