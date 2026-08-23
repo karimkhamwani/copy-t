@@ -1400,18 +1400,18 @@ async function prewarmLocalTokens(assets) {
   );
 }
 
-/** Limit order at an exact price/size. GTC rests on the book; FAK takes-or-kills. */
-async function placeLimitAt(trade, size, price, type, side = "BUY") {
+/** Limit BUY at an exact price/size. GTC rests on the book; FAK takes-or-kills. */
+async function placeLimitAt(trade, size, price, type) {
   if (isDryRun) {
     log(
-      `[DRY_RUN] would ${type} limit-${side} ${size} sh of "${trade.outcome}" ` +
+      `[DRY_RUN] would ${type} limit-BUY ${size} sh of "${trade.outcome}" ` +
         `in "${trade.slug}" @ ${price}`,
     );
     return { dryRun: true };
   }
   const client = await getClobClient();
   const order = await client.createOrder(
-    { tokenID: trade.asset, price, side: client._Side[side], size },
+    { tokenID: trade.asset, price, side: client._Side.BUY, size },
     localWarm.get(trade.asset), // prewarmed {tickSize,negRisk} -> zero lookups
   );
   const resp = await client.postOrder(order, client._OrderType[type]);
@@ -1424,209 +1424,6 @@ async function placeLimitAt(trade, size, price, type, side = "BUY") {
   return resp;
 }
 
-// ---------------------------------------------------------------------------
-// Hedge-on-fill: the strategy's posted pairs are only riskless when BOTH legs
-// fill. This watcher polls resting legs; the moment one leg is filled while
-// its sibling is untouched, it cancels the sibling and either
-//   (a) completes the pair at market — if filled price + current ask still
-//       sums under HEDGE_MAX_SUM, buy the missing side right now (small
-//       locked profit instead of a gamble), or
-//   (b) bails — sells the filled leg back at the bid (small known loss
-//       instead of holding a one-sided bet to resolution).
-// ---------------------------------------------------------------------------
-
-const HEDGE_MAX_SUM = 0.995; // complete the pair only while it still locks profit
-const HEDGE_GRACE_MS = 2500; // one-legged this long before acting
-const HEDGE_POLL_MS = 2000;
-
-const localPairs = new Map(); // pairKey -> { slug, legs: {up, down}, legAt, done }
-
-async function fetchBookTop(asset) {
-  const resp = await fetch(`${CLOB_API_HOST}/book?token_id=${asset}`, {
-    headers: { accept: "application/json" },
-  });
-  if (!resp.ok) throw new Error(`book ${resp.status}`);
-  const book = await resp.json();
-  const bids = (book?.bids || []).map((l) => Number(l.price)).filter(Number.isFinite);
-  const asks = (book?.asks || []).map((l) => Number(l.price)).filter(Number.isFinite);
-  return {
-    bid: bids.length ? Math.max(...bids) : null,
-    ask: asks.length ? Math.min(...asks) : null,
-  };
-}
-
-/** Buy `shares` of `asset` right now (hedge completion). Uses a marketable FAK
- * limit when the 5-share/$1 minimums allow, else a $-denominated market order. */
-async function buyNow(asset, shares, maxPrice, slug, outcome) {
-  const client = await getClobClient();
-  const price = Math.min(0.99, Math.round(maxPrice * 100) / 100);
-  if (shares >= MIN_LIMIT_SHARES && shares * price >= 1) {
-    const order = await client.createOrder(
-      { tokenID: asset, price, side: client._Side.BUY, size: shares },
-      localWarm.get(asset),
-    );
-    return client.postOrder(order, client._OrderType.FAK);
-  }
-  const order = await client.createMarketOrder(
-    { tokenID: asset, amount: Number((shares * price).toFixed(2)), side: client._Side.BUY, price },
-    localWarm.get(asset),
-  );
-  return client.postOrder(order, client._OrderType.FAK);
-}
-
-/** Sell `shares` of `asset` right now (hedge bail-out). */
-async function sellNow(asset, shares, minPrice) {
-  const client = await getClobClient();
-  const price = Math.max(0.01, Math.round(minPrice * 100) / 100);
-  if (shares >= MIN_LIMIT_SHARES && shares * price >= 1) {
-    const order = await client.createOrder(
-      { tokenID: asset, price, side: client._Side.SELL, size: shares },
-      localWarm.get(asset),
-    );
-    return client.postOrder(order, client._OrderType.FAK);
-  }
-  const order = await client.createMarketOrder(
-    { tokenID: asset, amount: shares, side: client._Side.SELL, price },
-    localWarm.get(asset),
-  );
-  return client.postOrder(order, client._OrderType.FAK);
-}
-
-async function hedgePair(pairKey, pair, filled, empty) {
-  const client = await getClobClient();
-  try {
-    await client.cancelOrders([empty.orderID]);
-  } catch {
-    /* may already be gone */
-  }
-  // the unfilled leg leaves the P/L stats — it never cost anything
-  journalUpdate(empty.journalKey, { status: "failed" });
-
-  const shares = filled.matched;
-  let top = null;
-  try {
-    top = await fetchBookTop(empty.asset);
-  } catch {
-    /* book unreadable — fall through to bail below */
-  }
-
-  if (top?.ask != null && filled.price + top.ask <= HEDGE_MAX_SUM + 1e-9) {
-    // (a) complete the pair at market: still locks (1 - sum) x shares
-    try {
-      const resp = await buyNow(empty.asset, shares, top.ask, pair.slug, empty.outcome);
-      const sum = (filled.price + top.ask).toFixed(2);
-      log(
-        `[hedge] ${pair.slug}: completed pair at market — bought ${shares} ${empty.outcome} ` +
-          `@ ${top.ask} (pair sum ${sum}, locked $${((1 - filled.price - top.ask) * shares).toFixed(2)})`,
-      );
-      const hTrade = {
-        transactionHash: `${pairKey}-hedge`,
-        asset: empty.asset,
-        conditionId: empty.conditionId,
-        title: empty.title,
-        slug: pair.slug,
-        eventSlug: pair.slug,
-        outcome: empty.outcome,
-        outcomeIndex: empty.outcomeIndex,
-        price: top.ask,
-        size: shares,
-        usdcSize: Number((top.ask * shares).toFixed(6)),
-        side: "BUY",
-        timestamp: Math.floor(Date.now() / 1000),
-      };
-      journalUpdate(
-        tradeKey(hTrade),
-        {
-          status: "success",
-          copy: {
-            mode: "live",
-            source: "local",
-            copiedAt: Date.now(),
-            spentUsdc: hTrade.usdcSize,
-            shares,
-            price: top.ask,
-            orderID: resp?.orderID || null,
-            txHashes: resp?.transactionsHashes || [],
-          },
-        },
-        observedEntry(hTrade, localWallet, "success"),
-      );
-      return;
-    } catch (err) {
-      log(`[hedge] ${pair.slug}: completion buy failed (${err.message}) — bailing instead`);
-    }
-  }
-
-  // (b) bail: sell the filled leg back at the bid
-  if (top?.bid != null) {
-    try {
-      await sellNow(filled.asset, shares, top.bid);
-      const loss = ((filled.price - top.bid) * shares).toFixed(2);
-      log(
-        `[hedge] ${pair.slug}: bailed — sold ${shares} ${filled.outcome} @ ~${top.bid} ` +
-          `(bought ${filled.price}, known loss ~$${loss} instead of a coin flip)`,
-      );
-      journalUpdate(filled.journalKey, {
-        hedge: { action: "bailed", soldAt: top.bid, at: Date.now() },
-      });
-      return;
-    } catch (err) {
-      log(`[hedge] ${pair.slug}: bail-out sell failed (${err.message}) — holding the leg`);
-    }
-  }
-  log(`[hedge] ${pair.slug}: no book to hedge against — holding the leg`);
-}
-
-async function hedgeTick(state) {
-  if (isDryRun) return;
-  const client = await getClobClient().catch(() => null);
-  if (!client) return;
-  for (const [pairKey, pair] of localPairs) {
-    if (pair.done) continue;
-    const legs = Object.values(pair.legs);
-    if (legs.length < 2) continue; // second leg's signal may still be in flight
-    for (const leg of legs) {
-      if (leg.finalized) continue;
-      try {
-        const o = await client.getOrder(leg.orderID);
-        const matched = Number(o?.size_matched);
-        if (Number.isFinite(matched)) leg.matched = matched;
-        const st = String(o?.status || "").toUpperCase();
-        if (st === "MATCHED") {
-          leg.matched = leg.size;
-          leg.finalized = true;
-        } else if (st === "CANCELED" || st === "CANCELLED") {
-          leg.finalized = true;
-        }
-      } catch {
-        /* transient lookup failure — keep last known state */
-      }
-    }
-    const [a, b] = legs;
-    if (a.matched >= a.size - 1e-9 && b.matched >= b.size - 1e-9) {
-      pair.done = true; // both filled: the pair completed on its own
-      continue;
-    }
-    const filled = a.matched > 0 && b.matched === 0 ? a : b.matched > 0 && a.matched === 0 ? b : null;
-    const empty = filled === a ? b : a;
-    if (!filled) {
-      pair.legAt = null; // both empty (keep waiting) or both partial (cancel sweep handles)
-      continue;
-    }
-    if (!pair.legAt) {
-      pair.legAt = Date.now(); // start the grace clock — the sibling often fills seconds later
-      continue;
-    }
-    if (Date.now() - pair.legAt < HEDGE_GRACE_MS) continue;
-    pair.done = true; // act exactly once
-    await hedgePair(pairKey, pair, filled, empty);
-  }
-  // drop finished pairs after 10 minutes so the map never grows unbounded
-  for (const [k, p] of localPairs) {
-    if (p.done && Date.now() - (p.createdAt || 0) > 600000) localPairs.delete(k);
-  }
-}
-
 async function handleLocalSignal(sig, state) {
   if (sig.type === "prewarm") {
     await prewarmLocalTokens(sig.assets);
@@ -1635,17 +1432,6 @@ async function handleLocalSignal(sig, state) {
   if (sig.type === "cancel") {
     const ids = localOrders.get(sig.slug) || [];
     localOrders.delete(sig.slug);
-    // settle hedge bookkeeping for this market: legs that never filled leave
-    // the P/L stats (they cost nothing), whatever their pair's fate
-    for (const [k, pair] of localPairs) {
-      if (pair.slug !== sig.slug) continue;
-      pair.done = true;
-      for (const leg of Object.values(pair.legs)) {
-        if (leg.matched === 0 && !leg.finalized) {
-          journalUpdate(leg.journalKey, { status: "failed" });
-        }
-      }
-    }
     if (isDryRun || ids.length === 0) return;
     try {
       const client = await getClobClient();
@@ -1731,31 +1517,6 @@ async function handleLocalSignal(sig, state) {
       const ids = localOrders.get(trade.slug) || [];
       ids.push(resp.orderID);
       localOrders.set(trade.slug, ids);
-      // register the leg for the hedge-on-fill watcher (ids end in -up/-down)
-      const m = /^(.*)-(up|down)$/.exec(sig.id);
-      if (m) {
-        const pair = localPairs.get(m[1]) || {
-          slug: trade.slug,
-          legs: {},
-          legAt: null,
-          done: false,
-          createdAt: Date.now(),
-        };
-        pair.legs[m[2]] = {
-          orderID: resp.orderID,
-          journalKey: key,
-          asset: trade.asset,
-          conditionId: trade.conditionId,
-          title: trade.title,
-          outcome: trade.outcome,
-          outcomeIndex: trade.outcomeIndex,
-          price: trade.price,
-          size,
-          matched: 0,
-          finalized: false,
-        };
-        localPairs.set(m[1], pair);
-      }
     }
     journalUpdate(key, {
       status: "success",
@@ -2088,15 +1849,7 @@ async function main() {
     log(`ws: real-time feed enabled (${WS_URL}) — poller runs as fallback`);
   }
 
-  if (botSignals) {
-    startLocalSignals(state);
-    if (!isDryRun) {
-      setInterval(() => {
-        hedgeTick(state).catch((err) => log("hedge tick error:", err.message || err));
-      }, HEDGE_POLL_MS);
-      log(`hedge-on-fill active: one-legged pairs are completed (sum <= ${HEDGE_MAX_SUM}) or bailed within ~${HEDGE_GRACE_MS / 1000}s`);
-    }
-  }
+  if (botSignals) startLocalSignals(state);
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
