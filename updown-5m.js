@@ -638,7 +638,12 @@ async function tick() {
 //   3. sell only the lonely excess shares at the current bid.
 // ---------------------------------------------------------------------------
 
-const BAIL_SUM = 1.0;
+// Bail when the FILLED leg's own bid has dropped this far below our entry —
+// i.e. the market is genuinely moving against the leg we hold. (Comparing
+// "completion cost at the ask" to $1.00 is useless: crossing the spread
+// always costs ~$1.00+, even in a healthy market — that test bailed
+// instantly on every fill.)
+const BAIL_DROP = 0.05;
 const RULE3_POLL_MS = 2000;
 // Rule 4: this close to the market end, no half-position may survive — the
 // cancel sweep only removes resting bids; it cannot flatten filled shares.
@@ -712,15 +717,19 @@ async function rule3Tick() {
     const resting = pair.legs[restingSide];
 
     if (!nearClose) {
-      // rule 2/3 boundary: keep waiting while completion still costs < $1.00
-      let sum = null;
+      // rule 2/3 boundary: keep waiting while the filled leg is healthy —
+      // its bid holding near our entry means nothing is wrong; the resting
+      // sibling may still fill at the posted price (observed live: sometimes
+      // minutes later). Only a real drop in the leg we HOLD means danger.
+      let bid = null;
       try {
-        const top = bookTop(await fetchJson(`${CLOB_API_HOST}/book?token_id=${resting.asset}`));
-        if (top.ask != null) sum = filled.price + top.ask;
+        const top = bookTop(await fetchJson(`${CLOB_API_HOST}/book?token_id=${filled.asset}`));
+        bid = top.bid;
       } catch {
         /* book unreadable this tick — try again next poll */
       }
-      if (sum == null || sum < BAIL_SUM - 1e-9) continue; // door still open
+      if (bid == null) continue;
+      if (bid > filled.price - BAIL_DROP + 1e-9) continue; // healthy: keep waiting
     }
 
     // exit: cancel first, confirm, then sell the lonely excess
@@ -728,7 +737,7 @@ async function rule3Tick() {
     pair.exitResting = restingSide;
     emitSignal({ type: "cancel-order", id: `${key}-${restingSide}` });
     log(
-      `[${pair.prefix}] ${pair.slug}: ${nearClose ? "market closing" : "completion door closed"} with ` +
+      `[${pair.prefix}] ${pair.slug}: ${nearClose ? "market closing" : `filled leg down ${Math.round(BAIL_DROP * 100)}c+`} with ` +
         `${filled.matched}/${resting.matched} fills — cancelling the ${restingSide} leg (exit step 1)`,
     );
   }
@@ -777,7 +786,7 @@ if (require.main === module) {
         rule3Busy = false;
       }
     }, RULE3_POLL_MS);
-    log(`rule 3 active: one-legged pairs wait while completable under $${BAIL_SUM.toFixed(2)}, then cancel-confirm-sell`);
+    log(`rule 3 active: one-legged pairs wait while the filled leg holds within ${Math.round(BAIL_DROP * 100)}c of entry; bail on a real drop or at T-${FORCE_EXIT_BEFORE_CLOSE_SEC}s`);
   }
 
   let busy = false;
