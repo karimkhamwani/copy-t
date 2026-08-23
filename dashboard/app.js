@@ -17,6 +17,8 @@ const BADGE_LABEL = {
   "min-skip": "MIN SKIP",
   "risk-skip": "RISK SKIP",
   "drift-skip": "DRIFT SKIP",
+  cancelled: "CANCELLED", // watchdog: never filled, order pulled — no loss
+  unwound: "SOLD BACK", // watchdog: filled one-legged, position sold back
 };
 
 function timeAgo(ms) {
@@ -168,6 +170,28 @@ function sourceCounts(copied) {
   return c;
 }
 
+/** One line of unwind detail for a pair-watchdog row: what filled, what was
+ * sold back, and the realized cost of getting flat. */
+function UnwindLine({ t }) {
+  const u = t.copy?.unwind;
+  if (!u) return null;
+  const price = t.copy?.price ?? t.theirPrice ?? 0;
+  const net = (u.proceeds || 0) - (u.filled || 0) * price;
+  const parts = [`filled ${u.filled}/${u.placed} sh`];
+  if (u.sold > 0) parts.push(`sold back ${u.sold} sh for $${(u.proceeds || 0).toFixed(2)}`);
+  else if (u.filled > 0) parts.push("kept (balanced)");
+  else parts.push("order cancelled clean");
+  return html`<div className="meta">
+    <span className="outcome">unwind</span>
+    <span>${parts.join(" · ")}</span>
+    ${u.sold > 0 &&
+    html`<span style=${{ color: net >= 0 ? "var(--green)" : "var(--orange)" }}>
+      net ${net >= 0 ? "+" : "−"}$${Math.abs(net).toFixed(2)}
+    </span>`}
+    <span>${timeAgo(u.at)}</span>
+  </div>`;
+}
+
 function CopiedTradeRow({ t, dup }) {
   const c = t.copy || {};
   const ok = t.status === "success";
@@ -184,7 +208,7 @@ function CopiedTradeRow({ t, dup }) {
             ${(c.mode || "?").toUpperCase()}
           </span>
           <${SourceBadge} source=${c.source} />
-          <${Badge} status=${ok ? "success" : "failed"} />
+          <${Badge} status=${ok ? "success" : t.status} />
           ${ok && html`<${ResultBadge} result=${t.result} copy=${c} />`}
           ${dup &&
           html`<span
@@ -216,6 +240,7 @@ function CopiedTradeRow({ t, dup }) {
         ${ok && c.txHashes && c.txHashes[0] &&
         html`<a href=${`https://polygonscan.com/tx/${c.txHashes[0]}`} target="_blank" rel="noreferrer">tx ↗</a>`}
       </div>
+      <${UnwindLine} t=${t} />
       ${!ok && c.error && html`<div className="err">${c.error}</div>`}
     </div>`;
 }

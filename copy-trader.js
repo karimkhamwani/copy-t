@@ -1380,6 +1380,211 @@ const localWallet = normalizeWallets([
 const localOrders = new Map(); // slug -> [orderIDs] resting from "post" signals
 const localWarm = new Map(); // tokenID -> { tickSize, negRisk }, from "prewarm" signals
 
+// ---------------------------------------------------------------------------
+// Pair-fill watchdog: a "post" pair that hasn't FULLY filled within
+// UPDOWN_UNWIND_SEC seconds is cancelled, and any one-legged exposure (one
+// side filled, the other didn't) is sold straight back at the best bid — a
+// small, known spread cost instead of an open directional bet on the last
+// minutes of a 5m market.
+// ---------------------------------------------------------------------------
+const UPDOWN_UNWIND_SEC = Number(process.env.UPDOWN_UNWIND_SEC ?? "30"); // 0 = off
+const pendingPairs = new Map(); // "slug-pN" -> { slug, legs: {up, down}, timer }
+
+/** Track one placed GTC leg of an updown pair; the first leg to register
+ * arms the pair's unwind timer. Signal ids look like "<slug>-p<n>-up". */
+function registerPairLeg(sig, orderID, size) {
+  if (!(UPDOWN_UNWIND_SEC > 0)) return;
+  const m = /^(.+-p\d+)-(up|down)$/.exec(sig.id || "");
+  if (!m) return;
+  const [, pairKey, side] = m;
+  let pair = pendingPairs.get(pairKey);
+  if (!pair) {
+    pair = { slug: sig.slug || "", legs: {}, timer: null };
+    pendingPairs.set(pairKey, pair);
+    // Deliberately NOT routed through serialize(): the watchdog makes several
+    // network round-trips (status reads, cancel, book, sell), and the serial
+    // queue is the buy path — parking there would delay the next pair's order.
+    // It only touches the journal (sync writes) and pendingPairs, never the
+    // seen set or risk gate, so running alongside the queue is race-free.
+    pair.timer = setTimeout(() => {
+      checkPairFill(pairKey).catch((err) =>
+        log(`[unwind] ${pairKey}: watchdog error:`, err.message || err),
+      );
+    }, UPDOWN_UNWIND_SEC * 1000);
+    pair.timer.unref?.();
+  }
+  pair.legs[side] = {
+    orderID,
+    tokenID: sig.asset,
+    outcome: sig.outcome || side,
+    size,
+    price: Number(sig.price),
+    key: `${sig.id}:${sig.asset}`, // journal id (tradeKey of the local trade)
+  };
+}
+
+/** Rewrite a leg's journal entry to what ACTUALLY happened at unwind time:
+ * shares kept, net USDC spent (fill cost minus sell-back proceeds), and the
+ * unwind details. A leg with nothing kept leaves the success pipeline —
+ * "cancelled" (never filled) or "unwound" (filled, sold back) — so the risk
+ * gate, active-$ and win/loss stats all see the true position. */
+function journalUnwindLeg(leg, matched, sold, proceeds) {
+  if (!leg) return;
+  const e = journal.find((x) => x.id === leg.key);
+  if (!e || !e.copy) return;
+  const kept = Math.max(0, Number((matched - sold).toFixed(2)));
+  const netSpent = Math.max(0, Number((matched * leg.price - proceeds).toFixed(6)));
+  const patch = {
+    copy: {
+      ...e.copy,
+      shares: kept,
+      spentUsdc: netSpent,
+      unwind: {
+        at: Date.now(),
+        placed: leg.size,
+        filled: matched,
+        sold: Number(sold.toFixed(2)),
+        proceeds: Number(proceeds.toFixed(6)),
+      },
+    },
+  };
+  if (kept < 0.01) patch.status = matched > 0.009 ? "unwound" : "cancelled";
+  journalUpdate(leg.key, patch);
+}
+
+/** Final matched size of an order, capped at what we placed; null = unknown
+ * (never sell on a guess). */
+async function readMatched(client, leg) {
+  if (!leg) return 0;
+  try {
+    const o = await client.getOrder(leg.orderID);
+    return Math.min(Number(o?.size_matched) || 0, leg.size);
+  } catch {
+    return null;
+  }
+}
+
+async function checkPairFill(pairKey) {
+  const pair = pendingPairs.get(pairKey);
+  pendingPairs.delete(pairKey);
+  if (!pair) return;
+  const upLeg = pair.legs.up;
+  const downLeg = pair.legs.down;
+  const client = await getClobClient();
+
+  let [upFilled, downFilled] = await Promise.all([
+    readMatched(client, upLeg),
+    readMatched(client, downLeg),
+  ]);
+  const full = (leg, m) => !leg || (m != null && m >= leg.size - 1e-9);
+  if (upLeg && downLeg && full(upLeg, upFilled) && full(downLeg, downFilled)) {
+    log(`[unwind] ${pairKey}: both legs filled within ${UPDOWN_UNWIND_SEC}s — profit locked, nothing to do`);
+    return;
+  }
+
+  // cancel whatever is still resting (cancelling a filled order is a no-op)
+  const ids = [upLeg, downLeg].filter(Boolean).map((l) => l.orderID);
+  try {
+    await client.cancelOrders(ids);
+    log(`[unwind] ${pairKey}: not fully filled after ${UPDOWN_UNWIND_SEC}s — cancelled resting orders`);
+  } catch (err) {
+    log(`[unwind] ${pairKey}: cancel failed:`, err.message || err);
+  }
+
+  // re-read AFTER the cancel — a fill can race the cancel, and the final
+  // matched sizes decide how much exposure must be sold back
+  [upFilled, downFilled] = await Promise.all([
+    readMatched(client, upLeg),
+    readMatched(client, downLeg),
+  ]);
+  if (upFilled == null || downFilled == null) {
+    log(`[unwind] ${pairKey}: could not read final fill sizes — auto-sell skipped, check the position manually`);
+    return;
+  }
+
+  // matched Up+Down pairs pay $1 either way — only the imbalance is exposure
+  const excess = Number((upFilled - downFilled).toFixed(2));
+  if (Math.abs(excess) < 0.01) {
+    if (upFilled > 0) {
+      log(`[unwind] ${pairKey}: legs filled evenly (${upFilled} Up / ${downFilled} Down) — balanced, nothing to sell`);
+    } else {
+      log(`[unwind] ${pairKey}: nothing filled — cancelled clean, no loss`);
+    }
+    journalUnwindLeg(upLeg, upFilled, 0, 0);
+    journalUnwindLeg(downLeg, downFilled, 0, 0);
+    writeStatus();
+    return;
+  }
+  const leg = excess > 0 ? upLeg : downLeg;
+  const qty = Math.abs(excess);
+  log(
+    `[unwind] ${pairKey}: one-legged fill — Up ${upFilled}/${upLeg?.size ?? 0}, ` +
+      `Down ${downFilled}/${downLeg?.size ?? 0} — selling ${qty} ${leg.outcome} back`,
+  );
+  const { sold, proceeds } = await sellBack(leg.tokenID, leg.outcome, qty, pairKey);
+  journalUnwindLeg(upLeg, upFilled, excess > 0 ? sold : 0, excess > 0 ? proceeds : 0);
+  journalUnwindLeg(downLeg, downFilled, excess < 0 ? sold : 0, excess < 0 ? proceeds : 0);
+  writeStatus();
+}
+
+/** Sell `shares` of a token at the best bid (FAK: fill what's there, kill the
+ * rest). Retries with a fresh bid on partial fills; anything unsellable
+ * (no bids, or under the $1 marketable minimum) rides to resolution.
+ * Returns { sold, proceeds } — total shares sold and USDC received. */
+async function sellBack(tokenID, outcome, shares, tag) {
+  const client = await getClobClient();
+  const total = { sold: 0, proceeds: 0 };
+  let remaining = shares;
+  for (let attempt = 1; attempt <= 3 && remaining >= 0.01; attempt++) {
+    let bid = null;
+    try {
+      const book = await getJson(`${CLOB_API_HOST}/book?token_id=${tokenID}`);
+      const bids = (book?.bids || []).map((l) => Number(l.price)).filter(Number.isFinite);
+      bid = bids.length ? Math.max(...bids) : null;
+    } catch {
+      /* fall through to the no-bid handling */
+    }
+    if (bid == null) {
+      log(`[unwind] ${tag}: no bids on ${outcome} — cannot sell, riding to resolution`);
+      return total;
+    }
+    if (bid * remaining < 1) {
+      log(`[unwind] ${tag}: ${remaining} sh @ ${bid} is under the $1 marketable minimum — riding to resolution`);
+      return total;
+    }
+    try {
+      const order = await client.createOrder(
+        { tokenID, price: bid, side: client._Side.SELL, size: remaining },
+        localWarm.get(tokenID),
+      );
+      const resp = await client.postOrder(order, client._OrderType.FAK);
+      if (!resp || resp.error || resp.success === false)
+        throw new Error(resp?.error || resp?.errorMsg || "unknown");
+      // SELL: makingAmount = shares given up, takingAmount = USDC received
+      const sold = Number(resp.makingAmount);
+      const got = Number(resp.takingAmount);
+      const soldShares = Number.isFinite(sold) && sold > 0 ? Math.min(sold, remaining) : 0;
+      if (soldShares > 0) {
+        total.sold += soldShares;
+        // proceeds: prefer the exchange-reported USDC, fall back to bid price
+        total.proceeds += Number.isFinite(got) && got > 0 ? got : soldShares * bid;
+        log(
+          `[unwind] ${tag}: sold ${soldShares} ${outcome} @ ~${bid}` +
+            (Number.isFinite(got) && got > 0 ? ` for $${got.toFixed(2)}` : ""),
+        );
+      } else {
+        log(`[unwind] ${tag}: FAK sell filled nothing (book moved) — retrying`);
+      }
+      remaining = Number((remaining - soldShares).toFixed(2));
+    } catch (err) {
+      log(`[unwind] ${tag}: sell attempt ${attempt} failed:`, err.message || err);
+    }
+  }
+  if (remaining >= 0.01)
+    log(`[unwind] ${tag}: ${remaining} ${outcome} still unsold after retries — riding to resolution`);
+  return total;
+}
+
 /** Resolve tick-size/neg-risk for signal tokens ahead of the first order, so
  * placing it costs one postOrder round-trip instead of three lookups. */
 async function prewarmLocalTokens(assets) {
@@ -1517,6 +1722,7 @@ async function handleLocalSignal(sig, state) {
       const ids = localOrders.get(trade.slug) || [];
       ids.push(resp.orderID);
       localOrders.set(trade.slug, ids);
+      registerPairLeg(sig, resp.orderID, size);
     }
     journalUpdate(key, {
       status: "success",
