@@ -35,6 +35,11 @@ const {
   UPDOWN_TOTAL_COST = "0.98", // target Up+Down combined bid (must be < 1.00)
   UPDOWN_TAKE_SUM = "0.99", // instant-arb: if askUp+askDown <= this, take both asks immediately (must be < 1.00)
   UPDOWN_CANCEL_BEFORE_CLOSE_SEC = "30",
+  // Pair-fill watchdog policy (signal mode): this many seconds after posting
+  // a pair, tell the copier to flatten it — cancel what still rests and sell
+  // back any one-legged fill. The DECISION (when/whether) lives here; the
+  // copier only executes it, since the orders rest under its wallet. 0 = off.
+  UPDOWN_UNWIND_SEC = "30",
   UPDOWN_JOURNAL_FILE = path.join(__dirname, "updown-journal.json"),
   // BOT_SIGNALS (shared with copy-trader.js): 1 = emit trades as signals for
   // the copier to execute; 0 = this bot places its own orders directly.
@@ -55,6 +60,7 @@ const entryEnd = Number(UPDOWN_ENTRY_END_SEC);
 const totalCost = Number(UPDOWN_TOTAL_COST);
 const cancelBefore = Number(UPDOWN_CANCEL_BEFORE_CLOSE_SEC);
 const takeSum = Number(UPDOWN_TAKE_SUM);
+const unwindSec = Number(UPDOWN_UNWIND_SEC);
 const signalMode = BOT_SIGNALS === "1" || BOT_SIGNALS.toLowerCase() === "true";
 
 function log(...args) {
@@ -274,6 +280,21 @@ function emitPairSignals(st, pair, kind) {
     `[${st.prefix}] pair ${pair.n} ${kind.toUpperCase()} -> signals emitted: ` +
       `${pair.shares} Up @ ${pair.up} + ${pair.shares} Down @ ${pair.down} (sum ${pair.sum})`,
   );
+  // Watchdog policy: a posted pair that isn't fully filled in unwindSec is a
+  // legging risk, not an arb — tell the copier to flatten it (cancel the rest,
+  // sell back any one-legged fill). Takes never rest, so only posts get one.
+  if (kind === "post" && unwindSec > 0) {
+    const t = setTimeout(() => {
+      emitSignal({
+        type: "unwind",
+        slug: st.slug,
+        pair: pair.n,
+        timestamp: Math.floor(Date.now() / 1000),
+      });
+      log(`[${st.prefix}] pair ${pair.n} unwind signal emitted (+${unwindSec}s after post)`);
+    }, unwindSec * 1000);
+    t.unref?.();
+  }
 }
 
 /** Warm everything slow once, off the hot path: API creds, version cache,
