@@ -35,13 +35,6 @@ const {
   UPDOWN_TOTAL_COST = "0.98", // target Up+Down combined bid (must be < 1.00)
   UPDOWN_TAKE_SUM = "0.99", // instant-arb: if askUp+askDown <= this, take both asks immediately (must be < 1.00)
   UPDOWN_CANCEL_BEFORE_CLOSE_SEC = "30",
-  // Leg guard: watches whether both legs of a market actually filled and, when
-  // only one did, completes it instead of letting the position ride one-sided.
-  // 0 = observe and journal only (no rescue is ever sent); 1 = let it act.
-  UPDOWN_HEDGE = "0",
-  UPDOWN_HEDGE_GRACE_MS = "1500", // how long a still-live leg gets before we cross
-  UPDOWN_MAX_COMPLETE_SUM = "1.00", // paid + completion ask ceiling (1.00 = break even)
-  UPDOWN_PAIR_POLL_MS = "500", // fill-state refresh cadence per market
   UPDOWN_JOURNAL_FILE = path.join(__dirname, "updown-journal.json"),
   // BOT_SIGNALS (shared with copy-trader.js): 1 = emit trades as signals for
   // the copier to execute; 0 = this bot places its own orders directly.
@@ -63,7 +56,6 @@ const totalCost = Number(UPDOWN_TOTAL_COST);
 const cancelBefore = Number(UPDOWN_CANCEL_BEFORE_CLOSE_SEC);
 const takeSum = Number(UPDOWN_TAKE_SUM);
 const signalMode = BOT_SIGNALS === "1" || BOT_SIGNALS.toLowerCase() === "true";
-const hedgeEnabled = UPDOWN_HEDGE === "1" || UPDOWN_HEDGE.toLowerCase() === "true";
 
 function log(...args) {
   console.log(new Date().toISOString(), ...args);
@@ -244,24 +236,6 @@ function connectSignalSocket() {
     sigSockOk = true;
     log("signal socket connected (sub-ms delivery to copy-trader)");
   });
-  // The copier replies down the same socket with what became of each signal —
-  // which exchange order it turned into, or why it never got placed. That is
-  // the only way this process can tell its own legs from an unrelated copy of
-  // somebody else's trade in the very same market.
-  let rbuf = "";
-  s.on("data", (d) => {
-    rbuf += d;
-    const lines = rbuf.split("\n");
-    rbuf = lines.pop();
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        guardOnReply(JSON.parse(line));
-      } catch {
-        /* a malformed reply must never take the bot down */
-      }
-    }
-  });
   s.on("error", () => {});
   s.on("close", () => {
     sigSockOk = false;
@@ -302,585 +276,10 @@ function emitPairSignals(st, pair, kind) {
   );
 }
 
-// ---------------------------------------------------------------------------
-// Leg guard
-//
-// Rescues travel the same road as every other trade this bot makes: in signal
-// mode they go out over the existing unix socket and copy-trader executes them
-// under its own wallet and journal; in direct mode this process places them
-// itself. The guard never talks to the exchange to trade — only to read fills.
-// ---------------------------------------------------------------------------
-
-const guardCfg = {
-  act: hedgeEnabled,
-  pollMs: Number(UPDOWN_PAIR_POLL_MS) || 500, // fill-state refresh per market
-  graceMs: Number(UPDOWN_HEDGE_GRACE_MS), // grace for a leg that can still fill
-  graceSkipTicks: 2, // ask this far past our bid = stranded, don't wait
-  maxCompleteSum: Number(UPDOWN_MAX_COMPLETE_SUM),
-  minNotional: 1, // exchange minimum on a marketable order
-  maxAttempts: 3, // rescues one market may send
-  retryMs: 1000, // after a hold, how long before looking again
-  cancelSettleMs: 150, // let the cancel land before re-reading fills
-};
-
-const guardMarkets = new Map(); // slug -> guarded market
-const guardStats = { legged: 0, balanced: 0, rescued: 0, naked: 0 };
-
-/** Deliver one guard action. Signal mode hands it to the copier over the same
- * socket every other trade uses; direct mode places it here. Fire-and-forget:
- * the guard must never block the bot's tick. */
-function guardSend(msg) {
-  if (signalMode) return emitSignal(msg);
-  if (isDryRun) {
-    log(
-      `[DRY_RUN] guard would ` +
-        (msg.type === "cancel" ? `cancel ${msg.slug}` : `take ${msg.size} sh @ ${msg.price}`),
-    );
-    return;
-  }
-  (async () => {
-    try {
-      const st = [...states.values()].find((s) => s.slug === msg.slug);
-      if (msg.type === "cancel") {
-        if (st?.orderIds?.length) (await getClobClient()).cancelOrders(st.orderIds);
-        return;
-      }
-      const warm = msg.asset === st?.market?.upToken ? st?.warm?.up : st?.warm?.down;
-      await placeLimitBuy(msg.asset, msg.price, msg.size, warm, "FAK");
-    } catch (err) {
-      log(`guard send failed (${msg.type}): ${err.message}`);
-    }
-  })();
-}
-
-// Book reads are cached briefly and de-duplicated: the guard runs on the same
-// 150ms scheduler that places pairs, so it must never add latency there.
-const guardBooks = new Map(); // tokenID -> { at, top, inflight }
-async function guardTop(tokenID, { fresh = false } = {}) {
-  const hit = guardBooks.get(tokenID);
-  if (!fresh && hit) {
-    if (hit.inflight) return hit.inflight;
-    if (Date.now() - hit.at < 200) return hit.top;
-  }
-  const inflight = fetchJson(`${CLOB_API_HOST}/book?token_id=${tokenID}`).then((b) => {
-    const top = bookTop(b);
-    guardBooks.set(tokenID, { at: Date.now(), top, inflight: null });
-    return top;
-  });
-  guardBooks.set(tokenID, { at: hit?.at || 0, top: hit?.top, inflight });
-  try {
-    return await inflight;
-  } catch (err) {
-    guardBooks.set(tokenID, { at: 0, top: hit?.top, inflight: null });
-    throw err;
-  }
-}
-
-/** The copier's answer to one of our signals: the exchange order it became, or
- * why it never got placed. A leg that was skipped can never fill, which leaves
- * the market exactly as one-sided as a leg that simply did not — so both are
- * recorded the same way. */
-function guardOnReply(msg) {
-  if (msg?.type === "cancelled") {
-    for (const m of guardMarkets.values()) {
-      for (const leg of m.legs.values()) {
-        if (msg.orderIds?.includes(leg.orderID)) leg.cancelled = true;
-      }
-    }
-    return;
-  }
-  if (msg?.type !== "placed" || !msg.id) return;
-  for (const m of guardMarkets.values()) {
-    const leg = m.legs.get(msg.id);
-    if (!leg) continue;
-    if (!msg.placed) {
-      leg.placed = false;
-      leg.done = true;
-      leg.reason = msg.reason || "skipped";
-      log(`[guard ${m.slug}] leg ${leg.side.toUpperCase()} was not placed (${leg.reason})`);
-      return;
-    }
-    leg.orderID = msg.orderID || null;
-    leg.orderType = msg.orderType || "GTC";
-    if (msg.size) leg.size = Number(msg.size); // the copier may have resized it
-    // a FAK never rests: whatever it matched at submission is all it will ever
-    // match, so that number is final
-    if (leg.orderType === "FAK") {
-      leg.filled = Number(msg.filled) || 0;
-      leg.done = true;
-    }
-    if (msg.dryRun || !leg.orderID) leg.done = true;
-    return;
-  }
-}
-
-// One batched open-orders call per refresh covers every leg of every market
-// being watched, instead of one request per leg. Single-flighted so a slow
-// response cannot stack up behind the bot's 150ms tick.
-let guardOpenSnap = { at: 0, byId: new Map(), inflight: null };
-async function guardOpenOrders({ fresh = false } = {}) {
-  if (guardOpenSnap.inflight) return guardOpenSnap.inflight;
-  if (!fresh && Date.now() - guardOpenSnap.at < guardCfg.pollMs) return guardOpenSnap.byId;
-  const inflight = (async () => {
-    // guardCfg.readOrders is an injection point for tests; live it is the CLOB
-    const rows = guardCfg.readOrders
-      ? await guardCfg.readOrders()
-      : await (await getClobClient()).getOpenOrders();
-    const byId = new Map((rows || []).map((o) => [String(o.id), o]));
-    guardOpenSnap = { at: Date.now(), byId, inflight: null };
-    return byId;
-  })();
-  guardOpenSnap.inflight = inflight;
-  try {
-    return await inflight;
-  } catch {
-    guardOpenSnap = { at: Date.now(), byId: guardOpenSnap.byId, inflight: null };
-    return guardOpenSnap.byId; // keep the last snapshot rather than stalling
-  }
-}
-
-/**
- * Refresh how much of each leg has filled, reading the orders this strategy
- * actually owns rather than every trade in the market. That distinction
- * matters: the copier also copies other wallets into these same 5m markets, and
- * those trades are indistinguishable from our legs at the market level.
- */
-async function guardReadFills(m, { fresh = false } = {}) {
-  if (!fresh && Date.now() - m.lastPoll < guardCfg.pollMs) return;
-  m.lastPoll = Date.now();
-  if (isDryRun) return guardSimulateFills(m);
-  try {
-    const open = await guardOpenOrders({ fresh });
-    for (const leg of m.legs.values()) {
-      if (leg.done || !leg.orderID) continue;
-      const row = open.get(String(leg.orderID));
-      if (row) {
-        const matched = Number(row.size_matched);
-        if (Number.isFinite(matched)) leg.filled = matched;
-        if (leg.filled >= leg.size - 1e-9) leg.done = true;
-        continue;
-      }
-      // gone from the open set means filled, cancelled or expired — one
-      // targeted read settles which, once per order rather than once per tick
-      try {
-        const o = await (await getClobClient()).getOrder(leg.orderID);
-        const matched = Number(o?.size_matched);
-        if (Number.isFinite(matched)) leg.filled = matched;
-      } catch {
-        /* a cancelled order can 404 — keep the last reading */
-      }
-      leg.done = true;
-    }
-    guardTotalFills(m);
-  } catch (err) {
-    log(`[guard ${m.slug}] fill read failed: ${err.message}`);
-  }
-}
-
-/** Roll the per-leg fills up into the market's two sides. The price used is
- * each leg's limit, which for a buy is the most it could have paid — so the
- * completion budget derived from it is conservative, never optimistic. */
-function guardTotalFills(m) {
-  for (const side of ["up", "down"]) {
-    let shares = 0;
-    let cost = 0;
-    for (const leg of m.legs.values()) {
-      if (leg.side !== side || !(leg.filled > 0)) continue;
-      shares += leg.filled;
-      cost += leg.filled * leg.price;
-    }
-    m.filled[side] = round2(shares);
-    m.vwap[side] = shares > 0 ? cost / shares : 0;
-  }
-}
-
-/** Dry run has no real fills, so treat a quoted bid as filled once the best ask
- * reaches it — exactly when a seller would have crossed into it. Enough to
- * exercise this whole path on paper. */
-async function guardSimulateFills(m) {
-  for (const leg of m.legs.values()) {
-    if (leg.done || !leg.size) continue;
-    try {
-      const top = await guardTop(leg.side === "up" ? m.upToken : m.downToken);
-      if (top.ask != null && top.ask <= leg.price + 1e-9) {
-        leg.filled = leg.size;
-        leg.done = true;
-      }
-    } catch {
-      /* keep the last reading */
-    }
-  }
-  guardTotalFills(m);
-}
-
-/** Record the guard's verdict on the market's existing journal entry. */
-function journalGuard(slug, patch) {
-  // The bot writes its own market entry via setImmediate, so the guard can
-  // reach here first. Start a stub rather than dropping the verdict — a
-  // silently lost observation is worse than an entry with no pairs on it yet.
-  let e = journal.find((x) => x.slug === slug);
-  if (!e) {
-    e = { slug, pairs: [] };
-    journal.unshift(e);
-  }
-  e.guard = { ...(e.guard || {}), ...patch, at: Date.now() };
-  setImmediate(() => journalMarket(e));
-}
-
-/** Start watching a market once a pair is committed to it. Each leg is keyed by
- * the id the signal carried, which is how the copier's reply finds it again. */
-function guardTrackPair(st, pair) {
-  let m = guardMarkets.get(st.slug);
-  if (!m) {
-    m = {
-      slug: st.slug,
-      title: st.market.title || st.slug,
-      conditionId: st.market.conditionId,
-      upToken: st.market.upToken,
-      downToken: st.market.downToken,
-      // real tick size where the prewarm resolved it, 1c otherwise — a market
-      // on a finer tick would otherwise be misjudged as stranded
-      tick: Number(st.warm?.up?.tickSize) || Number(st.warm?.down?.tickSize) || 0.01,
-      legs: new Map(), // signal id -> leg
-      filled: { up: 0, down: 0 },
-      vwap: { up: 0, down: 0 },
-      leggedSince: null,
-      graceMs: guardCfg.graceMs,
-      attempts: 0,
-      status: "open",
-      busy: false,
-      lastPoll: 0,
-      trackedAt: Date.now(),
-    };
-    guardMarkets.set(st.slug, m);
-  }
-  for (const side of ["up", "down"]) {
-    const id = `${st.slug}-p${pair.n}-${side}`;
-    m.legs.set(id, {
-      id,
-      side,
-      price: pair[side],
-      size: pair.shares,
-      // direct mode gets its order ids straight back from the exchange; signal
-      // mode fills them in when the copier replies
-      orderID: signalMode ? null : pair.orderIds?.[side === "up" ? 0 : 1] || null,
-      orderType: pair.kind === "take" ? "FAK" : "GTC",
-      filled: 0,
-      done: false,
-      placed: true,
-      cancelled: false,
-    });
-  }
-}
-
-/** The still-resting leg on one side, if any — what a rescue would cancel. */
-function guardRestingLegs(m, side) {
-  return [...m.legs.values()].filter(
-    (l) => l.side === side && l.placed && !l.done && !l.cancelled && l.orderID,
-  );
-}
-
-/** How long the lagging leg gets before we cross for it. Waiting only helps
- * while the leg is still plausibly fillable; once the market has walked past
- * our bid the order is stranded, and every extra second is the filled side
- * sliding further out of the money. */
-async function guardGrace(m, shortSide) {
-  const resting = guardRestingLegs(m, shortSide);
-  if (!resting.length) return 0; // nothing is on the book — waiting cannot help
-  const quoted = Math.max(...resting.map((l) => l.price));
-  try {
-    const top = await guardTop(shortSide === "up" ? m.upToken : m.downToken);
-    if (top.ask != null && top.ask - quoted > guardCfg.graceSkipTicks * m.tick + 1e-9) {
-      log(`[guard ${m.slug}] ${shortSide.toUpperCase()} bid ${quoted} is stranded (ask ${top.ask}) — not waiting`);
-      return 0;
-    }
-  } catch {
-    /* fall through to the normal grace */
-  }
-  return guardCfg.graceMs;
-}
-
-/** Could not act this round: stay one-sided but keep watching. The resting leg
- * may still fill, or the ask may come back inside budget. Holding costs
- * nothing, so it never burns a rescue attempt. */
-function guardHold(m, patch) {
-  m.leggedSince = Date.now();
-  m.graceMs = guardCfg.retryMs;
-  if (patch) journalGuard(m.slug, patch);
-}
-
-async function guardRescue(m) {
-  const longSide = m.filled.up > m.filled.down ? "up" : "down";
-  const shortSide = longSide === "up" ? "down" : "up";
-  const shortToken = shortSide === "up" ? m.upToken : m.downToken;
-  let need = round2(Math.abs(m.filled.up - m.filled.down));
-  const paid = m.vwap[longSide];
-  if (!(paid > 0)) return; // nothing actually filled yet — nothing to rescue
-  const exposure = round2(need * paid);
-
-  if (!m.leggedCounted) {
-    m.leggedCounted = true;
-    guardStats.legged++;
-    log(
-      `[guard ${m.slug}] LEGGED: ${round2(m.filled[longSide])} sh ${longSide.toUpperCase()} @ ~${round2(paid)}, ` +
-        `${shortSide.toUpperCase()} short ${need} sh ($${exposure.toFixed(2)} one-sided)`,
-    );
-  }
-
-  const budget = round2(guardCfg.maxCompleteSum - paid);
-  let top = null;
-  try {
-    top = await guardTop(shortToken, { fresh: true });
-  } catch {
-    /* reported below */
-  }
-  const ask = top?.ask ?? null;
-  const pairSum = ask != null ? round2(paid + ask) : null;
-  const cost = ask != null ? round2((paid + ask - 1) * need) : null;
-
-  // Observe mode: price the rescue, record it, send nothing. This is how you
-  // get legged-rate and rescue-cost numbers before letting it trade.
-  if (!guardCfg.act) {
-    if (!m.observed) {
-      m.observed = true;
-      log(
-        `[guard ${m.slug}] OBSERVED (UPDOWN_HEDGE=0)` +
-          (ask != null
-            ? `: completing at ${ask} would make the pair ${pairSum} — ` +
-              (cost > 0 ? `cost $${cost.toFixed(2)}` : `still +$${Math.abs(cost).toFixed(2)}`)
-            : ": no ask available to price the completion"),
-      );
-      journalGuard(m.slug, {
-        outcome: "legged-observed",
-        leggedSide: longSide,
-        leggedShares: need,
-        exposureUsdc: exposure,
-        ask,
-        pairSum,
-        wouldCostUsdc: cost,
-      });
-    }
-    guardHold(m);
-    return;
-  }
-
-  // Decide BEFORE touching the resting order. The leg still on the book is the
-  // cheapest completion available — it fills at our original price, better than
-  // any ask we could cross. Cancelling it and then failing to complete would
-  // throw that option away for nothing, so the cancel only happens on the path
-  // that actually places the rescue.
-  if (ask == null || ask > budget + 1e-9) {
-    log(
-      `[guard ${m.slug}] CANNOT COMPLETE: ask ${ask ?? "n/a"} is above the ${budget.toFixed(2)} budget ` +
-        `(paid ${round2(paid)}, ceiling ${guardCfg.maxCompleteSum}) — holding ${need} sh ` +
-        `${longSide.toUpperCase()} ($${exposure.toFixed(2)} at risk), resting leg left in place`,
-    );
-    guardHold(m, { outcome: "held-expensive", leggedSide: longSide, leggedShares: need, exposureUsdc: exposure, ask });
-    return;
-  }
-
-  // A rescue under the $1 exchange minimum cannot be sent at all. Buying a few
-  // shares more clears it and leaves the surplus on the CHEAP side — worth it
-  // whenever that surplus risks less than the naked position it replaces.
-  const sizeFor = (shortfall) => {
-    if (ask * shortfall >= guardCfg.minNotional) return { size: shortfall };
-    const bumped = round2(Math.ceil((guardCfg.minNotional / ask) * 100) / 100);
-    const surplusRisk = (bumped - shortfall) * ask;
-    if (surplusRisk >= round2(shortfall * paid)) return { size: 0, surplusRisk };
-    return { size: bumped, bumpedFrom: shortfall, surplusRisk };
-  };
-
-  let sized = sizeFor(need);
-  if (!sized.size) {
-    log(
-      `[guard ${m.slug}] rescue of ${need} sh @ ${ask} is $${(ask * need).toFixed(2)}, under the ` +
-        `$${guardCfg.minNotional} minimum and rounding up would risk more than holding`,
-    );
-    guardHold(m, { outcome: "held-dust", leggedSide: longSide, leggedShares: need, exposureUsdc: exposure });
-    return;
-  }
-
-  if (m.attempts++ >= guardCfg.maxAttempts) {
-    m.status = "naked";
-    guardStats.naked++;
-    log(`[guard ${m.slug}] giving up after ${guardCfg.maxAttempts} rescue attempts`);
-    journalGuard(m.slug, { outcome: "naked", leggedSide: longSide, leggedShares: need, exposureUsdc: exposure });
-    return;
-  }
-
-  // 1. Cancel what is still resting BEFORE crossing, so the old leg cannot fill
-  //    alongside the rescue and leave us long twice on one side. Only the
-  //    lagging side's orders are named — other pairs in this market may be
-  //    perfectly healthy, and a blanket cancel would take them out too.
-  const resting = guardRestingLegs(m, shortSide);
-  if (resting.length) {
-    guardSend({ type: "cancel", slug: m.slug, orderIds: resting.map((l) => l.orderID) });
-    for (const l of resting) l.cancelled = true;
-  }
-
-  // 2. re-read fills — the cancel may have raced a fill, and the rescue has to
-  //    be sized off what is actually held, not what we believed a moment ago
-  await new Promise((r) => setTimeout(r, guardCfg.cancelSettleMs));
-  await guardReadFills(m, { fresh: true });
-  need = round2(Math.abs(m.filled.up - m.filled.down));
-  if (need <= 0) {
-    log(`[guard ${m.slug}] filled during the cancel — market is balanced`);
-    m.status = "balanced";
-    guardStats.balanced++;
-    journalGuard(m.slug, { outcome: "balanced" });
-    return;
-  }
-  sized = sizeFor(need); // the shortfall may have shrunk while the cancel landed
-  if (!sized.size) {
-    log(`[guard ${m.slug}] shortfall shrank to ${need} sh — now under the $${guardCfg.minNotional} minimum, holding`);
-    guardHold(m, { outcome: "held-dust", leggedSide: longSide, leggedShares: need });
-    return;
-  }
-  if (sized.bumpedFrom != null) {
-    log(
-      `[guard ${m.slug}] rescue notional $${(ask * need).toFixed(2)} is under the ` +
-        `$${guardCfg.minNotional} minimum — taking ${sized.size} sh instead ` +
-        `($${sized.surplusRisk.toFixed(2)} surplus risk vs $${exposure.toFixed(2)} naked)`,
-    );
-  }
-
-  // 3. complete by taking the other side, never paying past the budget
-  const limit = round2(Math.floor(budget * 100) / 100);
-  const rescueId = `${m.slug}-rescue${m.attempts}-${shortSide}`;
-  // track the rescue as a leg of its own so its fill counts toward the market
-  m.legs.set(rescueId, {
-    id: rescueId,
-    side: shortSide,
-    price: limit,
-    size: sized.size,
-    orderID: null,
-    orderType: "FAK",
-    filled: 0,
-    done: false,
-    placed: true,
-    cancelled: false,
-  });
-  guardSend({
-    type: "buy",
-    kind: "take", // copy-trader turns a take into a FAK
-    hedge: true, // exempt from the per-bet cap, risk gate and MAX_TRADES
-    id: rescueId,
-    slug: m.slug,
-    conditionId: m.conditionId,
-    title: m.title,
-    asset: shortToken,
-    outcome: shortSide === "up" ? "Up" : "Down",
-    outcomeIndex: shortSide === "up" ? 0 : 1,
-    price: limit,
-    size: sized.size,
-    timestamp: Math.floor(Date.now() / 1000),
-  });
-  guardStats.rescued++;
-  log(
-    `[guard ${m.slug}] RESCUE SENT: take ${sized.size} sh ${shortSide.toUpperCase()} up to ${limit} ` +
-      `(ask ${ask}, pair sum ~${pairSum}, ` +
-      `${cost > 0 ? `locks $${cost.toFixed(2)} loss` : `keeps $${Math.abs(cost).toFixed(2)} profit`})`,
-  );
-  journalGuard(m.slug, { outcome: "rescue-sent", rescueSide: shortSide, rescueShares: sized.size, ask, pairSum, costUsdc: cost });
-
-  // A FAK is not a promise. It can match nothing at all if the ask moves in the
-  // moment between reading the book and the order landing, so the market stays
-  // under watch: the next pass confirms it actually balanced, and retries while
-  // attempts remain if it did not.
-  guardHold(m);
-}
-
-/** Driven by the bot's existing 150ms scheduler — no second timer. Reads are
- * throttled and cached, so an idle market costs a map lookup. */
-async function guardTick(st) {
-  const m = guardMarkets.get(st.slug);
-  if (!m || m.status !== "open" || m.busy) return;
-  m.busy = true;
-  try {
-    // Replies only travel the socket. If the copier is delivering via the ndjson
-    // fallback instead, no leg ever learns its order id and the guard quietly
-    // watches nothing — safe, but not protection. Say so once rather than
-    // leaving it silent.
-    if (!m.warnedNoIds && Date.now() - m.trackedAt > 5000) {
-      m.warnedNoIds = true;
-      if (signalMode && ![...m.legs.values()].some((l) => l.orderID || l.placed === false)) {
-        log(
-          `[guard ${m.slug}] no order ids came back from the copier — the signal socket ` +
-            `is probably down, so legs cannot be watched for this market`,
-        );
-      }
-    }
-    await guardReadFills(m);
-    const imbalance = round2(Math.abs(m.filled.up - m.filled.down));
-    const anyFill = m.filled.up > 0 || m.filled.down > 0;
-
-    if (anyFill && imbalance < 1e-9) {
-      m.status = "balanced";
-      guardStats.balanced++;
-      const sum = round2(m.vwap.up + m.vwap.down);
-      log(
-        `[guard ${m.slug}] BALANCED: ${round2(m.filled.up)} sh each side at a combined ${sum} ` +
-          `(locked $${round2((1 - sum) * m.filled.up).toFixed(2)})`,
-      );
-      journalGuard(m.slug, { outcome: "balanced", pairSum: sum, edgeUsdc: round2((1 - sum) * m.filled.up) });
-      return;
-    }
-    if (!anyFill) return;
-
-    // the clock starts at the FIRST fill, not when the pair was placed — a pair
-    // can rest for minutes before anything touches it
-    if (m.leggedSince == null) {
-      m.leggedSince = Date.now();
-      m.graceMs = await guardGrace(m, m.filled.up > m.filled.down ? "down" : "up");
-      if (m.graceMs > 0)
-        log(`[guard ${m.slug}] one-sided — giving the resting leg ${m.graceMs}ms to fill`);
-    }
-    if (Date.now() - m.leggedSince < m.graceMs) return;
-    await guardRescue(m);
-  } catch (err) {
-    log(`[guard ${st.slug}] tick error: ${err.message}`);
-  } finally {
-    m.busy = false;
-  }
-}
-
-/** Window closing: record how the market actually ended and stop watching. */
-function guardCloseMarket(slug) {
-  const m = guardMarkets.get(slug);
-  if (!m) return;
-  if (m.status === "open") {
-    const imbalance = round2(Math.abs(m.filled.up - m.filled.down));
-    const outcome = imbalance > 0 ? "naked" : m.filled.up > 0 ? "balanced" : "unfilled";
-    if (outcome === "naked") guardStats.naked++;
-    if (outcome === "balanced") guardStats.balanced++;
-    journalGuard(slug, {
-      outcome,
-      filled: { up: round2(m.filled.up), down: round2(m.filled.down) },
-      ...(imbalance > 0 ? { leggedShares: imbalance } : {}),
-    });
-    log(
-      `[guard ${slug}] closed ${outcome} — running tally: ` +
-        `${guardStats.balanced} balanced, ${guardStats.legged} legged, ` +
-        `${guardStats.rescued} rescued, ${guardStats.naked} left naked`,
-    );
-  }
-  guardMarkets.delete(slug);
-}
-
 /** Warm everything slow once, off the hot path: API creds, version cache,
  * per-token tick size + neg-risk, and the HTTP connections themselves. */
 async function prewarmMarket(market) {
   const warm = { up: undefined, down: undefined };
-  // In signal mode the copier does the trading, but the guard still has to read
-  // this account's fills — derive the API creds now (~1s) rather than on the
-  // first fill check, which happens while a position is already one-sided.
-  if (signalMode && !isDryRun && PRIVATE_KEY) {
-    try {
-      await getClobClient();
-    } catch (err) {
-      log(`guard: could not derive read creds (${err.message}) — fill tracking is off`);
-    }
-  }
   if (!signalMode && !isDryRun && PRIVATE_KEY) {
     const client = await getClobClient(); // creds derivation (~1s) happens here, not on order 1
     try {
@@ -1026,7 +425,6 @@ async function placePair(st, i) {
       log(`[${st.prefix}] pair ${pair.n} TAKE: bought both asks, sum ${pair.sum} (profit $${pair.maxProfit})`);
     }
     st.pairs.push(pair);
-    guardTrackPair(st, pair);
     const snapshot = {
       slug: st.slug,
       start: st.start,
@@ -1093,7 +491,6 @@ async function placePair(st, i) {
   }
 
   st.pairs.push(pair);
-  guardTrackPair(st, pair);
   // journal off the hot path — the disk write must never delay the next pair
   const snapshot = {
     slug: st.slug,
@@ -1108,7 +505,6 @@ async function placePair(st, i) {
 
 async function cancelOpenOrders(st) {
   st.cancelled = true;
-  guardCloseMarket(st.slug); // settle the market's leg record before it rolls
   if (signalMode) {
     if (st.pairs.some((p) => p.kind === "post")) {
       emitSignal({ type: "cancel", slug: st.slug });
@@ -1171,11 +567,6 @@ async function tickMarket(prefix) {
     }
   }
 
-  // Watch the fills. Runs on this same 150ms scheduler rather than a timer of
-  // its own: the reads inside are throttled and cached, and an idle market
-  // costs nothing but a map lookup.
-  if (st.market && st.pairs.length) guardTick(st);
-
   // cancel whatever is still resting shortly before the market closes
   if (!st.cancelled && t >= MARKET_SECONDS - cancelBefore) {
     await cancelOpenOrders(st);
@@ -1200,15 +591,6 @@ function validate() {
     console.error(`UPDOWN_TAKE_SUM must be between 0 and 1 (got ${UPDOWN_TAKE_SUM})`);
     process.exit(1);
   }
-  const completeSum = Number(UPDOWN_MAX_COMPLETE_SUM);
-  if (!(completeSum >= totalCost && completeSum <= 1.2)) {
-    console.error(
-      `UPDOWN_MAX_COMPLETE_SUM must be between the target sum (${totalCost}) and 1.2 ` +
-        `(got ${UPDOWN_MAX_COMPLETE_SUM}) — below the target it can never complete, ` +
-        `above 1.2 a "rescue" costs more than the leg it saves`,
-    );
-    process.exit(1);
-  }
   if (!(entryStart >= 0 && entryEnd > entryStart && entryEnd < MARKET_SECONDS)) {
     console.error("entry window must satisfy 0 <= START < END < 300 seconds");
     process.exit(1);
@@ -1226,14 +608,6 @@ if (require.main === module) {
       `${sharesPerOrder}+${sharesPerOrder} shares, entry ${entryStart}-${entryEnd}s, ` +
       `target sum ${totalCost}, mode ${signalMode ? "SIGNAL -> copy-trader" : isDryRun ? "DRY" : "LIVE"}`,
   );
-  log(
-    hedgeEnabled
-      ? `leg guard ACTIVE: completes a one-sided market up to a combined ` +
-          `${Number(UPDOWN_MAX_COMPLETE_SUM).toFixed(2)}, after ${UPDOWN_HEDGE_GRACE_MS}ms of grace ` +
-          `(rescues go out over the signal path)`
-      : `leg guard OBSERVING (UPDOWN_HEDGE=0): measures legging and what a rescue ` +
-          `would cost, sends nothing — see updown-pairs.json`,
-  );
   let busy = false;
   // 150ms scheduler: a pair fires within ~150ms of its slot instead of up to
   // 1s late. Idle ticks are pure clock math — no network, no disk.
@@ -1250,17 +624,4 @@ if (require.main === module) {
   }, 150);
 }
 
-module.exports = {
-  bookTop,
-  pairPrices,
-  currentMarketStart,
-  pairTime,
-  // leg guard internals, exported for tests
-  guardCfg,
-  guardStats,
-  guardMarkets,
-  guardTrackPair,
-  guardOnReply,
-  guardTick,
-  guardCloseMarket,
-};
+module.exports = { bookTop, pairPrices, currentMarketStart, pairTime };

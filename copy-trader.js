@@ -1380,23 +1380,6 @@ const localWallet = normalizeWallets([
 const localOrders = new Map(); // slug -> [orderIDs] resting from "post" signals
 const localWarm = new Map(); // tokenID -> { tickSize, negRisk }, from "prewarm" signals
 
-// Open connections from strategy bots. The signal socket runs both ways: the
-// bot sends trades down it, and we send back what became of each one. Without
-// that reply the bot cannot tell which exchange order was its own leg, and a
-// copy of somebody else's trade in the same market looks identical to it.
-const signalConns = new Set();
-function replyToBot(msg) {
-  if (!signalConns.size) return;
-  const line = JSON.stringify(msg) + "\n";
-  for (const conn of signalConns) {
-    try {
-      conn.write(line);
-    } catch {
-      signalConns.delete(conn);
-    }
-  }
-}
-
 /** Resolve tick-size/neg-risk for signal tokens ahead of the first order, so
  * placing it costs one postOrder round-trip instead of three lookups. */
 async function prewarmLocalTokens(assets) {
@@ -1447,20 +1430,13 @@ async function handleLocalSignal(sig, state) {
     return;
   }
   if (sig.type === "cancel") {
-    const resting = localOrders.get(sig.slug) || [];
-    // A targeted cancel names the orders to pull; without one, everything
-    // resting for the slug goes. The strategy uses the targeted form so that
-    // fixing one bad leg does not take out other pairs that are still fine.
-    const wanted = Array.isArray(sig.orderIds) && sig.orderIds.length ? sig.orderIds : null;
-    const ids = wanted ? resting.filter((id) => wanted.includes(id)) : resting;
-    if (wanted) localOrders.set(sig.slug, resting.filter((id) => !wanted.includes(id)));
-    else localOrders.delete(sig.slug);
+    const ids = localOrders.get(sig.slug) || [];
+    localOrders.delete(sig.slug);
     if (isDryRun || ids.length === 0) return;
     try {
       const client = await getClobClient();
       await client.cancelOrders(ids);
-      log(`[local] cancelled ${ids.length}${wanted ? " targeted" : ""} resting orders for ${sig.slug}`);
-      replyToBot({ type: "cancelled", slug: sig.slug, orderIds: ids });
+      log(`[local] cancelled ${ids.length} resting orders for ${sig.slug}`);
     } catch (err) {
       log(`[local] cancel failed for ${sig.slug}:`, err.message || err);
     }
@@ -1491,25 +1467,18 @@ async function handleLocalSignal(sig, state) {
     journalAdd(observedEntry(trade, localWallet, "pending"));
   }
 
-  // A hedge is the strategy closing a position it is already exposed to, not a
-  // new bet. The per-bet cap and the risk gate both exist to limit how much
-  // gets put AT risk, so applying them to the trade that TAKES risk off would
-  // be backwards — a blocked hedge leaves the bigger naked leg standing.
-  const isHedge = sig.hedge === true;
-
   // stale guard: signals for 5m markets are worthless after ~2 minutes
   if (Math.floor(Date.now() / 1000) - trade.timestamp > 120) {
     state.seen.add(key);
     saveState(state);
     journalUpdate(key, { status: "stale" });
-    replyToBot({ type: "placed", id: sig.id, placed: false, reason: "stale" });
     return;
   }
 
   // per-bet cap: scale the size down when the signal exceeds MAX_BET_USDC
   let size = Number(sig.size);
   let cost = Number((size * trade.price).toFixed(2));
-  if (cost > BET_USDC && !isHedge) {
+  if (cost > BET_USDC) {
     size = Math.floor((BET_USDC / trade.price) * 100) / 100;
     cost = Number((size * trade.price).toFixed(2));
   }
@@ -1517,12 +1486,6 @@ async function handleLocalSignal(sig, state) {
     state.seen.add(key);
     saveState(state);
     journalUpdate(key, { status: "min-skip" });
-    replyToBot({
-      type: "placed",
-      id: sig.id,
-      placed: false,
-      reason: `min-skip (${size} sh < ${MIN_LIMIT_SHARES})`,
-    });
     log(
       `${tag} ${trade.slug} ${trade.outcome}: ${size} sh is under the ` +
         `${MIN_LIMIT_SHARES}-share limit-order minimum — skipped`,
@@ -1530,13 +1493,12 @@ async function handleLocalSignal(sig, state) {
     return;
   }
 
-  const gate = isHedge ? { allowed: true } : await riskGateCheck(cost);
+  const gate = await riskGateCheck(cost);
   if (!gate.allowed) {
     riskSnapshot.riskSkipped++;
     state.seen.add(key);
     saveState(state);
     journalUpdate(key, { status: "risk-skip", riskReason: gate.reason });
-    replyToBot({ type: "placed", id: sig.id, placed: false, reason: "risk-skip" });
     log(`${tag} RISK SKIP ${trade.slug}: ${gate.reason}`);
     writeStatus();
     return;
@@ -1547,7 +1509,7 @@ async function handleLocalSignal(sig, state) {
     const resp = await placeLimitAt(trade, size, trade.price, type);
     state.seen.add(key);
     saveState(state);
-    if (!isHedge) tradesPlaced++; // a hedge closes an existing trade, it is not a new one
+    tradesPlaced++;
     const spent = Number((size * trade.price).toFixed(6)); // post: worst case; take: cap
     if (isDryRun) paperBalance -= spent;
     balanceCache = { value: null, fetchedAt: 0 };
@@ -1569,21 +1531,6 @@ async function handleLocalSignal(sig, state) {
         txHashes: resp.transactionsHashes || [],
       },
     });
-    // Tell the bot which exchange order this signal became. A FAK never rests,
-    // so its match is reported here and now; a GTC is watched by orderID.
-    replyToBot({
-      type: "placed",
-      id: sig.id,
-      placed: true,
-      slug: trade.slug,
-      asset: trade.asset,
-      orderID: resp.orderID || null,
-      orderType: type,
-      price: trade.price,
-      size,
-      filled: type === "FAK" ? Number(resp.takingAmount) || 0 : 0,
-      dryRun: !!resp.dryRun,
-    });
     log(`${tag} placed ${type} ${size} sh ${trade.outcome} @ ${trade.price} in ${trade.slug}`);
     if (maxTrades && tradesPlaced >= maxTrades) {
       log(`MAX_TRADES limit reached (${tradesPlaced}/${maxTrades}) — stopping.`);
@@ -1595,7 +1542,6 @@ async function handleLocalSignal(sig, state) {
     // a post signal is for one moment in one 5m market — never retry it later
     state.seen.add(key);
     saveState(state);
-    replyToBot({ type: "placed", id: sig.id, placed: false, reason: String(err.message || err) });
     journalUpdate(key, {
       status: "failed",
       copy: {
@@ -1683,11 +1629,6 @@ function startLocalSignals(state) {
   try {
     const server = net.createServer((conn) => {
       let sbuf = "";
-      // The socket is bidirectional: the strategy bot needs to know which
-      // exchange order its signal became, so it can watch that order's fills
-      // and tell its own legs apart from unrelated copies in the same market.
-      signalConns.add(conn);
-      conn.on("close", () => signalConns.delete(conn));
       conn.on("data", (d) => {
         sbuf += d;
         const lines = sbuf.split("\n");
@@ -1703,7 +1644,7 @@ function startLocalSignals(state) {
           serialize(() => handleLocalSignal(sig, state));
         }
       });
-      conn.on("error", () => signalConns.delete(conn));
+      conn.on("error", () => {});
     });
     server.on("error", (err) => log(`signal socket error: ${err.message}`));
     server.listen(SIGNAL_SOCKET, () =>
