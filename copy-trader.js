@@ -1436,7 +1436,11 @@ async function placeLimitAt(trade, size, price, type, side = "BUY") {
 // ---------------------------------------------------------------------------
 
 const HEDGE_MAX_SUM = 0.995; // complete the pair only while it still locks profit
-const HEDGE_GRACE_MS = 2500; // one-legged this long before acting
+// How long a pair may stay one-legged before we hedge. Too short wastes money
+// hedging pairs the market was about to complete for free; too long lets a
+// trending market run away from the eventual hedge. Live observation: siblings
+// often complete naturally within ~10s.
+const HEDGE_GRACE_MS = 10000;
 const HEDGE_POLL_MS = 2000;
 
 const localPairs = new Map(); // pairKey -> { slug, legs: {up, down}, legAt, done }
