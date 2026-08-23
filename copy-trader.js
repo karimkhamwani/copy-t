@@ -1381,25 +1381,37 @@ const localOrders = new Map(); // slug -> [orderIDs] resting from "post" signals
 const localWarm = new Map(); // tokenID -> { tickSize, negRisk }, from "prewarm" signals
 
 // ---------------------------------------------------------------------------
-// Pair-fill watchdog EXECUTION: the updown bot owns the policy and emits a
-// {type:"unwind", slug, pair} signal when a posted pair has had its chance to
-// fill (UPDOWN_UNWIND_SEC, read by the bot). This side is purely mechanical:
-// it tracks which orders belong to which pair (they rest under OUR wallet, so
-// only this process can query or exit them), and on the signal cancels what
-// still rests and sells back any one-legged exposure at the best bid.
+// Pair-fill watchdog: a "post" pair that hasn't FULLY filled within
+// UPDOWN_UNWIND_SEC seconds is cancelled, and any one-legged exposure (one
+// side filled, the other didn't) is sold straight back at the best bid — a
+// small, known spread cost instead of an open directional bet on the last
+// minutes of a 5m market.
 // ---------------------------------------------------------------------------
-const pendingPairs = new Map(); // "slug-pN" -> { slug, legs: {up, down} }
+const UPDOWN_UNWIND_SEC = Number(process.env.UPDOWN_UNWIND_SEC ?? "30"); // 0 = off
+const pendingPairs = new Map(); // "slug-pN" -> { slug, legs: {up, down}, timer }
 
-/** Track one placed GTC leg of an updown pair so a later unwind signal can
- * find its orders. Signal ids look like "<slug>-p<n>-up". */
+/** Track one placed GTC leg of an updown pair; the first leg to register
+ * arms the pair's unwind timer. Signal ids look like "<slug>-p<n>-up". */
 function registerPairLeg(sig, orderID, size) {
+  if (!(UPDOWN_UNWIND_SEC > 0)) return;
   const m = /^(.+-p\d+)-(up|down)$/.exec(sig.id || "");
   if (!m) return;
   const [, pairKey, side] = m;
   let pair = pendingPairs.get(pairKey);
   if (!pair) {
-    pair = { slug: sig.slug || "", legs: {} };
+    pair = { slug: sig.slug || "", legs: {}, timer: null };
     pendingPairs.set(pairKey, pair);
+    // Deliberately NOT routed through serialize(): the watchdog makes several
+    // network round-trips (status reads, cancel, book, sell), and the serial
+    // queue is the buy path — parking there would delay the next pair's order.
+    // It only touches the journal (sync writes) and pendingPairs, never the
+    // seen set or risk gate, so running alongside the queue is race-free.
+    pair.timer = setTimeout(() => {
+      checkPairFill(pairKey).catch((err) =>
+        log(`[unwind] ${pairKey}: watchdog error:`, err.message || err),
+      );
+    }, UPDOWN_UNWIND_SEC * 1000);
+    pair.timer.unref?.();
   }
   pair.legs[side] = {
     orderID,
@@ -1452,11 +1464,7 @@ async function readMatched(client, leg) {
   }
 }
 
-/** Mechanically flatten one pair: cancel what still rests, re-read the final
- * fills, sell back any imbalance. Idempotent — the pair leaves pendingPairs
- * on the first call, so a duplicate unwind signal (socket + file tail both
- * deliver) is a no-op. */
-async function flattenPair(pairKey) {
+async function checkPairFill(pairKey) {
   const pair = pendingPairs.get(pairKey);
   pendingPairs.delete(pairKey);
   if (!pair) return;
@@ -1470,7 +1478,7 @@ async function flattenPair(pairKey) {
   ]);
   const full = (leg, m) => !leg || (m != null && m >= leg.size - 1e-9);
   if (upLeg && downLeg && full(upLeg, upFilled) && full(downLeg, downFilled)) {
-    log(`[unwind] ${pairKey}: both legs already filled — profit locked, nothing to do`);
+    log(`[unwind] ${pairKey}: both legs filled within ${UPDOWN_UNWIND_SEC}s — profit locked, nothing to do`);
     return;
   }
 
@@ -1478,7 +1486,7 @@ async function flattenPair(pairKey) {
   const ids = [upLeg, downLeg].filter(Boolean).map((l) => l.orderID);
   try {
     await client.cancelOrders(ids);
-    log(`[unwind] ${pairKey}: not fully filled at unwind — cancelled resting orders`);
+    log(`[unwind] ${pairKey}: not fully filled after ${UPDOWN_UNWIND_SEC}s — cancelled resting orders`);
   } catch (err) {
     log(`[unwind] ${pairKey}: cancel failed:`, err.message || err);
   }
@@ -1626,26 +1634,9 @@ async function handleLocalSignal(sig, state) {
     await prewarmLocalTokens(sig.assets);
     return;
   }
-  if (sig.type === "unwind") {
-    if (!sig.slug || sig.pair == null) return;
-    const pairKey = `${sig.slug}-p${sig.pair}`;
-    // Fire-and-forget OFF the serial queue: flattening makes several network
-    // round-trips (status reads, cancel, book, sell) and must never delay the
-    // next buy signal. It only touches the journal (sync writes) and
-    // pendingPairs, never the seen set or risk gate, so this is race-free.
-    flattenPair(pairKey).catch((err) =>
-      log(`[unwind] ${pairKey}: failed:`, err.message || err),
-    );
-    return;
-  }
   if (sig.type === "cancel") {
     const ids = localOrders.get(sig.slug) || [];
     localOrders.delete(sig.slug);
-    // drop pair tracking for the closing market — unwind signals for it can
-    // no longer arrive (the bot only emits them well before this cancel)
-    for (const k of pendingPairs.keys()) {
-      if (k.startsWith(`${sig.slug}-p`)) pendingPairs.delete(k);
-    }
     if (isDryRun || ids.length === 0) return;
     try {
       const client = await getClobClient();
