@@ -1424,14 +1424,159 @@ async function placeLimitAt(trade, size, price, type) {
   return resp;
 }
 
+// ---------------------------------------------------------------------------
+// Strategy feedback loop: the BOT decides, this engine executes and reports.
+// For every resting local order we poll fill state and push {type:"fill"}
+// events back over the signal socket; the bot runs the pair logic (wait /
+// cancel / sell) and sends {type:"cancel-order"} / {type:"sell"} signals,
+// which are executed here blindly.
+// ---------------------------------------------------------------------------
+
+const PAIR_POLL_MS = 2000;
+const localLegs = new Map(); // signal id -> { orderID, journalKey, asset, outcome, slug, size, matched, finalized }
+const signalClients = new Set(); // connected bot sockets, for feedback events
+
+function pushFeedback(event) {
+  const line = JSON.stringify(event) + "\n";
+  for (const conn of signalClients) {
+    try {
+      conn.write(line);
+    } catch {
+      /* dead conn is removed on its close event */
+    }
+  }
+}
+
+/** Sell `shares` of `asset` right now: marketable FAK limit when the 5-share/
+ * $1 minimums allow, else a shares-denominated market order. */
+async function sellNow(asset, shares, floorPrice) {
+  const client = await getClobClient();
+  const price = Math.max(0.01, Math.round(floorPrice * 100) / 100);
+  if (shares >= MIN_LIMIT_SHARES && shares * price >= 1) {
+    const order = await client.createOrder(
+      { tokenID: asset, price, side: client._Side.SELL, size: shares },
+      localWarm.get(asset),
+    );
+    return client.postOrder(order, client._OrderType.FAK);
+  }
+  const order = await client.createMarketOrder(
+    { tokenID: asset, amount: shares, side: client._Side.SELL, price },
+    localWarm.get(asset),
+  );
+  return client.postOrder(order, client._OrderType.FAK);
+}
+
+/** Refresh a leg's fill state from the exchange; report changes to the bot. */
+async function refreshLeg(client, id, leg) {
+  if (leg.finalized) return;
+  const before = `${leg.matched}:${leg.finalized}`;
+  try {
+    const o = await client.getOrder(leg.orderID);
+    const matched = Number(o?.size_matched);
+    if (Number.isFinite(matched)) leg.matched = matched;
+    const st = String(o?.status || "").toUpperCase();
+    if (st === "MATCHED") {
+      leg.matched = leg.size;
+      leg.finalized = true;
+    } else if (st === "CANCELED" || st === "CANCELLED") {
+      leg.finalized = true;
+    }
+  } catch {
+    /* transient lookup failure — keep last known state */
+  }
+  if (`${leg.matched}:${leg.finalized}` !== before) {
+    pushFeedback({
+      type: "fill",
+      id,
+      matched: leg.matched,
+      size: leg.size,
+      final: leg.finalized,
+    });
+  }
+}
+
+async function pairWatchTick() {
+  if (isDryRun) return;
+  const active = [...localLegs].filter(([, l]) => !l.finalized);
+  if (active.length === 0) return;
+  const client = await getClobClient().catch(() => null);
+  if (!client) return;
+  for (const [id, leg] of active) await refreshLeg(client, id, leg);
+  // prune finalized legs after 10 minutes so the map never grows unbounded
+  for (const [id, l] of localLegs) {
+    if (l.finalized && Date.now() - (l.createdAt || 0) > 600000) localLegs.delete(id);
+  }
+}
+
 async function handleLocalSignal(sig, state) {
   if (sig.type === "prewarm") {
     await prewarmLocalTokens(sig.assets);
     return;
   }
+  // Bot-directed exit steps (rule 3 lives in the bot; we just execute):
+  if (sig.type === "cancel-order") {
+    const leg = localLegs.get(sig.id);
+    if (!leg || isDryRun) return;
+    const client = await getClobClient();
+    try {
+      await client.cancelOrders([leg.orderID]);
+    } catch {
+      /* may already be filled/gone — the refresh below reports the truth */
+    }
+    await refreshLeg(client, sig.id, leg);
+    leg.finalized = true;
+    if (leg.matched === 0) journalUpdate(leg.journalKey, { status: "failed" });
+    // always report the final state so the bot's exit sequence can proceed
+    pushFeedback({ type: "fill", id: sig.id, matched: leg.matched, size: leg.size, final: true });
+    log(`[local] cancel-order ${sig.id}: final fill ${leg.matched}/${leg.size}`);
+    return;
+  }
+  if (sig.type === "sell") {
+    if (isDryRun) return;
+    const shares = Number(sig.shares);
+    const floor = Number(sig.price);
+    if (!(shares > 0) || !(floor > 0) || !sig.asset) return;
+    // A FAK sell can whiff when the bid vanishes in the same instant. Retry a
+    // few times, chasing one tick lower per attempt — in a bail-out, being
+    // flat matters more than the last cent.
+    let remaining = shares;
+    for (let attempt = 0; attempt < 4 && remaining > 0; attempt++) {
+      const price = Math.max(0.01, Math.round((floor - attempt * 0.01) * 100) / 100);
+      try {
+        const resp = await sellNow(sig.asset, remaining, price);
+        const sold = Number(resp?.makingAmount); // maker asset on a SELL = shares given up
+        const filledShares = Number.isFinite(sold) && sold > 0 ? sold : remaining;
+        remaining = Math.max(0, Math.round((remaining - filledShares) * 100) / 100);
+        if (remaining === 0) break;
+        log(`[local] SELL partial in ${sig.slug}: ${remaining} sh left — retrying 1 tick lower`);
+      } catch (err) {
+        log(`[local] SELL attempt ${attempt + 1} failed for ${sig.slug} (${err.message || err}) — retrying lower`);
+      }
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    if (remaining > 0) {
+      log(`[local] SELL exhausted retries for ${sig.slug}: ${remaining} sh still held`);
+    } else {
+      log(`[local] SELL done: ${shares} sh of "${sig.outcome || sig.asset}" in ${sig.slug} (bot bail-out)`);
+    }
+    const leg = sig.legId ? localLegs.get(sig.legId) : null;
+    if (leg) {
+      journalUpdate(leg.journalKey, {
+        hedge: { action: "bailed", shares: shares - remaining, soldAt: floor, at: Date.now() },
+      });
+    }
+    return;
+  }
   if (sig.type === "cancel") {
     const ids = localOrders.get(sig.slug) || [];
     localOrders.delete(sig.slug);
+    // settle leg bookkeeping for this market: legs that never filled leave
+    // the P/L stats (they cost nothing), and the poller stops tracking them
+    for (const [, leg] of localLegs) {
+      if (leg.slug !== sig.slug || leg.finalized) continue;
+      leg.finalized = true;
+      if (leg.matched === 0) journalUpdate(leg.journalKey, { status: "failed" });
+    }
     if (isDryRun || ids.length === 0) return;
     try {
       const client = await getClobClient();
@@ -1517,6 +1662,18 @@ async function handleLocalSignal(sig, state) {
       const ids = localOrders.get(trade.slug) || [];
       ids.push(resp.orderID);
       localOrders.set(trade.slug, ids);
+      // track the leg: fills are polled and reported back to the bot
+      localLegs.set(sig.id, {
+        orderID: resp.orderID,
+        journalKey: key,
+        asset: trade.asset,
+        outcome: trade.outcome,
+        slug: trade.slug,
+        size,
+        matched: 0,
+        finalized: false,
+        createdAt: Date.now(),
+      });
     }
     journalUpdate(key, {
       status: "success",
@@ -1628,6 +1785,8 @@ function startLocalSignals(state) {
   }
   try {
     const server = net.createServer((conn) => {
+      signalClients.add(conn);
+      conn.on("close", () => signalClients.delete(conn));
       let sbuf = "";
       conn.on("data", (d) => {
         sbuf += d;
@@ -1849,7 +2008,15 @@ async function main() {
     log(`ws: real-time feed enabled (${WS_URL}) — poller runs as fallback`);
   }
 
-  if (botSignals) startLocalSignals(state);
+  if (botSignals) {
+    startLocalSignals(state);
+    if (!isDryRun) {
+      setInterval(() => {
+        pairWatchTick().catch((err) => log("pair watch error:", err.message || err));
+      }, PAIR_POLL_MS);
+      log("fill reporter active: leg fills stream back to the bot; bot drives cancel/sell");
+    }
+  }
 
   // eslint-disable-next-line no-constant-condition
   while (true) {

@@ -229,12 +229,44 @@ const SIGNAL_SOCKET =
 let sigSock = null;
 let sigSockOk = false;
 
+// Pairs this bot is nursing: fills stream back from the copier over the same
+// socket, and rule 3 (below) decides when to wait, cancel, or sell.
+const trackedPairs = new Map(); // pairKey -> { slug, prefix, legs: {up, down}, phase }
+
+function handleFeedback(event) {
+  if (event.type !== "fill") return;
+  const m = /^(.*)-(up|down)$/.exec(event.id);
+  if (!m) return;
+  const pair = trackedPairs.get(m[1]);
+  if (!pair) return;
+  const leg = pair.legs[m[2]];
+  if (!leg) return;
+  leg.matched = Number(event.matched) || 0;
+  leg.final = Boolean(event.final);
+  if (leg.matched > 0)
+    log(`[${pair.prefix}] fill: ${leg.matched}/${leg.size} ${m[2]} @ ${leg.price} (${pair.slug})`);
+}
+
 function connectSignalSocket() {
   if (!signalMode || sigSock) return;
   const s = net.createConnection(SIGNAL_SOCKET);
   s.on("connect", () => {
     sigSockOk = true;
     log("signal socket connected (sub-ms delivery to copy-trader)");
+  });
+  let fbuf = "";
+  s.on("data", (d) => {
+    fbuf += d;
+    const lines = fbuf.split("\n");
+    fbuf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        handleFeedback(JSON.parse(line));
+      } catch {
+        /* malformed feedback line */
+      }
+    }
   });
   s.on("error", () => {});
   s.on("close", () => {
@@ -259,6 +291,18 @@ function emitSignal(obj) {
 }
 
 function emitPairSignals(st, pair, kind) {
+  if (kind === "post") {
+    // nurse this pair: fills come back from the copier; rule 3 decides exits
+    trackedPairs.set(`${st.slug}-p${pair.n}`, {
+      slug: st.slug,
+      prefix: st.prefix,
+      phase: "resting", // resting -> exiting -> done
+      legs: {
+        up: { asset: st.market.upToken, price: pair.up, size: pair.shares, matched: 0, final: false, outcome: "Up" },
+        down: { asset: st.market.downToken, price: pair.down, size: pair.shares, matched: 0, final: false, outcome: "Down" },
+      },
+    });
+  }
   const base = {
     type: "buy",
     kind, // post -> GTC at this price; take -> FAK at this price
@@ -510,6 +554,10 @@ async function cancelOpenOrders(st) {
       emitSignal({ type: "cancel", slug: st.slug });
       log(`[${st.prefix}] cancel signal emitted for ${st.slug}`);
     }
+    // stop nursing this market's pairs — the cancel sweep settles them
+    for (const [key, pair] of trackedPairs) {
+      if (pair.slug === st.slug) trackedPairs.delete(key);
+    }
     return;
   }
   if (isDryRun || st.orderIds.length === 0) return;
@@ -579,6 +627,114 @@ async function tick() {
 }
 
 // ---------------------------------------------------------------------------
+// Rule 3 — "never hold half a pair into danger" (decisions here; the copier
+// only executes). A one-legged pair is left to wait — minutes if need be —
+// while completing it at market would still total under $1.00 (the escape
+// door is open, and the resting bid may still fill at the better posted
+// price). When the sum reaches $1.00 the exit runs in the safe order:
+//   1. tell the copier to cancel the resting leg;
+//   2. wait for its final fill report — if it filled in the race, the pair
+//      completed, keep everything;
+//   3. sell only the lonely excess shares at the current bid.
+// ---------------------------------------------------------------------------
+
+const BAIL_SUM = 1.0;
+const RULE3_POLL_MS = 2000;
+// Rule 4: this close to the market end, no half-position may survive — the
+// cancel sweep only removes resting bids; it cannot flatten filled shares.
+const FORCE_EXIT_BEFORE_CLOSE_SEC = 35;
+
+async function rule3Tick() {
+  for (const [key, pair] of trackedPairs) {
+    if (pair.phase === "done") {
+      trackedPairs.delete(key);
+      continue;
+    }
+    const { up, down } = pair.legs;
+
+    // both filled -> completed on its own; nothing to nurse
+    if (up.matched >= up.size - 1e-9 && down.matched >= down.size - 1e-9) {
+      pair.phase = "done";
+      continue;
+    }
+
+    if (pair.phase === "exiting") {
+      // waiting for the copier's final report on the cancelled leg
+      const resting = pair.exitResting === "up" ? up : down;
+      const filled = pair.exitResting === "up" ? down : up;
+      if (!resting.final) continue;
+      const lonely = Math.round((filled.matched - resting.matched) * 100) / 100;
+      pair.phase = "done";
+      if (lonely <= 0) {
+        log(`[${pair.prefix}] ${pair.slug}: sibling filled during the exit race — pair completed`);
+        continue;
+      }
+      let top = null;
+      try {
+        top = bookTop(await fetchJson(`${CLOB_API_HOST}/book?token_id=${filled.asset}`));
+      } catch {
+        /* book unreadable */
+      }
+      if (top?.bid == null) {
+        log(`[${pair.prefix}] ${pair.slug}: no bid to bail ${lonely} ${filled.outcome} into — holding`);
+        continue;
+      }
+      emitSignal({
+        type: "sell",
+        legId: `${key}-${pair.exitResting === "up" ? "down" : "up"}`,
+        asset: filled.asset,
+        shares: lonely,
+        price: top.bid,
+        slug: pair.slug,
+        outcome: filled.outcome,
+      });
+      log(
+        `[${pair.prefix}] ${pair.slug}: bail — selling ${lonely} lonely ${filled.outcome} @ ~${top.bid} ` +
+          `(bought ${filled.price}, known loss ~$${((filled.price - top.bid) * lonely).toFixed(2)} instead of a coin flip)`,
+      );
+      continue;
+    }
+
+    // phase "resting": any unhedged exposure? (one-legged, or unequal partials)
+    const exposure = Math.abs(up.matched - down.matched) > 1e-9;
+    if (!exposure && !(up.matched > 0)) continue; // nothing filled yet: free waiting
+    if (!exposure) continue; // equal fills: hedged; the cancel sweep tidies the rest
+
+    // rule 4: near the close, exit NOW regardless of price — after the close
+    // there are no choices left, only the coin flip
+    const startTs = Number((/-(\d{10})$/.exec(pair.slug) || [])[1]);
+    const nearClose =
+      startTs && Date.now() / 1000 >= startTs + MARKET_SECONDS - FORCE_EXIT_BEFORE_CLOSE_SEC;
+
+    const filledSide = up.matched > down.matched ? "up" : "down";
+    const restingSide = filledSide === "up" ? "down" : "up";
+    const filled = pair.legs[filledSide];
+    const resting = pair.legs[restingSide];
+
+    if (!nearClose) {
+      // rule 2/3 boundary: keep waiting while completion still costs < $1.00
+      let sum = null;
+      try {
+        const top = bookTop(await fetchJson(`${CLOB_API_HOST}/book?token_id=${resting.asset}`));
+        if (top.ask != null) sum = filled.price + top.ask;
+      } catch {
+        /* book unreadable this tick — try again next poll */
+      }
+      if (sum == null || sum < BAIL_SUM - 1e-9) continue; // door still open
+    }
+
+    // exit: cancel first, confirm, then sell the lonely excess
+    pair.phase = "exiting";
+    pair.exitResting = restingSide;
+    emitSignal({ type: "cancel-order", id: `${key}-${restingSide}` });
+    log(
+      `[${pair.prefix}] ${pair.slug}: ${nearClose ? "market closing" : "completion door closed"} with ` +
+        `${filled.matched}/${resting.matched} fills — cancelling the ${restingSide} leg (exit step 1)`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -608,6 +764,22 @@ if (require.main === module) {
       `${sharesPerOrder}+${sharesPerOrder} shares, entry ${entryStart}-${entryEnd}s, ` +
       `target sum ${totalCost}, mode ${signalMode ? "SIGNAL -> copy-trader" : isDryRun ? "DRY" : "LIVE"}`,
   );
+  if (signalMode) {
+    let rule3Busy = false;
+    setInterval(async () => {
+      if (rule3Busy) return;
+      rule3Busy = true;
+      try {
+        await rule3Tick();
+      } catch (err) {
+        log("rule3 error:", err.message || err);
+      } finally {
+        rule3Busy = false;
+      }
+    }, RULE3_POLL_MS);
+    log(`rule 3 active: one-legged pairs wait while completable under $${BAIL_SUM.toFixed(2)}, then cancel-confirm-sell`);
+  }
+
   let busy = false;
   // 150ms scheduler: a pair fires within ~150ms of its slot instead of up to
   // 1s late. Idle ticks are pure clock math — no network, no disk.
