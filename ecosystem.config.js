@@ -33,6 +33,14 @@ module.exports = {
       restart_delay: 5000,
     },
     {
+      name: "delta-bot",
+      script: "delta-signals.js",
+      watch: ["delta-signals.js", ".env"],
+      watch_delay: 2000,
+      max_restarts: 10,
+      restart_delay: 5000,
+    },
+    {
       name: "dashboard",
       script: "dashboard-server.js",
       watch: ["dashboard-server.js", "dashboard", ".env"],
