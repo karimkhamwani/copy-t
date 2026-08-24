@@ -12,6 +12,7 @@
     "dashboard": "node dashboard-server.js",
     "updown": "node updown-5m.js",
     "delta": "node delta-signals.js",
+    "mm": "node mm-bot.js",
     "up": "pm2 start ecosystem.config.js && pm2 logs",
     "logs": "pm2 logs",
     "down": "pm2 delete ecosystem.config.js",

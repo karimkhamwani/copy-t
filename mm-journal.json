@@ -1,0 +1,17 @@
+[
+  {
+    "at": 1787592044318,
+    "slug": "btc-updown-5m-1787592000",
+    "outcome": "Up",
+    "action": "cut",
+    "why": "fair 0.349 under floor 0.35",
+    "shares": 10,
+    "cost": 2,
+    "proceeds": 1.1,
+    "pnl": -0.9,
+    "heldSec": 28,
+    "entryFair": 0.43,
+    "exitFair": 0.35,
+    "mode": "dry"
+  }
+]
