@@ -41,6 +41,7 @@ const {
   BINANCE_WS_URL = "wss://data-stream.binance.vision",
   BINANCE_REST_HOST = "https://data-api.binance.vision",
   CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market",
+  CLOB_USER_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/user",
   PRIVATE_KEY,
   FUNDER_ADDRESS,
   SIGNATURE_TYPE = "1",
@@ -63,6 +64,11 @@ const {
   MM_LOOP_MS = "250",
   MM_REST_LOOP_MS = "1000",
   MM_BOOK_STALE_MS = "4000", // never quote off a book older than this
+  // Fill detection: the user websocket pushes fills; REST getOrder stays as a
+  // reconciliation sweep on this slower timer so nothing can be lost if the
+  // socket drops a message. Without the socket, REST runs every tick.
+  MM_FILL_RECONCILE_MS = "2000",
+  MM_USER_WS_SILENCE_MS = "30000", // socket considered dead after this quiet
   MM_SKIP_PREFLIGHT = "0", // 1 = run even where Binance/Polymarket are blocked
   MM_QUOTE_START_SEC = "15", // quote window inside the market, from open
   MM_QUOTE_END_FRAC = "0.75", // stop quoting after this fraction of the window
@@ -91,6 +97,8 @@ const debug = MM_DEBUG === "1" || MM_DEBUG.toLowerCase() === "true";
 const loopMs = Math.max(100, Number(MM_LOOP_MS) || 250);
 const restLoopMs = Math.max(250, Number(MM_REST_LOOP_MS) || 1000);
 const bookStaleMs = Math.max(1000, Number(MM_BOOK_STALE_MS) || 4000);
+const fillReconcileMs = Math.max(500, Number(MM_FILL_RECONCILE_MS) || 2000);
+const USER_WS_SILENCE_MS = Math.max(5000, Number(MM_USER_WS_SILENCE_MS) || 30000);
 const skipPreflight = MM_SKIP_PREFLIGHT === "1" || MM_SKIP_PREFLIGHT.toLowerCase() === "true";
 const quoteStart = Number(MM_QUOTE_START_SEC);
 const quoteEndFrac = Number(MM_QUOTE_END_FRAC);
@@ -162,7 +170,22 @@ function startBinance() {
   });
 }
 
+const volCache = new Map(); // SYMBOL -> { at, vol }
+const VOL_TTL_MS = 1000;
+
+/** Realized vol, memoised for VOL_TTL_MS: the estimate walks up to 600
+ * samples, and recomputing it per leg per 250ms tick was pure waste (the
+ * inputs only change once a second anyway — samples are 1Hz). */
 function perSecVol(sym) {
+  const hit = volCache.get(sym);
+  const now = Date.now();
+  if (hit && now - hit.at < VOL_TTL_MS) return hit.vol;
+  const vol = computeVol(sym);
+  volCache.set(sym, { at: now, vol });
+  return vol;
+}
+
+function computeVol(sym) {
   const s = spot.get(sym)?.samples || [];
   if (s.length < 60) return volFallback;
   const r = [];
@@ -199,6 +222,7 @@ function fairUp(mid, strike, tau, sigma) {
 // ---------------------------------------------------------------------------
 
 let clob = null;
+let clobCreds = null;
 async function getClob() {
   if (clob) return clob;
   const { ClobClient, Side, OrderType } = await import("@polymarket/clob-client-v2");
@@ -209,6 +233,7 @@ async function getClob() {
     signatureType: Number(SIGNATURE_TYPE), funderAddress: FUNDER_ADDRESS,
   });
   const creds = await boot.createOrDeriveApiKey();
+  clobCreds = creds; // the user websocket authenticates with these
   clob = new ClobClient({
     host: CLOB_API_HOST, chain: CHAIN_ID, signer, creds,
     signatureType: Number(SIGNATURE_TYPE), funderAddress: FUNDER_ADDRESS,
@@ -327,6 +352,87 @@ function subscribeBooks(tokens) {
 }
 
 // ---------------------------------------------------------------------------
+// User channel (fills). A market maker's most time-critical input is "am I
+// filled?" — that starts the cut clock. Polling getOrder per resting order
+// costs a round-trip per order per tick and detects fills up to a full tick
+// late; the user channel pushes them. REST reconciliation stays on a slow
+// timer so a missed/garbled event can never lose a fill.
+// ---------------------------------------------------------------------------
+
+const wsMatched = new Map(); // orderID -> latest size_matched seen on the socket
+let userWs = null;
+let userWsOk = false;
+let lastUserMsgAt = 0;
+let userSubKey = "";
+
+function userWsHealthy() {
+  // treat the socket as authoritative only while it is demonstrably alive
+  return userWsOk && Date.now() - lastUserMsgAt < USER_WS_SILENCE_MS;
+}
+
+function subscribeUser(conditionIds) {
+  if (isDryRun || !clobCreds || !conditionIds.length) return;
+  const key = conditionIds.slice().sort().join(",");
+  if (key === userSubKey && userWs && userWsOk) return;
+  userSubKey = key;
+  try {
+    userWs?.removeAllListeners();
+    userWs?.close();
+  } catch {
+    /* already gone */
+  }
+  const ws = new WebSocket(CLOB_USER_WS_URL);
+  userWs = ws;
+  ws.on("open", () => {
+    userWsOk = true;
+    lastUserMsgAt = Date.now();
+    ws.send(
+      JSON.stringify({
+        auth: {
+          apiKey: clobCreds.key,
+          secret: clobCreds.secret,
+          passphrase: clobCreds.passphrase,
+        },
+        markets: conditionIds,
+        type: "user",
+      }),
+    );
+    log(`clob user ws subscribed (${conditionIds.length} markets — fills by push)`);
+  });
+  ws.on("message", (buf) => {
+    lastUserMsgAt = Date.now();
+    let msgs;
+    try {
+      msgs = JSON.parse(buf.toString());
+    } catch {
+      return;
+    }
+    for (const m of Array.isArray(msgs) ? msgs : [msgs]) {
+      // order events carry the running matched size; trade events confirm it
+      const id = m.id || m.order_id || m.orderID;
+      if (!id) continue;
+      const matched = Number(m.size_matched ?? m.sizeMatched);
+      if (Number.isFinite(matched)) {
+        wsMatched.set(String(id), Math.max(matched, wsMatched.get(String(id)) || 0));
+      }
+    }
+  });
+  ws.on("error", (e) => {
+    if (userWsOk) log("clob user ws error:", e.message);
+    userWsOk = false;
+  });
+  ws.on("close", () => {
+    userWsOk = false;
+    if (userWs === ws) {
+      setTimeout(() => {
+        userSubKey = "";
+        subscribeUser(conditionIds);
+      }, 2000).unref();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Preflight: this bot is meant to run where Binance and Polymarket are
 // reachable (the Windows trading box). On a network that blocks them it would
 // otherwise sit there quoting nothing, or worse, quote off stale data — so
@@ -374,13 +480,14 @@ async function preflight() {
     probeHttp(`${CLOB_API_HOST}/`, "clob REST"),
     probeWs(`${BINANCE_WS_URL}/stream?streams=btcusdt@bookTicker`, "binance ws"),
     probeWs(CLOB_WS_URL, "clob book ws"),
+    probeWs(CLOB_USER_WS_URL, "clob user ws"),
   ]);
   for (const p of probes) log(`preflight ${p.ok ? "OK  " : "FAIL"} ${p.label}${p.why ? " — " + p.why : ""}`);
 
   // ALL of these are required. The book websocket especially: quoting off 1s
   // REST snapshots means resting orders that lag the market, which is exactly
   // how a maker gets picked off. If it is blocked, this is the wrong machine.
-  const bad = probes.filter((p) => !p.ok);
+  const bad = probes.filter((p) => !p.ok && !(isDryRun && p.label === "clob user ws"));
   const wsOk = probes.find((p) => p.label === "clob book ws").ok;
 
   if (bad.length) {
@@ -439,6 +546,7 @@ function freshLeg(token, outcome) {
     position: null,   // { shares, cost, at, entryFair }
     warm: undefined,  // { tickSize, negRisk }
     book: { bid: null, ask: null, at: 0 },
+    reserved: 0,   // USDC committed by a placement currently in flight
     exited: false,
   };
 }
@@ -452,6 +560,7 @@ async function rollWindow(s) {
   const w = {
     prefix: s.prefix, symbol: s.symbol, seconds: s.seconds, start,
     slug: `${s.prefix}-${start}`, market: null, strike: null, legs: new Map(),
+    lastReconcileAt: 0,
   };
   windows.set(s.prefix, w);
 
@@ -463,12 +572,14 @@ async function rollWindow(s) {
     w.legs.set(w.market.downToken, freshLeg(w.market.downToken, "Down"));
     if (!isDryRun && PRIVATE_KEY) {
       const c = await getClob();
-      for (const leg of w.legs.values()) {
-        const [tickSize, negRisk] = await Promise.all([
-          c.getTickSize(leg.token), c.getNegRisk(leg.token),
-        ]);
-        leg.warm = { tickSize, negRisk };
-      }
+      await Promise.all(
+        [...w.legs.values()].map(async (leg) => {
+          const [tickSize, negRisk] = await Promise.all([
+            c.getTickSize(leg.token), c.getNegRisk(leg.token),
+          ]);
+          leg.warm = { tickSize, negRisk };
+        }),
+      );
     }
   } catch (e) {
     log(`[${w.prefix}] discovery failed: ${e.message}`);
@@ -517,6 +628,21 @@ function activeUsdc() {
   let s = 0;
   for (const w of windows.values())
     for (const l of w.legs.values()) if (l.position) s += l.position.cost;
+  return s;
+}
+
+/** Everything that could turn into cost basis: filled positions, resting bids
+ * that may fill at any moment, and placements currently in flight. The legs of
+ * a market are quoted concurrently, so the in-flight reservation is what stops
+ * both of them passing the cap check in the same tick. */
+function committedUsdc() {
+  let s = 0;
+  for (const w of windows.values())
+    for (const l of w.legs.values()) {
+      if (l.position) s += l.position.cost;
+      if (l.order) s += l.order.price * l.order.size;
+      s += l.reserved || 0;
+    }
   return s;
 }
 
@@ -578,6 +704,7 @@ async function placeBid(w, leg, price) {
 async function cancelBid(leg) {
   const id = leg.order?.id;
   leg.order = null;
+  if (id) wsMatched.delete(id);
   if (!id || isDryRun) return;
   try {
     const c = await getClob();
@@ -599,7 +726,7 @@ async function manageQuote(w, leg, fair) {
   }
   // inventory + capital caps
   const clips = leg.position ? leg.position.shares / clipShares : 0;
-  if (clips >= maxClips || activeUsdc() >= maxActiveUsdc) {
+  if (clips >= maxClips || committedUsdc() >= maxActiveUsdc) {
     if (leg.order) await cancelBid(leg);
     return;
   }
@@ -615,13 +742,23 @@ async function manageQuote(w, leg, fair) {
     return;
   }
   if (!leg.order) {
-    await placeBid(w, leg, want);
+    leg.reserved = want * clipShares;
+    try {
+      await placeBid(w, leg, want);
+    } finally {
+      leg.reserved = 0;
+    }
     return;
   }
   // re-quote when fair has moved our target away from where we're resting
   if (Math.abs(want - leg.order.price) >= requoteAt) {
-    await cancelBid(leg);
-    await placeBid(w, leg, want);
+    leg.reserved = want * clipShares;
+    try {
+      await cancelBid(leg);
+      await placeBid(w, leg, want);
+    } finally {
+      leg.reserved = 0;
+    }
   }
 }
 
@@ -630,23 +767,55 @@ async function manageQuote(w, leg, fair) {
 // ---------------------------------------------------------------------------
 
 async function pollFills(w) {
-  for (const leg of w.legs.values()) {
-    if (!leg.order) continue;
-    let matched = 0;
-    if (isDryRun) {
-      // Simulation: a resting bid only fills when a SELLER crosses into it —
-      // i.e. the offer comes down to our price. ("best bid <= our price" would
-      // fill constantly, since we quote at/near the bid by construction.)
-      if (leg.book.ask != null && leg.book.ask <= leg.order.price) matched = leg.order.size;
-    } else {
-      try {
-        const c = await getClob();
-        const o = await c.getOrder(leg.order.id);
-        matched = Math.min(Number(o?.size_matched) || 0, leg.order.size);
-      } catch {
-        continue; // transient; try next poll
-      }
+  const legs = [...w.legs.values()].filter((l) => l.order);
+  if (!legs.length) return;
+
+  // Both legs are checked CONCURRENTLY: these are independent round-trips, and
+  // running them back-to-back used to burn ~2x the loop budget for no reason.
+  let matches;
+  if (isDryRun) {
+    // Simulation: a resting bid only fills when a SELLER crosses into it —
+    // i.e. the offer comes down to our price. ("best bid <= our price" would
+    // fill constantly, since we quote at/near the bid by construction.)
+    matches = legs.map((l) =>
+      l.book.ask != null && l.book.ask <= l.order.price ? l.order.size : 0,
+    );
+  } else if (userWsHealthy()) {
+    // push path: the socket already told us what is matched. REST is still run
+    // periodically below as a reconciliation sweep, never on the hot path.
+    matches = legs.map((l) =>
+      Math.min(wsMatched.get(l.order.id) || 0, l.order.size),
+    );
+    if (Date.now() - w.lastReconcileAt > fillReconcileMs) {
+      w.lastReconcileAt = Date.now();
+      const c = await getClob();
+      const rest = await Promise.all(
+        legs.map((l) =>
+          c
+            .getOrder(l.order.id)
+            .then((o) => Math.min(Number(o?.size_matched) || 0, l.order.size))
+            .catch(() => 0),
+        ),
+      );
+      // trust whichever source saw more — a missed event must never lose a fill
+      matches = matches.map((m, i) => Math.max(m, rest[i]));
     }
+  } else {
+    w.lastReconcileAt = Date.now();
+    const c = await getClob();
+    matches = await Promise.all(
+      legs.map((l) =>
+        c
+          .getOrder(l.order.id)
+          .then((o) => Math.min(Number(o?.size_matched) || 0, l.order.size))
+          .catch(() => 0), // transient; try again next poll
+      ),
+    );
+  }
+
+  for (let i = 0; i < legs.length; i++) {
+    const leg = legs[i];
+    const matched = matches[i];
     if (matched <= 0) continue;
     const px = leg.order.price;
     const fair = currentFair(w, leg);
@@ -660,8 +829,15 @@ async function pollFills(w) {
       `[${w.prefix}] FILLED ${leg.outcome} ${matched} sh @ ${px} ` +
         `(fair ${fair.toFixed(3)}, position ${leg.position.shares} sh)`,
     );
-    if (matched >= leg.order.size) leg.order = null;
-    else leg.order.size -= matched;
+    if (matched >= leg.order.size) {
+      wsMatched.delete(leg.order.id);
+      leg.order = null;
+    } else {
+      // remaining size shrinks; zero the counter so the next event's absolute
+      // size_matched is measured against what is still resting
+      wsMatched.set(leg.order.id, 0);
+      leg.order.size -= matched;
+    }
   }
 }
 
@@ -669,11 +845,20 @@ async function pollFills(w) {
 // Exits — cut when fair turns, hold otherwise (the wallet's core behaviour)
 // ---------------------------------------------------------------------------
 
-function currentFair(w, leg) {
+/** P(Up) for the whole market — compute once per tick, both legs derive
+ * from it (Down is just 1 - Up). */
+function marketFairUp(w) {
   const st = spot.get(w.symbol);
   const tau = w.start + w.seconds - Date.now() / 1000;
-  const up = fairUp(st.mid, w.strike, tau, perSecVol(w.symbol));
+  return fairUp(st.mid, w.strike, tau, perSecVol(w.symbol));
+}
+
+function legFair(leg, up) {
   return leg.outcome === "Up" ? up : 1 - up;
+}
+
+function currentFair(w, leg) {
+  return legFair(leg, marketFairUp(w));
 }
 
 /** Why we should cut this position now, or null to keep holding. */
@@ -774,27 +959,50 @@ async function tickSeries(s) {
   const st = spot.get(w.symbol);
   if (!st?.mid || Date.now() - st.at > 5000) return; // never quote off a stale feed
 
+  // Skip the book fetch entirely when there is nothing to do with it: outside
+  // the quoting window, flat, and nothing resting. (REST path only — the ws
+  // feed costs nothing to read.)
+  const tNow = Date.now() / 1000 - w.start;
+  const idle =
+    !clobWsOk &&
+    (tNow < quoteStart - 1 || tNow > w.seconds * quoteEndFrac) &&
+    [...w.legs.values()].every((l) => !l.position && !l.order);
+  if (idle) return;
+
   await refreshBooks(w);
   await pollFills(w);
-  for (const leg of w.legs.values()) {
-    // a stale book is worse than no book: quoting off it is how a maker gets
-    // picked off after the market has already moved
-    if (!leg.book.at || Date.now() - leg.book.at > bookStaleMs) {
-      if (leg.order) await cancelBid(leg);
-      if (debug) log(`[dbg] [${w.prefix}] ${leg.outcome}: book stale — quote pulled`);
-      continue;
-    }
-    const fair = currentFair(w, leg);
-    if (leg.position) await maybeExit(w, leg, fair);
-    await manageQuote(w, leg, fair);
-  }
+
+  // One fair value for the market; each leg derives its own side from it.
+  const up = marketFairUp(w);
+  // Legs are independent — handle them concurrently so Down does not wait on
+  // Up's cancel/place round-trips. The capital cap is enforced through
+  // committedUsdc(), which counts in-flight placements.
+  await Promise.all(
+    [...w.legs.values()].map(async (leg) => {
+      // a stale book is worse than no book: quoting off it is how a maker gets
+      // picked off after the market has already moved
+      if (!leg.book.at || Date.now() - leg.book.at > bookStaleMs) {
+        if (leg.order) await cancelBid(leg);
+        if (debug) log(`[dbg] [${w.prefix}] ${leg.outcome}: book stale — quote pulled`);
+        return;
+      }
+      const fair = legFair(leg, up);
+      if (leg.position) await maybeExit(w, leg, fair);
+      await manageQuote(w, leg, fair);
+    }),
+  );
 }
 
 /** Keep the socket subscribed to exactly the tokens in play right now. */
 function syncSubscriptions() {
   const tokens = [];
-  for (const w of windows.values()) for (const leg of w.legs.values()) tokens.push(leg.token);
+  const conditions = [];
+  for (const w of windows.values()) {
+    for (const leg of w.legs.values()) tokens.push(leg.token);
+    if (w.market?.conditionId) conditions.push(w.market.conditionId);
+  }
   if (tokens.length) subscribeBooks(tokens);
+  if (conditions.length) subscribeUser(conditions);
 }
 
 async function tick() {
