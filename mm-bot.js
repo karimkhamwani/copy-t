@@ -34,6 +34,7 @@ require("dotenv").config();
 const fs = require("fs");
 const path = require("path");
 const WebSocket = require("ws");
+const { createResolutionCache } = require("./market-resolution.js");
 
 const {
   CLOB_API_HOST = "https://clob.polymarket.com",
@@ -533,7 +534,8 @@ function journalWrite(entry) {
 // ---------------------------------------------------------------------------
 
 const windows = new Map(); // prefix -> window state
-let stats = { clips: 0, cuts: 0, held: 0, cutPnl: 0 };
+let stats = { clips: 0, cuts: 0, held: 0, cutPnl: 0, heldPnl: 0 };
+let lastSettleAt = 0;
 
 function windowStart(sec, now = Date.now()) {
   return Math.floor(now / 1000 / sec) * sec;
@@ -607,16 +609,113 @@ async function backfillStrike(w) {
 }
 
 async function closeWindow(w) {
-  // pull every resting quote; positions are deliberately left to resolve
-  const ids = [...w.legs.values()].map((l) => l.order?.id).filter(Boolean);
+  // Positions are deliberately left to resolve — but they must NOT disappear
+  // from the books when the window object is dropped: the cash is still tied
+  // up until the market settles, and their win/loss is the other half of the
+  // strategy's P&L (the journal would otherwise only ever show the cuts).
+  for (const leg of w.legs.values()) {
+    if (leg.position && leg.position.shares > 0) {
+      settling.push({
+        slug: w.slug,
+        conditionId: w.market?.conditionId || "",
+        token: leg.token,
+        outcome: leg.outcome,
+        shares: leg.position.shares,
+        cost: leg.position.cost,
+        entryFair: leg.position.entryFair,
+        at: leg.position.at,
+        closedAt: Date.now(),
+      });
+    }
+  }
+  // pull every resting quote
+  const legsSnapshot = [...w.legs.values()]
+    .filter((l) => l.order)
+    .map((l) => ({ id: l.order.id, price: l.order.price, size: round2(l.order.size - l.order.matched) }));
+  const ids = legsSnapshot.map((l) => l.id);
   for (const leg of w.legs.values()) leg.order = null;
   if (isDryRun || !ids.length) return;
   try {
     const c = await getClob();
     await c.cancelOrders(ids);
+    for (const id of ids) {
+      wsMatched.delete(id);
+      orphans.delete(id);
+    }
     log(`[${w.prefix}] window closed — cancelled ${ids.length} resting quotes`);
   } catch (e) {
-    log(`[${w.prefix}] close-cancel failed: ${e.message}`);
+    for (const l of legsSnapshot) {
+      orphans.set(l.id, { price: l.price, size: l.size, at: Date.now(), tries: 0 });
+    }
+    log(`[${w.prefix}] close-cancel failed (${e.message}) — ${ids.length} orders tracked as orphans`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Settlement: positions carried past their window, held until the market
+// resolves. They keep consuming the capital cap (the cash is locked) and are
+// journalled win/loss on resolution — without this the journal only ever shows
+// cuts, and the strategy could never be evaluated.
+// ---------------------------------------------------------------------------
+
+const settling = []; // { slug, conditionId, token, outcome, shares, cost, ... }
+const resolutions = createResolutionCache({
+  host: CLOB_API_HOST,
+  fetchJson,
+  recheckMs: 30000,
+});
+
+const SETTLE_MAX_AGE_MS = 30 * 60 * 1000; // these markets resolve minutes after close
+
+async function settleResolved() {
+  if (!settling.length) return;
+
+  // expire anything that is never going to resolve, so a stuck entry cannot
+  // hold the capital cap hostage and silently stop all quoting
+  for (let i = settling.length - 1; i >= 0; i--) {
+    const p = settling[i];
+    if (Date.now() - p.closedAt < SETTLE_MAX_AGE_MS) continue;
+    settling.splice(i, 1);
+    log(
+      `[settle] ${p.slug} ${p.outcome} ${p.shares} sh: no resolution after ` +
+        `${Math.round(SETTLE_MAX_AGE_MS / 60000)}m — dropped from the books ` +
+        `(cost $${p.cost.toFixed(2)}; check this position manually)`,
+    );
+    journalWrite({
+      at: Date.now(), slug: p.slug, outcome: p.outcome, action: "unsettled",
+      shares: p.shares, cost: round2(p.cost), entryFair: round2(p.entryFair),
+      mode: isDryRun ? "dry" : "live",
+    });
+  }
+  if (!settling.length) return;
+  const ids = [...new Set(settling.map((p) => p.conditionId).filter(Boolean))];
+  try {
+    await resolutions.refresh(ids);
+  } catch {
+    return; // retried on the next sweep
+  }
+  for (let i = settling.length - 1; i >= 0; i--) {
+    const p = settling[i];
+    const c = p.conditionId && resolutions.get(p.conditionId);
+    if (!c || !c.resolved) continue;
+    const won = c.tokens.some((t) => t.tokenId === p.token && t.winner);
+    const payout = won ? p.shares : 0; // winners pay $1/share
+    const pnl = payout - p.cost;
+    stats.held++;
+    stats.heldPnl += pnl;
+    settling.splice(i, 1);
+    log(
+      `[settle] ${p.slug} ${p.outcome} ${p.shares} sh: ${won ? "WON" : "LOST"} ` +
+        `(cost $${p.cost.toFixed(2)}, payout $${payout.toFixed(2)}, ` +
+        `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)})`,
+    );
+    journalWrite({
+      at: Date.now(), slug: p.slug, outcome: p.outcome, action: "held",
+      won, shares: p.shares, cost: round2(p.cost), payout: round2(payout),
+      pnl: round2(pnl), entryFair: round2(p.entryFair),
+      heldSec: Math.round((Date.now() - p.at) / 1000),
+      mode: isDryRun ? "dry" : "live",
+    });
   }
 }
 
@@ -624,23 +723,19 @@ async function closeWindow(w) {
 // Quoting — bid below fair on BOTH sides, independently
 // ---------------------------------------------------------------------------
 
-function activeUsdc() {
-  let s = 0;
-  for (const w of windows.values())
-    for (const l of w.legs.values()) if (l.position) s += l.position.cost;
-  return s;
-}
-
 /** Everything that could turn into cost basis: filled positions, resting bids
  * that may fill at any moment, and placements currently in flight. The legs of
  * a market are quoted concurrently, so the in-flight reservation is what stops
  * both of them passing the cap check in the same tick. */
 function committedUsdc() {
-  let s = 0;
+  // cash locked in positions waiting on resolution is NOT free capital, and
+  // neither is an orphaned order that may still be resting on the exchange
+  let s = settling.reduce((a, p) => a + p.cost, 0);
+  for (const o of orphans.values()) s += o.price * o.size;
   for (const w of windows.values())
     for (const l of w.legs.values()) {
       if (l.position) s += l.position.cost;
-      if (l.order) s += l.order.price * l.order.size;
+      if (l.order) s += l.order.price * (l.order.size - l.order.matched);
       s += l.reserved || 0;
     }
   return s;
@@ -685,7 +780,7 @@ function desiredBid(leg, fair, top, why = {}) {
 
 async function placeBid(w, leg, price) {
   if (isDryRun) {
-    leg.order = { id: `dry-${leg.token.slice(0, 6)}-${Date.now()}`, price, size: clipShares, at: Date.now() };
+    leg.order = { id: `dry-${leg.token.slice(0, 6)}-${Date.now()}`, price, size: clipShares, matched: 0, at: Date.now() };
     log(`[DRY] [${w.prefix}] quote ${leg.outcome} ${clipShares} sh @ ${price}`);
     return;
   }
@@ -697,21 +792,64 @@ async function placeBid(w, leg, price) {
   const resp = await c.postOrder(order, c._OrderType.GTC);
   if (!resp || resp.error || resp.success === false)
     throw new Error(resp?.error || resp?.errorMsg || "rejected");
-  leg.order = { id: resp.orderID, price, size: clipShares, at: Date.now() };
+  leg.order = { id: resp.orderID, price, size: clipShares, matched: 0, at: Date.now() };
   log(`[${w.prefix}] quote ${leg.outcome} ${clipShares} sh @ ${price}`);
 }
 
+/** Orders we believe are still live on the exchange but no longer track on a
+ * leg, because their cancel failed. They keep consuming the capital cap and
+ * are retried until the exchange confirms they are gone. */
+const orphans = new Map(); // orderID -> { price, size, at, tries }
+
 async function cancelBid(leg) {
-  const id = leg.order?.id;
+  const order = leg.order;
   leg.order = null;
-  if (id) wsMatched.delete(id);
-  if (!id || isDryRun) return;
+  if (!order) return;
+  if (isDryRun) {
+    wsMatched.delete(order.id);
+    return;
+  }
   try {
     const c = await getClob();
-    await c.cancelOrders([id]);
-  } catch {
-    /* already filled or gone */
+    await c.cancelOrders([order.id]);
+    wsMatched.delete(order.id);
+    orphans.delete(order.id);
+  } catch (e) {
+    // The order may still be resting. Do NOT forget it: keep it on the books
+    // and retry, or a blip leaves a live bid nobody is watching.
+    orphans.set(order.id, {
+      price: order.price,
+      size: round2(order.size - order.matched),
+      at: Date.now(),
+      tries: 0,
+    });
+    log(`[${leg.outcome}] cancel failed (${e.message}) — order ${order.id.slice(0, 10)}… tracked as orphan, will retry`);
   }
+}
+
+/** Retry cancelling orphaned orders; give up (loudly) after enough attempts. */
+async function sweepOrphans() {
+  if (isDryRun || !orphans.size) return;
+  const c = await getClob();
+  await Promise.all(
+    [...orphans.entries()].map(async ([id, o]) => {
+      o.tries++;
+      try {
+        await c.cancelOrders([id]);
+        orphans.delete(id);
+        wsMatched.delete(id);
+        log(`orphan ${id.slice(0, 10)}… cancelled on retry ${o.tries}`);
+      } catch (e) {
+        if (o.tries >= 10) {
+          orphans.delete(id);
+          log(
+            `orphan ${id.slice(0, 10)}… still uncancellable after ${o.tries} tries ` +
+              `(${e.message}) — dropped; CHECK THIS ORDER MANUALLY`,
+          );
+        }
+      }
+    }),
+  );
 }
 
 async function manageQuote(w, leg, fair) {
@@ -783,9 +921,7 @@ async function pollFills(w) {
   } else if (userWsHealthy()) {
     // push path: the socket already told us what is matched. REST is still run
     // periodically below as a reconciliation sweep, never on the hot path.
-    matches = legs.map((l) =>
-      Math.min(wsMatched.get(l.order.id) || 0, l.order.size),
-    );
+    matches = legs.map((l) => Math.min(wsMatched.get(l.order.id) || 0, l.order.size));
     if (Date.now() - w.lastReconcileAt > fillReconcileMs) {
       w.lastReconcileAt = Date.now();
       const c = await getClob();
@@ -815,28 +951,28 @@ async function pollFills(w) {
 
   for (let i = 0; i < legs.length; i++) {
     const leg = legs[i];
-    const matched = matches[i];
+    // Both the socket and getOrder report size_matched CUMULATIVELY for the
+    // life of the order. Book the DELTA against what we already counted —
+    // treating each reading as new shares double-counts every partial fill.
+    const cumulative = Math.min(matches[i], leg.order.size);
+    const matched = round2(cumulative - leg.order.matched);
     if (matched <= 0) continue;
+    leg.order.matched = cumulative;
+
     const px = leg.order.price;
     const fair = currentFair(w, leg);
     leg.position = leg.position || { shares: 0, cost: 0, at: Date.now(), entryFair: fair };
-    leg.position.shares += matched;
+    leg.position.shares = round2(leg.position.shares + matched);
     leg.position.cost += matched * px;
-    leg.position.at = leg.position.at || Date.now();
     leg.exited = false;
     stats.clips++;
     log(
       `[${w.prefix}] FILLED ${leg.outcome} ${matched} sh @ ${px} ` +
         `(fair ${fair.toFixed(3)}, position ${leg.position.shares} sh)`,
     );
-    if (matched >= leg.order.size) {
+    if (cumulative >= leg.order.size - 1e-9) {
       wsMatched.delete(leg.order.id);
-      leg.order = null;
-    } else {
-      // remaining size shrinks; zero the counter so the next event's absolute
-      // size_matched is measured against what is still resting
-      wsMatched.set(leg.order.id, 0);
-      leg.order.size -= matched;
+      leg.order = null; // fully filled; nothing resting
     }
   }
 }
@@ -891,11 +1027,13 @@ async function maybeExit(w, leg, fair) {
   const pnl = proceeds - p.cost;
   leg.exited = true;
   stats.cuts++;
-  stats.cutPnl += pnl;
   const line =
     `[${w.prefix}] CUT ${leg.outcome} ${p.shares} sh @ ${bid} — ${why} ` +
     `(cost $${p.cost.toFixed(2)}, got $${proceeds.toFixed(2)}, ${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}, ` +
     `held ${Math.round((Date.now() - p.at) / 1000)}s)`;
+
+  let soldShares = p.shares;
+  let gotUsdc = proceeds;
 
   if (isDryRun) {
     log(`[DRY] ${line}`);
@@ -909,20 +1047,52 @@ async function maybeExit(w, leg, fair) {
       const resp = await c.postOrder(order, c._OrderType.FAK);
       if (!resp || resp.error || resp.success === false)
         throw new Error(resp?.error || resp?.errorMsg || "rejected");
-      log(line);
+      // A FAK is accepted even when it fills NOTHING (the bid moved) and can
+      // fill partially when the level is thin. Book what actually executed —
+      // SELL: makingAmount = shares given up, takingAmount = USDC received.
+      const madeSh = Number(resp.makingAmount);
+      const tookUsdc = Number(resp.takingAmount);
+      soldShares = Number.isFinite(madeSh) && madeSh > 0 ? Math.min(madeSh, p.shares) : 0;
+      gotUsdc = Number.isFinite(tookUsdc) && tookUsdc > 0 ? tookUsdc : soldShares * bid;
+      if (soldShares <= 0) {
+        leg.exited = false; // nothing sold — retry on the next tick
+        log(`[${w.prefix}] cut filled NOTHING ${leg.outcome} (bid moved) — retrying`);
+        return;
+      }
+      log(
+        soldShares >= p.shares - 1e-9
+          ? line
+          : `[${w.prefix}] CUT PARTIAL ${leg.outcome} ${soldShares}/${p.shares} sh @ ${bid} — ${why} ` +
+            `(got $${gotUsdc.toFixed(2)}; ${round2(p.shares - soldShares)} sh still held)`,
+      );
     } catch (e) {
       leg.exited = false; // let the next tick retry the cut
       log(`[${w.prefix}] cut FAILED ${leg.outcome}: ${e.message}`);
       return;
     }
   }
+
+  // cost basis leaves with the shares that actually sold
+  const costOut = p.cost * (soldShares / p.shares);
+  const realized = gotUsdc - costOut;
+  stats.cutPnl += realized;
   journalWrite({
     at: Date.now(), slug: w.slug, outcome: leg.outcome, action: "cut", why,
-    shares: p.shares, cost: round2(p.cost), proceeds: round2(proceeds), pnl: round2(pnl),
+    shares: round2(soldShares), cost: round2(costOut), proceeds: round2(gotUsdc),
+    pnl: round2(realized), partial: soldShares < p.shares - 1e-9,
     heldSec: Math.round((Date.now() - p.at) / 1000),
     entryFair: round2(p.entryFair), exitFair: round2(fair), mode: isDryRun ? "dry" : "live",
   });
-  leg.position = null;
+
+  const left = round2(p.shares - soldShares);
+  if (left > 0.009) {
+    // keep the remainder on the books and let the next tick try again
+    p.shares = left;
+    p.cost = round2(p.cost - costOut);
+    leg.exited = false;
+  } else {
+    leg.position = null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,6 +1178,13 @@ function syncSubscriptions() {
 async function tick() {
   await Promise.all(series.map((s) => tickSeries(s).catch((e) => log(`[${s.prefix}] tick error: ${e.message}`))));
   syncSubscriptions();
+  // settlement is slow (resolution lookups) and never time-critical — fire and
+  // forget so it can never delay a quote
+  if ((settling.length || orphans.size) && Date.now() - lastSettleAt > 15000) {
+    lastSettleAt = Date.now();
+    settleResolved().catch((e) => log("settle error:", e.message || e));
+    sweepOrphans().catch((e) => log("orphan sweep error:", e.message || e));
+  }
 }
 
 function validate() {
@@ -1048,9 +1225,11 @@ async function main() {
   }, cadence);
   setInterval(() => {
     log(
-      `stats: ${stats.clips} clips filled, ${stats.cuts} cuts, ` +
-        `cut P&L ${stats.cutPnl >= 0 ? "+" : ""}$${stats.cutPnl.toFixed(2)}, ` +
-        `active $${activeUsdc().toFixed(2)}`,
+      `stats: ${stats.clips} clips, ${stats.cuts} cuts ` +
+        `(${stats.cutPnl >= 0 ? "+" : ""}$${stats.cutPnl.toFixed(2)}), ` +
+        `${stats.held} settled (${stats.heldPnl >= 0 ? "+" : ""}$${stats.heldPnl.toFixed(2)}), ` +
+        `net ${stats.cutPnl + stats.heldPnl >= 0 ? "+" : ""}$${(stats.cutPnl + stats.heldPnl).toFixed(2)}, ` +
+        `committed $${committedUsdc().toFixed(2)} (${settling.length} awaiting resolution)`,
     );
   }, 60000).unref();
 }
