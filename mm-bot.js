@@ -86,6 +86,10 @@ const {
   // never quote a leg whose fair is already this close to the cut floor —
   // otherwise the fill and the cut land on the same tick and we just pay spread
   MM_EXIT_QUOTE_BUFFER = "0.05",
+  // after cutting a leg, don't requote it for this long — otherwise fair
+  // oscillating across the floor within one window re-buys and re-cuts the
+  // same leg repeatedly, paying the spread every time (churn, not signal).
+  MM_CUT_COOLDOWN_SEC = "45",
 
   // Floor on tau inside the fair-value model. P(up) divides by sqrt(tau), so
   // without this the model snaps to 0/1 in the closing seconds and drives
@@ -127,6 +131,7 @@ const exitMinTau = Number(MM_EXIT_MIN_TAU_SEC);
 const exitRequireBook =
   MM_EXIT_REQUIRE_BOOK === "1" || MM_EXIT_REQUIRE_BOOK.toLowerCase() === "true";
 const exitQuoteBuffer = Number(MM_EXIT_QUOTE_BUFFER);
+const cutCooldownSec = Number(MM_CUT_COOLDOWN_SEC);
 const fairMinTau = Math.max(1, Number(MM_FAIR_MIN_TAU_SEC) || 1);
 const maxActiveUsdc = Number(MM_MAX_ACTIVE_USDC);
 const volFallback = Number(MM_VOL_FALLBACK);
@@ -778,6 +783,7 @@ function freshLeg(token, outcome) {
     reserved: 0,   // USDC committed by a placement currently in flight
     exited: false,
     blockReason: null, // why we are not quoting right now (dashboard/telemetry)
+    cutAt: undefined,  // Date.now() of the last completed cut — requote cooldown
   };
 }
 
@@ -1112,6 +1118,19 @@ async function manageQuote(w, leg, fair) {
     if (leg.order) await cancelBid(leg);
     return;
   }
+  // Cooldown after a cut: fair oscillating across the floor within one window
+  // was re-buying and re-cutting the same leg repeatedly — 22 of 27 live cuts
+  // in one session were repeat cuts on the same window+side, costing more
+  // than every other loss combined. Don't touch this leg again until the
+  // cooldown clears, however tempting the model's fair looks in the meantime.
+  if (leg.cutAt != null) {
+    const sinceCut = (Date.now() - leg.cutAt) / 1000;
+    if (sinceCut < cutCooldownSec) {
+      noteBlocked(leg, `cut cooldown (${Math.round(cutCooldownSec - sinceCut)}s left)`);
+      if (leg.order) await cancelBid(leg);
+      return;
+    }
+  }
   // Never quote into our own cut rule. Buying a leg already at (or a hair
   // above) the exit floor means the fill and the cut land on the same tick and
   // we just pay the spread: 77 of the first 148 cuts were held <=1s.
@@ -1384,6 +1403,7 @@ async function maybeExit(w, leg, fair) {
     leg.exited = false;
   } else {
     leg.position = null;
+    leg.cutAt = Date.now(); // starts the requote cooldown — see manageQuote
   }
 }
 
