@@ -80,6 +80,17 @@ const {
   MM_EXIT_FAIR_FLOOR = "0.35", // cut if fair for the held side drops under this
   MM_EXIT_MAX_HOLD_SEC = "120", // backstop: their p75 hold was 108s
   MM_EXIT_MIN_TAU_SEC = "12", // too close to close to exit; ride it out
+  // 1 = a model-driven cut needs the book to corroborate it (see exitReason).
+  // Set to 0 to get the old model-only exits back for comparison.
+  MM_EXIT_REQUIRE_BOOK = "1",
+  // never quote a leg whose fair is already this close to the cut floor —
+  // otherwise the fill and the cut land on the same tick and we just pay spread
+  MM_EXIT_QUOTE_BUFFER = "0.05",
+
+  // Floor on tau inside the fair-value model. P(up) divides by sqrt(tau), so
+  // without this the model snaps to 0/1 in the closing seconds and drives
+  // exits off a number the market flatly contradicts. 0 disables the floor.
+  MM_FAIR_MIN_TAU_SEC = "30",
 
   MM_MAX_ACTIVE_USDC = "50", // hard cap on cost basis outstanding at once
   MM_VOL_FALLBACK = "0.0003", // per-second log-return vol until measured
@@ -113,6 +124,10 @@ const exitFairDrop = Number(MM_EXIT_FAIR_DROP);
 const exitFairFloor = Number(MM_EXIT_FAIR_FLOOR);
 const exitMaxHold = Number(MM_EXIT_MAX_HOLD_SEC);
 const exitMinTau = Number(MM_EXIT_MIN_TAU_SEC);
+const exitRequireBook =
+  MM_EXIT_REQUIRE_BOOK === "1" || MM_EXIT_REQUIRE_BOOK.toLowerCase() === "true";
+const exitQuoteBuffer = Number(MM_EXIT_QUOTE_BUFFER);
+const fairMinTau = Math.max(1, Number(MM_FAIR_MIN_TAU_SEC) || 1);
 const maxActiveUsdc = Number(MM_MAX_ACTIVE_USDC);
 const volFallback = Number(MM_VOL_FALLBACK);
 const telemetryMs = Math.max(250, Number(MM_TELEMETRY_MS) || 1000);
@@ -219,9 +234,19 @@ function phi(z) {
   return 0.5 * (1 + (z >= 0 ? erf : -erf));
 }
 
-/** P(window closes UP) given spot, strike, seconds left, per-second vol. */
-function fairUp(mid, strike, tau, sigma) {
-  return phi(Math.log(mid / strike) / (sigma * Math.sqrt(Math.max(tau, 1))));
+/**
+ * P(window closes UP) given spot, strike, seconds left, per-second vol.
+ *
+ * tau is floored (MM_FAIR_MIN_TAU_SEC). Because the z-score divides by
+ * sqrt(tau), an unfloored model goes to 0 or 1 as the window closes: measured
+ * over 5,480 samples, 33% of readings inside the last 75s sat below 0.05 or
+ * above 0.95, and the book contradicted more than half of those by over 0.15.
+ * Mean absolute error tripled (0.107 early -> 0.331 in the final sixth). We
+ * cannot quote that late anyway, but exits still fire there, so the model must
+ * not manufacture certainty it has not earned.
+ */
+function fairUp(mid, strike, tau, sigma, minTau = fairMinTau) {
+  return phi(Math.log(mid / strike) / (sigma * Math.sqrt(Math.max(tau, minTau))));
 }
 
 // ---------------------------------------------------------------------------
@@ -693,6 +718,7 @@ function writeTelemetry() {
         series: series.map((s) => s.prefix),
         clipShares, margin, requoteAt, maxClips, minPrice, maxPrice, maxDisagree,
         maxActiveUsdc, exitFairDrop, exitFairFloor, exitMaxHold, exitMinTau,
+        exitRequireBook, exitQuoteBuffer, fairMinTau,
         quoteStart, quoteEndFrac, cancelBefore, loopMs: telemetryMs,
       },
       feeds: {
@@ -1059,6 +1085,15 @@ async function sweepOrphans() {
   );
 }
 
+/** True once a leg's price (model or book) has fallen into our own cut zone —
+ * used both to stop quoting into it and to pull a resting order before it can
+ * fill at a price we're about to reject anyway. */
+function inCutTerritory(leg, fair) {
+  const bookMid = midOf(leg.book);
+  const cutFloor = exitFairFloor + exitQuoteBuffer;
+  return fair < cutFloor || (bookMid != null && bookMid < cutFloor);
+}
+
 async function manageQuote(w, leg, fair) {
   const t = Date.now() / 1000 - w.start;
   const tau = w.seconds - t;
@@ -1074,6 +1109,24 @@ async function manageQuote(w, leg, fair) {
   const clips = leg.position ? leg.position.shares / clipShares : 0;
   if (clips >= maxClips || committedUsdc() >= maxActiveUsdc) {
     noteBlocked(leg, clips >= maxClips ? "inventory cap" : "capital cap");
+    if (leg.order) await cancelBid(leg);
+    return;
+  }
+  // Never quote into our own cut rule. Buying a leg already at (or a hair
+  // above) the exit floor means the fill and the cut land on the same tick and
+  // we just pay the spread: 77 of the first 148 cuts were held <=1s.
+  //
+  // BOTH opinions have to clear the floor, not just the model's. Gating on fair
+  // alone left the hole wide open — in a paired A/B, 14 of 16 cuts still fired
+  // through the book-under-floor path with 12 of them inside a second, because
+  // nothing stopped us bidding for a leg the market itself already priced below
+  // the floor. (Consequence worth knowing: with the default 0.35 floor this
+  // makes the bot a one-sided maker on whichever leg is above ~0.40. Lower
+  // MM_EXIT_FAIR_FLOOR if you want it quoting both sides.)
+  if (inCutTerritory(leg, fair)) {
+    const bookMid = midOf(leg.book);
+    const cutFloor = exitFairFloor + exitQuoteBuffer;
+    noteBlocked(leg, fair < cutFloor ? "fair in cut territory" : "book in cut territory");
     if (leg.order) await cancelBid(leg);
     return;
   }
@@ -1208,13 +1261,41 @@ function currentFair(w, leg) {
   return legFair(leg, marketFairUp(w));
 }
 
-/** Why we should cut this position now, or null to keep holding. */
+/** Book mid, or null when the book is one-sided. */
+function midOf(book) {
+  return book.bid != null && book.ask != null ? (book.bid + book.ask) / 2 : null;
+}
+
+/**
+ * Why we should cut this position now, or null to keep holding.
+ *
+ * A cut is a real sale into the bid, so it pays the spread every time. Entries
+ * already refuse to act when the book disagrees with the model by more than
+ * maxDisagree; exits had no equivalent check, and that asymmetry was the single
+ * biggest loss in the first live-shaped run: 148 model-driven cuts for -$79.75
+ * against +$24.60 from the 19 positions that were simply held to resolution.
+ * The bot was only entering when model and market agreed, then exiting on
+ * model-only moves that were frequently the model's own error.
+ *
+ * So model-driven triggers now need the book to corroborate them. The market's
+ * own verdict still stands on its own — if the book itself prices the leg under
+ * the floor, that is not a model opinion and we cut regardless.
+ */
 function exitReason(w, leg, fair) {
   const p = leg.position;
   if (!p || leg.exited) return null;
   const tau = w.start + w.seconds - Date.now() / 1000;
   if (tau < exitMinTau) return null; // too late to exit cleanly; let it resolve
   const heldSec = (Date.now() - p.at) / 1000;
+  const mid = midOf(leg.book);
+
+  // the market's own opinion needs no second source
+  if (mid != null && mid < exitFairFloor)
+    return `book ${mid.toFixed(3)} under floor ${exitFairFloor}`;
+
+  // ...but the model's does, when the two are far apart
+  if (exitRequireBook && mid != null && Math.abs(fair - mid) > maxDisagree) return null;
+
   if (fair < exitFairFloor) return `fair ${fair.toFixed(3)} under floor ${exitFairFloor}`;
   if (p.entryFair - fair >= exitFairDrop)
     return `fair fell ${(p.entryFair - fair).toFixed(3)} from entry ${p.entryFair.toFixed(3)}`;
@@ -1357,10 +1438,29 @@ async function tickSeries(s) {
   if (idle) return;
 
   await refreshBooks(w);
-  await pollFills(w);
 
   // One fair value for the market; each leg derives its own side from it.
   const up = marketFairUp(w);
+
+  // Pull any resting order whose leg has already crashed into cut territory
+  // BEFORE polling fills against this same fresh book. Otherwise a bid placed
+  // a tick ago fills at its old (now-stale) price and gets cut on the very
+  // same tick — the fill and the exit landing back to back for no reason
+  // other than the cancel arriving one step too late. This is the race the
+  // in-manageQuote cutFloor gate can't close on its own: manageQuote runs
+  // AFTER pollFills, so by the time it would pull the order, pollFills has
+  // already matched it.
+  await Promise.all(
+    [...w.legs.values()].map((leg) => {
+      if (!leg.order || leg.position) return null; // only pre-empt orders that haven't filled yet
+      if (!leg.book.at || Date.now() - leg.book.at > bookStaleMs) return null; // handled in the loop below
+      const fair = legFair(leg, up);
+      return inCutTerritory(leg, fair) ? cancelBid(leg) : null;
+    }),
+  );
+
+  await pollFills(w);
+
   // Legs are independent — handle them concurrently so Down does not wait on
   // Up's cancel/place round-trips. The capital cap is enforced through
   // committedUsdc(), which counts in-flight placements.

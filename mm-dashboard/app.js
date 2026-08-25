@@ -316,6 +316,7 @@ function ErrorByPhase({ rows, seconds }) {
 
 function Calibration({ rows, status }) {
   const maxDisagree = status?.config?.maxDisagree ?? 0.15;
+  const margin = status?.config?.margin ?? 0.04;
   const seconds = status?.windows?.[0]?.seconds || 300;
 
   const m = useMemo(() => {
@@ -325,38 +326,43 @@ function Calibration({ rows, status }) {
     const absMean = gaps.reduce((a, b) => a + Math.abs(b), 0) / gaps.length;
     const over = gaps.filter((g) => Math.abs(g) > maxDisagree).length / gaps.length;
     const oneWay = Math.abs(mean) / (absMean || 1); // 1 = every miss in one direction
-    return { n: gaps.length, mean, absMean, over, oneWay };
-  }, [rows, maxDisagree]);
+    return { n: gaps.length, mean, absMean, over, oneWay, ratio: absMean / (margin || 0.04) };
+  }, [rows, maxDisagree, margin]);
 
+  // The grade that matters is absolute error against the margin we are trying
+  // to earn. An early version passed the model as "tracking the book" on a near
+  // zero mean signed error while it was losing money: unbiased is not the same
+  // as accurate, and it is the size of the miss, not its direction, that
+  // decides whether a fair-value edge survives the spread.
   let verdict = null;
   if (m && m.n >= 30) {
-    if (Math.abs(m.mean) > maxDisagree * 0.5 && m.oneWay > 0.6) {
+    if (m.ratio > 1) {
       verdict = {
         cls: "bad",
-        title: "Model looks biased, not just noisy",
-        body: `Mean signed error is ${m.mean > 0 ? "+" : ""}${m.mean.toFixed(3)} and ${Math.round(
-          m.oneWay * 100,
-        )}% of the average miss is in one direction. A one-sided error like this is a strike or vol problem, not market noise — the bot will systematically buy the ${
-          m.mean > 0 ? "Up" : "Down"
-        } side too dear. Check that the strike matches Polymarket's reference price before trading this live.`,
+        title: `Error is ${m.ratio.toFixed(1)}× the edge being quoted`,
+        body: `Mean absolute error ${m.absMean.toFixed(3)} against a ${margin} margin. The edge is smaller than the measurement noise, so fills are close to a coin flip on the model's own terms — profitable only by luck. ${
+          m.oneWay > 0.6
+            ? `The miss is also one-sided (mean ${m.mean > 0 ? "+" : ""}${m.mean.toFixed(3)}), which points at the strike or vol input rather than market noise.`
+            : `The miss is symmetric (mean ${m.mean > 0 ? "+" : ""}${m.mean.toFixed(3)}), so this is noise and overconfidence, not a constant offset.`
+        }`,
       };
-    } else if (m.over > 0.5) {
+    } else if (m.ratio > 0.5 || m.over > 0.5) {
       verdict = {
         cls: "warn",
-        title: "Sitting out more than half the time",
-        body: `${Math.round(
-          m.over * 100,
-        )}% of samples exceed the ${maxDisagree} disagreement guard, so the bot is declining to quote most of the window. Either the model needs work or the guard is too tight to ever make a market.`,
+        title: "Edge is thin relative to the error",
+        body: `Mean absolute error ${m.absMean.toFixed(3)} against a ${margin} margin (${m.ratio.toFixed(
+          1,
+        )}×), ${Math.round(m.over * 100)}% of samples outside the ${maxDisagree} guard. Tradeable in principle, but the model needs to be roughly twice this accurate before the spread capture is reliable.`,
       };
     } else {
       verdict = {
         cls: "good",
-        title: "Model is tracking the book",
-        body: `Mean absolute error ${m.absMean.toFixed(3)}, ${Math.round(
+        title: "Model is sharper than the edge it quotes",
+        body: `Mean absolute error ${m.absMean.toFixed(3)} against a ${margin} margin (${m.ratio.toFixed(
+          1,
+        )}×), bias ${m.mean > 0 ? "+" : ""}${m.mean.toFixed(3)}, ${Math.round(
           m.over * 100,
-        )}% of samples outside the guard. Bias is small (${m.mean > 0 ? "+" : ""}${m.mean.toFixed(
-          3,
-        )}). This is the regime where the spread capture can actually earn.`,
+        )}% outside the guard. This is the regime where the spread capture can actually earn.`,
       };
     }
   }
@@ -377,6 +383,10 @@ function Calibration({ rows, status }) {
             <dd className=${pnlClass(-Math.abs(m.mean))}>${m.mean >= 0 ? "+" : ""}${m.mean.toFixed(3)}</dd>
             <dt>mean absolute error</dt>
             <dd>${m.absMean.toFixed(3)}</dd>
+            <dt>error ÷ quoted margin</dt>
+            <dd className=${m.ratio > 1 ? "neg" : m.ratio > 0.5 ? "" : "pos"}>
+              ${m.ratio.toFixed(1)}×
+            </dd>
             <dt>outside the ${maxDisagree} guard</dt>
             <dd>${(m.over * 100).toFixed(0)}%</dd>
           </dl>
