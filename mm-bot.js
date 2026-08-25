@@ -86,10 +86,12 @@ const {
   // never quote a leg whose fair is already this close to the cut floor —
   // otherwise the fill and the cut land on the same tick and we just pay spread
   MM_EXIT_QUOTE_BUFFER = "0.05",
-  // after cutting a leg, don't requote it for this long — otherwise fair
-  // oscillating across the floor within one window re-buys and re-cuts the
-  // same leg repeatedly, paying the spread every time (churn, not signal).
-  MM_CUT_COOLDOWN_SEC = "45",
+  // after cutting a leg, require fair to sit continuously above the cut floor
+  // for this long before trusting it enough to requote. A flat time-based
+  // cooldown blocks genuine fast recoveries just as hard as it blocks noise —
+  // this instead lets a real, sustained move back in immediately while still
+  // rejecting the spike-then-reverse pattern that was driving repeat cuts.
+  MM_CUT_REQUOTE_CONFIRM_SEC = "8",
 
   // Floor on tau inside the fair-value model. P(up) divides by sqrt(tau), so
   // without this the model snaps to 0/1 in the closing seconds and drives
@@ -131,7 +133,7 @@ const exitMinTau = Number(MM_EXIT_MIN_TAU_SEC);
 const exitRequireBook =
   MM_EXIT_REQUIRE_BOOK === "1" || MM_EXIT_REQUIRE_BOOK.toLowerCase() === "true";
 const exitQuoteBuffer = Number(MM_EXIT_QUOTE_BUFFER);
-const cutCooldownSec = Number(MM_CUT_COOLDOWN_SEC);
+const cutRequoteConfirmSec = Number(MM_CUT_REQUOTE_CONFIRM_SEC);
 const fairMinTau = Math.max(1, Number(MM_FAIR_MIN_TAU_SEC) || 1);
 const maxActiveUsdc = Number(MM_MAX_ACTIVE_USDC);
 const volFallback = Number(MM_VOL_FALLBACK);
@@ -783,7 +785,11 @@ function freshLeg(token, outcome) {
     reserved: 0,   // USDC committed by a placement currently in flight
     exited: false,
     blockReason: null, // why we are not quoting right now (dashboard/telemetry)
-    cutAt: undefined,  // Date.now() of the last completed cut — requote cooldown
+    cutAt: undefined,  // Date.now() of the last completed cut — cleared once the
+                       // post-cut recovery is confirmed (see aboveFloorSince)
+    aboveFloorSince: undefined, // Date.now() this leg most recently crossed back
+                       // out of cut territory; null while inside it. A cut is
+                       // only trusted to requote once this has held long enough.
   };
 }
 
@@ -1118,19 +1124,6 @@ async function manageQuote(w, leg, fair) {
     if (leg.order) await cancelBid(leg);
     return;
   }
-  // Cooldown after a cut: fair oscillating across the floor within one window
-  // was re-buying and re-cutting the same leg repeatedly — 22 of 27 live cuts
-  // in one session were repeat cuts on the same window+side, costing more
-  // than every other loss combined. Don't touch this leg again until the
-  // cooldown clears, however tempting the model's fair looks in the meantime.
-  if (leg.cutAt != null) {
-    const sinceCut = (Date.now() - leg.cutAt) / 1000;
-    if (sinceCut < cutCooldownSec) {
-      noteBlocked(leg, `cut cooldown (${Math.round(cutCooldownSec - sinceCut)}s left)`);
-      if (leg.order) await cancelBid(leg);
-      return;
-    }
-  }
   // Never quote into our own cut rule. Buying a leg already at (or a hair
   // above) the exit floor means the fill and the cut land on the same tick and
   // we just pay the spread: 77 of the first 148 cuts were held <=1s.
@@ -1142,12 +1135,39 @@ async function manageQuote(w, leg, fair) {
   // the floor. (Consequence worth knowing: with the default 0.35 floor this
   // makes the bot a one-sided maker on whichever leg is above ~0.40. Lower
   // MM_EXIT_FAIR_FLOOR if you want it quoting both sides.)
+  //
+  // While here, track how long this leg has sat OUTSIDE cut territory —
+  // reset to null every time it dips back in, started fresh the moment it
+  // clears. This is what lets a post-cut requote require a real, held
+  // recovery instead of either a fixed timer (blocks genuine fast recoveries
+  // just as hard as noise) or nothing (22 of 27 live cuts in one session were
+  // instant repeat buy/cut cycles on the same leg, costing more than every
+  // other loss combined).
   if (inCutTerritory(leg, fair)) {
+    leg.aboveFloorSince = null;
     const bookMid = midOf(leg.book);
     const cutFloor = exitFairFloor + exitQuoteBuffer;
     noteBlocked(leg, fair < cutFloor ? "fair in cut territory" : "book in cut territory");
     if (leg.order) await cancelBid(leg);
     return;
+  }
+  if (leg.aboveFloorSince == null) leg.aboveFloorSince = Date.now();
+
+  // After a cut, don't trust the recovery until it's held for a while —
+  // a spike that reverses in a couple of ticks is exactly the noise this
+  // guards against, but a real, sustained move back in is let through as
+  // soon as it's confirmed rather than waiting out a fixed clock.
+  if (leg.cutAt != null) {
+    const heldAboveSec = (Date.now() - leg.aboveFloorSince) / 1000;
+    if (heldAboveSec < cutRequoteConfirmSec) {
+      noteBlocked(
+        leg,
+        `requote needs ${cutRequoteConfirmSec}s stable above floor (${heldAboveSec.toFixed(1)}s so far)`,
+      );
+      if (leg.order) await cancelBid(leg);
+      return;
+    }
+    leg.cutAt = undefined; // recovery confirmed — back to normal quoting
   }
   const why = {};
   const want = desiredBid(leg, fair, leg.book, why);
@@ -1403,7 +1423,7 @@ async function maybeExit(w, leg, fair) {
     leg.exited = false;
   } else {
     leg.position = null;
-    leg.cutAt = Date.now(); // starts the requote cooldown — see manageQuote
+    leg.cutAt = Date.now(); // marks this leg as needing a confirmed recovery — see manageQuote
   }
 }
 

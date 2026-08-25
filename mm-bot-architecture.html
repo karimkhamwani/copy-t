@@ -1,0 +1,441 @@
+<title>MM Bot Mechanism</title>
+<style>
+  :root {
+    --bg: #f4f5fa;
+    --surface: #ffffff;
+    --surface-2: #eceefa;
+    --border: #d5d8e6;
+    --text: #171a26;
+    --text-dim: #5c6178;
+    --accent: #4f4fd8;
+    --accent-soft: #e7e7fb;
+    --warm: #c0631a;
+    --warm-soft: #fbeadb;
+    --good: #1a8f52;
+    --bad: #c23b34;
+    --bad-soft: #fbe8e6;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+    --sans: "IBM Plex Sans", system-ui, sans-serif;
+    --disp: "Manrope", var(--sans);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0d0e16;
+      --surface: #151725;
+      --surface-2: #1b1e30;
+      --border: #2b2f45;
+      --text: #eceefb;
+      --text-dim: #9498b3;
+      --accent: #9291f2;
+      --accent-soft: #232349;
+      --warm: #e2954f;
+      --warm-soft: #362613;
+      --good: #46d485;
+      --bad: #f2766e;
+      --bad-soft: #3a1b1a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0d0e16;
+    --surface: #151725;
+    --surface-2: #1b1e30;
+    --border: #2b2f45;
+    --text: #eceefb;
+    --text-dim: #9498b3;
+    --accent: #9291f2;
+    --accent-soft: #232349;
+    --warm: #e2954f;
+    --warm-soft: #362613;
+    --good: #46d485;
+    --bad: #f2766e;
+    --bad-soft: #3a1b1a;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    margin: 0;
+    padding: 48px 24px 96px;
+  }
+  main {
+    max-width: 1180px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 44px;
+  }
+
+  header { display: flex; flex-direction: column; gap: 10px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h1 {
+    font-family: var(--disp);
+    font-weight: 700;
+    font-size: clamp(28px, 4vw, 40px);
+    margin: 0;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+  .dek {
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--text-dim);
+    max-width: 68ch;
+  }
+  .dek code { font-family: var(--mono); font-size: 0.92em; color: var(--text); }
+
+  figure { margin: 0; display: flex; flex-direction: column; gap: 14px; }
+  .diagram-frame {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 20px;
+    overflow-x: auto;
+  }
+  svg { display: block; width: 100%; height: auto; min-width: 880px; }
+  figcaption {
+    font-size: 13.5px;
+    color: var(--text-dim);
+    line-height: 1.55;
+    max-width: 74ch;
+  }
+  figcaption b { color: var(--text); font-weight: 600; }
+
+  section { display: flex; flex-direction: column; gap: 16px; }
+  h2 {
+    font-family: var(--disp);
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  .cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 14px;
+  }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .card .label {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  .card p { margin: 0; font-size: 14px; line-height: 1.55; color: var(--text-dim); }
+  .card code {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    background: var(--surface-2);
+    padding: 1px 5px;
+    border-radius: 4px;
+    color: var(--text);
+  }
+
+  .gap-callout {
+    border: 1px solid var(--bad);
+    background: var(--bad-soft);
+    border-radius: 12px;
+    padding: 18px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .gap-callout .label {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--bad);
+    font-weight: 600;
+  }
+  .gap-callout p { margin: 0; font-size: 14.5px; line-height: 1.6; color: var(--text); }
+  .gap-callout .stat {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    font-size: 13px;
+    color: var(--text-dim);
+  }
+  .gap-callout .stat b { color: var(--bad); font-weight: 600; }
+
+  footer {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    border-top: 1px solid var(--border);
+    padding-top: 16px;
+  }
+</style>
+
+<main>
+  <header>
+    <span class="eyebrow">mm-bot.js — market maker</span>
+    <h1>What the bot actually does</h1>
+    <p class="dek">
+      A 250ms loop that reads Binance spot to price two Polymarket outcomes
+      (<code>Up</code> / <code>Down</code>) on its own model, quotes passive bids
+      below that price, and cuts fast when the model turns. No resting offers,
+      no requirement that the pair sum under $1 — modeled on wallet
+      <code>0xeebde7a0…</code>.
+    </p>
+  </header>
+
+  <figure>
+    <div class="diagram-frame">
+      <svg viewBox="0 0 1200 660" role="img" aria-label="Data flow through mm-bot.js: Binance and Polymarket feeds enter a 250ms tick pipeline (roll window, refresh books, compute fair value, pre-fill cut sweep, poll fills, per-leg exit and quote decision), which places or cancels bids back on the CLOB, journals cuts and resolutions, and feeds a dashboard on port 3211. A callout marks the churn gap: a cut clears a position and the leg is immediately re-quotable with no cooldown.">
+
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0,0 L10,5 L0,10 z" fill="currentColor" />
+          </marker>
+        </defs>
+
+        <g font-family="IBM Plex Mono, ui-monospace, monospace" font-size="10.5">
+
+          <!-- Row A: external systems -->
+          <g>
+            <rect x="30" y="28" width="330" height="62" rx="9" fill="none" stroke="currentColor" opacity="0.55"/>
+            <text x="46" y="53" font-size="13" font-weight="600" fill="currentColor">BINANCE</text>
+            <text x="46" y="70" fill="currentColor" opacity="0.65">data-stream.binance.vision — WS bookTicker · REST klines</text>
+
+            <rect x="400" y="28" width="250" height="62" rx="9" fill="none" stroke="currentColor" opacity="0.55"/>
+            <text x="416" y="53" font-size="13" font-weight="600" fill="currentColor">GAMMA API</text>
+            <text x="416" y="70" fill="currentColor" opacity="0.65">market discovery ·</text>
+            <text x="416" y="82" fill="currentColor" opacity="0.65">resolution polling</text>
+
+            <rect x="690" y="28" width="480" height="62" rx="9" fill="none" stroke="currentColor" opacity="0.55"/>
+            <text x="706" y="53" font-size="13" font-weight="600" fill="currentColor">POLYMARKET CLOB</text>
+            <text x="706" y="70" fill="currentColor" opacity="0.65">book WS (push, 250ms) · REST · user WS (fill events)</text>
+          </g>
+
+          <!-- arrows Row A -> Row B -->
+          <g stroke="currentColor" fill="none" opacity="0.85">
+            <path d="M195,90 C195,130 503,140 503,178" marker-end="url(#arrow)"/>
+            <path d="M525,90 C525,130 115,140 115,178" marker-end="url(#arrow)"/>
+            <path d="M840,90 L309,178" marker-end="url(#arrow)"/>
+            <path d="M980,90 C980,140 891,140 891,178" marker-end="url(#arrow)"/>
+          </g>
+          <g fill="currentColor" opacity="0.7">
+            <text x="330" y="132" text-anchor="middle">spot mid + realized σ (10 min window)</text>
+            <text x="330" y="144" text-anchor="middle">(perSecVol, 1s cache)</text>
+            <text x="270" y="158" text-anchor="middle">strike backfill, token IDs</text>
+            <text x="620" y="115" text-anchor="middle">book snapshot</text>
+            <text x="990" y="132" text-anchor="middle">fill events</text>
+            <text x="990" y="144" text-anchor="middle">(push + REST reconcile)</text>
+          </g>
+
+          <!-- Row B: tick pipeline -->
+          <g>
+            <rect x="18" y="176" width="1164" height="76" rx="10" fill="none" stroke="var(--accent)" stroke-dasharray="3 4" opacity="0.6"/>
+            <text x="30" y="266" font-size="10.5" fill="var(--accent)" opacity="0.9">tickSeries() — every 250ms on push, 1000ms on REST fallback</text>
+          </g>
+
+          <!-- B boxes -->
+          <g fill="var(--surface)" stroke="currentColor">
+            <rect x="30" y="180" width="170" height="64" rx="8"/>
+            <rect x="224" y="180" width="170" height="64" rx="8"/>
+            <rect x="418" y="180" width="170" height="64" rx="8"/>
+            <rect x="612" y="180" width="170" height="64" rx="8" stroke="var(--warm)"/>
+            <rect x="806" y="180" width="170" height="64" rx="8"/>
+            <rect x="1000" y="180" width="170" height="64" rx="8"/>
+          </g>
+          <g fill="currentColor" font-weight="600" font-size="11">
+            <text x="115" y="202" text-anchor="middle">roll window</text>
+            <text x="309" y="202" text-anchor="middle">refresh books</text>
+            <text x="503" y="202" text-anchor="middle">compute fair</text>
+            <text x="697" y="202" text-anchor="middle" fill="var(--warm)">cut-sweep (new)</text>
+            <text x="891" y="202" text-anchor="middle">poll fills</text>
+            <text x="1085" y="202" text-anchor="middle">per-leg decision</text>
+          </g>
+          <g fill="currentColor" opacity="0.65" font-size="9.5">
+            <text x="115" y="218" text-anchor="middle">discover market,</text>
+            <text x="115" y="229" text-anchor="middle">strike</text>
+            <text x="309" y="218" text-anchor="middle">bid/ask per leg</text>
+            <text x="503" y="218" text-anchor="middle">Φ(ln(spot/strike)</text>
+            <text x="503" y="229" text-anchor="middle">/ σ√τ)</text>
+            <text x="697" y="218" text-anchor="middle" fill="var(--warm)">cancel resting order</text>
+            <text x="697" y="229" text-anchor="middle" fill="var(--warm)">if already under floor</text>
+            <text x="891" y="218" text-anchor="middle">ask ≤ our bid</text>
+            <text x="891" y="229" text-anchor="middle">= filled (dry)</text>
+            <text x="1085" y="218" text-anchor="middle">exit rules +</text>
+            <text x="1085" y="229" text-anchor="middle">quote gates</text>
+          </g>
+
+          <!-- sequential arrows -->
+          <g stroke="currentColor" fill="none">
+            <line x1="200" y1="212" x2="222" y2="212" marker-end="url(#arrow)"/>
+            <line x1="394" y1="212" x2="416" y2="212" marker-end="url(#arrow)"/>
+            <line x1="588" y1="212" x2="610" y2="212" marker-end="url(#arrow)"/>
+            <line x1="782" y1="212" x2="804" y2="212" marker-end="url(#arrow)"/>
+            <line x1="976" y1="212" x2="998" y2="212" marker-end="url(#arrow)"/>
+          </g>
+
+          <!-- loop back -->
+          <path d="M1085,244 C1085,270 115,270 115,246" stroke="currentColor" fill="none" opacity="0.7" marker-end="url(#arrow)"/>
+          <text x="600" y="266" text-anchor="middle" fill="currentColor" opacity="0.6">next tick</text>
+
+          <!-- execution back to CLOB -->
+          <path d="M1140,180 C1140,120 1050,100 950,92" stroke="var(--good)" fill="none" marker-end="url(#arrow)"/>
+          <text x="1050" y="118" text-anchor="middle" fill="var(--good)">place / cancel bid</text>
+          <text x="1050" y="130" text-anchor="middle" fill="var(--good)" opacity="0.75">(GTC buy · FAK sell to exit)</text>
+
+          <!-- settlement note -->
+          <g>
+            <rect x="30" y="300" width="290" height="60" rx="8" fill="none" stroke="currentColor" stroke-dasharray="3 4" opacity="0.7"/>
+            <text x="44" y="320" font-weight="600" fill="currentColor">settling pool</text>
+            <text x="44" y="335" fill="currentColor" opacity="0.65">position still open when window closes —</text>
+            <text x="44" y="347" fill="currentColor" opacity="0.65">polls gamma-api for resolution every 30s</text>
+          </g>
+          <path d="M115,244 L115,298" stroke="currentColor" fill="none" opacity="0.7" marker-end="url(#arrow)"/>
+          <text x="128" y="280" fill="currentColor" opacity="0.6">window closed,</text>
+          <text x="128" y="291" fill="currentColor" opacity="0.6">still holding</text>
+
+          <!-- gap callout -->
+          <g>
+            <rect x="960" y="300" width="210" height="118" rx="8" fill="var(--bad-soft)" stroke="var(--bad)"/>
+            <text x="974" y="320" font-weight="700" fill="var(--bad)">GAP — no cooldown</text>
+            <text x="974" y="336" fill="currentColor">cut clears leg.position →</text>
+            <text x="974" y="348" fill="currentColor">immediately re-quotable</text>
+            <text x="974" y="368" fill="currentColor" opacity="0.75">live session:</text>
+            <text x="974" y="380" fill="var(--bad)" font-weight="600">22/27 cuts were repeat</text>
+            <text x="974" y="392" fill="var(--bad)" font-weight="600">buys on the same leg</text>
+            <text x="974" y="408" fill="currentColor" opacity="0.75">−$13.26 of −$17.46 cut P&amp;L</text>
+          </g>
+          <path d="M1085,244 L1085,298" stroke="var(--bad)" fill="none" stroke-dasharray="2 3" marker-end="url(#arrow)"/>
+
+          <!-- Row C: outputs -->
+          <g fill="var(--surface)" stroke="currentColor">
+            <rect x="30" y="430" width="260" height="66" rx="8"/>
+            <rect x="330" y="430" width="340" height="66" rx="8"/>
+            <rect x="710" y="430" width="300" height="66" rx="8"/>
+          </g>
+          <g fill="currentColor" font-weight="600" font-size="11">
+            <text x="160" y="454" text-anchor="middle">mm-journal.json</text>
+            <text x="500" y="454" text-anchor="middle">mm-status.json /</text>
+            <text x="500" y="466" text-anchor="middle">mm-signals.ndjson</text>
+            <text x="860" y="454" text-anchor="middle">mm-dashboard.js :3211</text>
+          </g>
+          <g fill="currentColor" opacity="0.65" font-size="9.5">
+            <text x="160" y="480" text-anchor="middle">cuts + resolved (won/lost)</text>
+            <text x="500" y="484" text-anchor="middle">live snapshot ~1s · fair-vs-market trail</text>
+            <text x="860" y="472" text-anchor="middle">serves the three files as</text>
+            <text x="860" y="483" text-anchor="middle">a small JSON API</text>
+          </g>
+
+          <path d="M160,360 L160,428" stroke="currentColor" fill="none" opacity="0.7" marker-end="url(#arrow)"/>
+          <text x="180" y="410" fill="currentColor" opacity="0.6">won / lost</text>
+
+          <path d="M1085,418 C1085,428 300,432 290,432" stroke="currentColor" fill="none" opacity="0.55" marker-end="url(#arrow)"/>
+          <text x="700" y="422" text-anchor="middle" fill="currentColor" opacity="0.55">journalWrite() on cut</text>
+
+          <path d="M1085,418 C1085,432 700,436 670,436" stroke="currentColor" fill="none" opacity="0.55" marker-end="url(#arrow)"/>
+          <text x="900" y="440" text-anchor="middle" fill="currentColor" opacity="0.55">writeTelemetry() ~1/tick</text>
+
+          <line x1="290" y1="463" x2="328" y2="463" stroke="currentColor" opacity="0.6" marker-end="url(#arrow)"/>
+          <line x1="670" y1="463" x2="708" y2="463" stroke="currentColor" opacity="0.6" marker-end="url(#arrow)"/>
+
+          <!-- dashboard UI -->
+          <rect x="710" y="560" width="300" height="50" rx="8" fill="var(--surface)" stroke="currentColor"/>
+          <text x="860" y="582" text-anchor="middle" font-weight="600" fill="currentColor">Dashboard UI (browser)</text>
+          <text x="860" y="597" text-anchor="middle" fill="currentColor" opacity="0.65">localhost:3211 · polls every ~1s</text>
+          <line x1="860" y1="496" x2="860" y2="558" stroke="currentColor" opacity="0.6" marker-end="url(#arrow)"/>
+
+        </g>
+      </svg>
+    </div>
+    <figcaption>
+      Every 250ms, the bot re-prices both outcomes off Binance spot, checks whether either
+      leg has already fallen into its own cut zone <b>before</b> it lets a fill happen, matches
+      any resulting fill, then runs exit rules and quoting gates per leg. Placing or cancelling
+      a bid is the only write back to Polymarket; everything else is read-only market data.
+      The <b style="color:var(--bad)">highlighted gap</b> is a live, measured finding from this
+      session, not a hypothetical.
+    </figcaption>
+  </figure>
+
+  <section>
+    <h2>The mechanism, piece by piece</h2>
+    <div class="cards">
+      <div class="card">
+        <span class="label">Pricing</span>
+        <p>
+          One formula prices both legs: <code>Φ(ln(spot/strike) / (σ√τ))</code>.
+          Down is just <code>1 − Up</code>. <code>σ</code> is realized vol over the
+          trailing 10 minutes of Binance ticks, re-cached every second.
+        </p>
+      </div>
+      <div class="card">
+        <span class="label">Quoting</span>
+        <p>
+          Passive bids only, on both legs independently — no requirement that
+          Up + Down price sums under $1. Bid = <code>fair − MM_MARGIN</code>,
+          never crossing the ask.
+        </p>
+      </div>
+      <div class="card">
+        <span class="label">Risk gates</span>
+        <p>
+          A leg is blocked from quoting if: outside the quote window, at the
+          inventory or capital cap, or already priced (by model <i>or</i> book)
+          below <code>MM_EXIT_FAIR_FLOOR + MM_EXIT_QUOTE_BUFFER</code>.
+        </p>
+      </div>
+      <div class="card">
+        <span class="label">Exit</span>
+        <p>
+          A held position is cut on any of: book/fair under the floor, fair
+          dropped <code>MM_EXIT_FAIR_DROP</code> from entry, or held past
+          <code>MM_EXIT_MAX_HOLD_SEC</code> while still under 0.50.
+        </p>
+      </div>
+      <div class="card">
+        <span class="label">Hold</span>
+        <p>
+          Anything not cut rides to resolution. <code>closeWindow()</code> moves
+          it into a settling pool that polls gamma-api for the outcome and
+          journals a win or loss — this is where most of the modeled edge
+          is supposed to come from.
+        </p>
+      </div>
+      <div class="card">
+        <span class="label">Observability</span>
+        <p>
+          Every cut and resolution is journaled; a live snapshot and a
+          fair-vs-market trail are written roughly once a second and served
+          by a separate dashboard process on its own port.
+        </p>
+      </div>
+    </div>
+  </section>
+
+  <div class="gap-callout">
+    <span class="label">Open issue — quote cooldown after a cut</span>
+    <p>
+      When a cut finishes, <code>leg.exited</code> and <code>leg.position</code> both reset
+      immediately, so the very next tick can re-quote the exact leg just sold — nothing
+      remembers that this leg was just decided against.
+    </p>
+    <p class="stat">
+      Measured this session: <b>22 of 27 live cuts</b> were repeat buy/cut cycles on the same
+      leg within one window, accounting for <b>−$13.26</b> of the total <b>−$17.46</b> cut P&amp;L.
+      One leg was bought and cut five times in a single 5-minute window.
+    </p>
+  </div>
+
+  <footer>mm-bot.js · dry + live journal, 2026-08-25</footer>
+</main>
