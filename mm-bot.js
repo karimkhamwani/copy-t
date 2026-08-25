@@ -790,6 +790,7 @@ function freshLeg(token, outcome) {
     aboveFloorSince: undefined, // Date.now() this leg most recently crossed back
                        // out of cut territory; null while inside it. A cut is
                        // only trusted to requote once this has held long enough.
+    underMinLoggedAt: undefined, // throttles the "$1 minimum" retry log line
   };
 }
 
@@ -1350,8 +1351,16 @@ async function maybeExit(w, leg, fair) {
   const bid = leg.book.bid;
   if (bid == null) return;
   if (bid * p.shares < 1) {
-    leg.exited = true; // unsellable under the $1 minimum — ride to resolution
-    log(`[${w.prefix}] cut skipped ${leg.outcome}: ${p.shares} sh @ ${bid} under $1 minimum`);
+    // Unsellable right now, not unsellable for the rest of the window — a
+    // single-tick gap can put bid*shares under the CLOB's $1 minimum for a
+    // moment even when the exit floor fired cleanly. Don't latch leg.exited
+    // here: that permanently gave up on positions whose price later
+    // recovered above the minimum but well within a normal cut, riding them
+    // to resolution for no reason. Just retry next tick.
+    if (!leg.underMinLoggedAt || Date.now() - leg.underMinLoggedAt > 10000) {
+      leg.underMinLoggedAt = Date.now();
+      log(`[${w.prefix}] cut blocked ${leg.outcome}: ${p.shares} sh @ ${bid} under $1 minimum — retrying`);
+    }
     return;
   }
   const proceeds = bid * p.shares;
