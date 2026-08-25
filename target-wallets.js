@@ -29,12 +29,19 @@ module.exports = [
   //   max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
   // },
   // btc good win rate over 11h 60%
-  {
-    address: "0xdf4c6a942bd95bf903d6066b4ba7051e6f914f22",
-    category: "crypto",
-    sub_category: ["btc-updown-5m"],
-    max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
-  },
+  // {
+  //   address: "0xdf4c6a942bd95bf903d6066b4ba7051e6f914f22",
+  //   category: "crypto",
+  //   sub_category: ["btc-updown-5m"],
+  //   max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
+  // },
+  // this wallet does bet both sides with less than 10$
+  // {
+  //   address: "0x0484e64092ba4108c2786b61e6fc052d3bf41b1a",
+  //   category: "crypto",
+  //   sub_category: ["btc-updown-5m"],
+  //   max_trade_age_sec: 60, // 5m markets expire fast — don't chase old entries
+  // },
   // {
   //   address: "0xc2ad03f79ca3f3c17d8c7de2612ce0c89b7d40ed",
   //   category: "crypto",

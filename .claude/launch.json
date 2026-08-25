@@ -6,6 +6,12 @@
       "runtimeExecutable": "node",
       "runtimeArgs": ["dashboard-server.js"],
       "port": 3210
+    },
+    {
+      "name": "mm-dashboard",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["mm-dashboard.js"],
+      "port": 3211
     }
   ]
 }

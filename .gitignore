@@ -14,3 +14,6 @@ status.json
 npm-debug.log*
 updown-signals.ndjson
 updown-signals.ndjson.sock
+mm-status.json
+mm-signals.ndjson
+mm-signals.ndjson.1

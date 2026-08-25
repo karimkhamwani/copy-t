@@ -84,6 +84,11 @@ const {
   MM_MAX_ACTIVE_USDC = "50", // hard cap on cost basis outstanding at once
   MM_VOL_FALLBACK = "0.0003", // per-second log-return vol until measured
   MM_JOURNAL_FILE = path.join(__dirname, "mm-journal.json"),
+
+  // telemetry for mm-dashboard.js — a live snapshot plus a fair-vs-market trail
+  MM_STATUS_FILE = path.join(__dirname, "mm-status.json"),
+  MM_SIGNALS_FILE = path.join(__dirname, "mm-signals.ndjson"),
+  MM_TELEMETRY_MS = "1000", // the quote loop runs at 250ms; don't write that often
 } = process.env;
 
 const isDryRun = MM_DRY_RUN === "1" || MM_DRY_RUN.toLowerCase() === "true";
@@ -110,6 +115,7 @@ const exitMaxHold = Number(MM_EXIT_MAX_HOLD_SEC);
 const exitMinTau = Number(MM_EXIT_MIN_TAU_SEC);
 const maxActiveUsdc = Number(MM_MAX_ACTIVE_USDC);
 const volFallback = Number(MM_VOL_FALLBACK);
+const telemetryMs = Math.max(250, Number(MM_TELEMETRY_MS) || 1000);
 const CHAIN_ID = 137;
 
 /** "btc-updown-5m" -> { prefix, seconds, symbol } */
@@ -289,6 +295,28 @@ function wsTop(token) {
   return { bid: bid === -1 ? null : bid, ask: ask === 2 ? null : ask, at: b.at };
 }
 
+/**
+ * Drop a socket we no longer want.
+ *
+ * Closing one that is still CONNECTING makes ws emit 'error' — and since we
+ * have just stripped the listeners, an unhandled 'error' event takes the whole
+ * process down. (That is not hypothetical: starting within a second of a window
+ * boundary resubscribes twice in a row and killed the bot on the second call.)
+ * So re-arm a no-op error handler first, and terminate rather than close while
+ * the handshake is still in flight.
+ */
+function dropSocket(ws) {
+  if (!ws) return;
+  try {
+    ws.removeAllListeners();
+    ws.on("error", () => {});
+    if (ws.readyState === WebSocket.CONNECTING) ws.terminate();
+    else ws.close();
+  } catch {
+    /* already gone */
+  }
+}
+
 /** (Re)subscribe the socket to exactly the tokens currently being quoted. */
 function subscribeBooks(tokens) {
   const key = tokens.slice().sort().join(",");
@@ -297,12 +325,7 @@ function subscribeBooks(tokens) {
   for (const t of tokens) if (!wsBooks.has(t)) wsBooks.set(t, { bids: new Map(), asks: new Map(), at: 0 });
   for (const t of [...wsBooks.keys()]) if (!tokens.includes(t)) wsBooks.delete(t);
 
-  try {
-    clobWs?.removeAllListeners();
-    clobWs?.close();
-  } catch {
-    /* already gone */
-  }
+  dropSocket(clobWs);
   const ws = new WebSocket(CLOB_WS_URL);
   clobWs = ws;
   ws.on("open", () => {
@@ -318,22 +341,29 @@ function subscribeBooks(tokens) {
       return;
     }
     for (const m of Array.isArray(msgs) ? msgs : [msgs]) {
-      const b = wsBooks.get(String(m.asset_id || ""));
-      if (!b) continue;
       if (m.event_type === "book") {
+        // snapshot: envelope carries the asset id
+        const b = wsBooks.get(String(m.asset_id || ""));
+        if (!b) continue;
         b.bids.clear();
         b.asks.clear();
         for (const l of m.bids || m.buys || []) b.bids.set(String(l.price), Number(l.size));
         for (const l of m.asks || m.sells || []) b.asks.set(String(l.price), Number(l.size));
         b.at = Date.now();
       } else if (m.event_type === "price_change") {
-        for (const ch of m.changes || [m]) {
+        // Deltas are MARKET-level: one message carries `price_changes` for both
+        // tokens and has NO asset_id on the envelope — the id is on each change.
+        // Reading it off the envelope drops every delta, which freezes the book
+        // at its snapshot and silently stops all quoting.
+        for (const ch of m.price_changes || m.changes || [m]) {
+          const b = wsBooks.get(String(ch.asset_id ?? m.asset_id ?? ""));
+          if (!b) continue;
           const side = String(ch.side || "").toUpperCase() === "BUY" ? b.bids : b.asks;
           const size = Number(ch.size);
           if (size > 0) side.set(String(ch.price), size);
           else side.delete(String(ch.price));
+          b.at = Date.now();
         }
-        b.at = Date.now();
       }
     }
   });
@@ -376,12 +406,7 @@ function subscribeUser(conditionIds) {
   const key = conditionIds.slice().sort().join(",");
   if (key === userSubKey && userWs && userWsOk) return;
   userSubKey = key;
-  try {
-    userWs?.removeAllListeners();
-    userWs?.close();
-  } catch {
-    /* already gone */
-  }
+  dropSocket(userWs);
   const ws = new WebSocket(CLOB_USER_WS_URL);
   userWs = ws;
   ws.on("open", () => {
@@ -445,12 +470,7 @@ function probeWs(url, label, timeoutMs = 8000) {
     let ws;
     const done = (ok, why) => {
       clearTimeout(timer);
-      try {
-        ws?.removeAllListeners();
-        ws?.terminate();
-      } catch {
-        /* ignore */
-      }
+      dropSocket(ws); // same CONNECTING-close hazard as the live subscriptions
       resolve({ label, ok, why });
     };
     const timer = setTimeout(() => done(false, "timeout"), timeoutMs);
@@ -524,9 +544,190 @@ try {
 function journalWrite(entry) {
   journal.unshift(entry);
   journal = journal.slice(0, 500);
-  const tmp = `${MM_JOURNAL_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(journal, null, 2));
-  fs.renameSync(tmp, MM_JOURNAL_FILE);
+  writeJsonAtomic(MM_JOURNAL_FILE, journal);
+}
+
+function writeJsonAtomic(file, data) {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, file);
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry (consumed by mm-dashboard.js)
+//
+// This process is the only one that knows the fair value that actually drove a
+// quote — a dashboard recomputing it would drift from the bot and show you a
+// model you aren't trading. So the bot publishes instead:
+//
+//   mm-status.json     full live snapshot, rewritten every MM_TELEMETRY_MS
+//   mm-signals.ndjson  append-only fair-vs-market trail, one row per window tick
+//
+// The trail is the point: the open question on this strategy is whether the
+// fair-value model is calibrated, and that is only answerable by watching fair
+// against the book over time and against what resolves.
+// ---------------------------------------------------------------------------
+
+const startedAt = Date.now();
+const blockCounts = new Map(); // stable reason code -> ticks blocked on it
+let lastTelemetryAt = 0;
+const round3 = (n) => Math.round(n * 1000) / 1000;
+
+/** Record why a leg is (or isn't) quoting. `code` groups causes for counting;
+ * `detail` is the human-readable line shown on the leg itself. */
+function noteBlocked(leg, code, detail) {
+  leg.blockReason = detail || code || null;
+  if (code) blockCounts.set(code, (blockCounts.get(code) || 0) + 1);
+}
+
+const SIGNALS_MAX_BYTES = 5 * 1024 * 1024;
+
+/** Keep the trail bounded: one generation back is plenty for a session. */
+function rotateSignals() {
+  try {
+    if (fs.statSync(MM_SIGNALS_FILE).size > SIGNALS_MAX_BYTES) {
+      fs.renameSync(MM_SIGNALS_FILE, `${MM_SIGNALS_FILE}.1`);
+    }
+  } catch {
+    /* no trail yet */
+  }
+}
+
+function legSnapshot(w, leg, fair) {
+  const p = leg.position;
+  const top = leg.book;
+  return {
+    outcome: leg.outcome,
+    token: leg.token,
+    fair: fair == null ? null : round3(fair),
+    bid: top.bid,
+    ask: top.ask,
+    mid: top.bid != null && top.ask != null ? round3((top.bid + top.ask) / 2) : null,
+    bookAgeMs: top.at ? Date.now() - top.at : null,
+    // what the model would pay vs what the book is actually showing
+    target: fair == null ? null : round2(fair - margin),
+    quote: leg.order
+      ? {
+          price: leg.order.price,
+          size: leg.order.size,
+          matched: leg.order.matched,
+          ageSec: Math.round((Date.now() - leg.order.at) / 1000),
+        }
+      : null,
+    position: p
+      ? {
+          shares: p.shares,
+          cost: round2(p.cost),
+          avgPrice: round3(p.cost / p.shares),
+          entryFair: round3(p.entryFair),
+          heldSec: Math.round((Date.now() - p.at) / 1000),
+          markValue: top.bid != null ? round2(top.bid * p.shares) : null,
+          unrealized: top.bid != null ? round2(top.bid * p.shares - p.cost) : null,
+          exitReason: fair == null ? null : exitReason(w, leg, fair),
+        }
+      : null,
+    blockReason: leg.blockReason,
+  };
+}
+
+function writeTelemetry() {
+  if (Date.now() - lastTelemetryAt < telemetryMs) return;
+  lastTelemetryAt = Date.now();
+
+  const wins = [];
+  const rows = [];
+  for (const w of windows.values()) {
+    const st = spot.get(w.symbol);
+    const ready = Boolean(w.market && w.strike && st?.mid);
+    const up = ready ? marketFairUp(w) : null;
+    const tau = w.start + w.seconds - Date.now() / 1000;
+    const legs = [...w.legs.values()].map((leg) =>
+      legSnapshot(w, leg, up == null ? null : legFair(leg, up)),
+    );
+    wins.push({
+      prefix: w.prefix,
+      slug: w.slug,
+      symbol: w.symbol,
+      start: w.start,
+      seconds: w.seconds,
+      tau: Math.round(tau),
+      elapsed: Math.round(w.seconds - tau),
+      strike: w.strike,
+      spot: st?.mid ?? null,
+      spotAgeMs: st?.at ? Date.now() - st.at : null,
+      vol: ready ? perSecVol(w.symbol) : null,
+      fairUp: up == null ? null : round3(up),
+      quoteWindow: { start: quoteStart, end: Math.round(w.seconds * quoteEndFrac) },
+      legs,
+    });
+    // one trail row per window per tick, only while the model is actually live
+    if (ready) {
+      const [a, b] = legs;
+      rows.push(
+        JSON.stringify({
+          t: Date.now(),
+          slug: w.slug,
+          tau: Math.round(tau),
+          spot: st.mid,
+          strike: w.strike,
+          fairUp: round3(up),
+          upMid: (a.outcome === "Up" ? a : b).mid,
+          downMid: (a.outcome === "Down" ? a : b).mid,
+          // signed model error on the Up leg: >0 means we think Up is worth
+          // more than the book does. Persistent one-way drift = bad strike/vol.
+          gap:
+            (a.outcome === "Up" ? a : b).mid == null
+              ? null
+              : round3(up - (a.outcome === "Up" ? a : b).mid),
+        }),
+      );
+    }
+  }
+
+  try {
+    writeJsonAtomic(MM_STATUS_FILE, {
+      mode: isDryRun ? "dry" : "live",
+      startedAt,
+      updatedAt: Date.now(),
+      config: {
+        series: series.map((s) => s.prefix),
+        clipShares, margin, requoteAt, maxClips, minPrice, maxPrice, maxDisagree,
+        maxActiveUsdc, exitFairDrop, exitFairFloor, exitMaxHold, exitMinTau,
+        quoteStart, quoteEndFrac, cancelBefore, loopMs: telemetryMs,
+      },
+      feeds: {
+        bookWs: clobWsOk,
+        userWs: isDryRun ? null : userWsHealthy(),
+        binanceAgeMs: Math.min(
+          ...[...spot.values()].map((s) => (s.at ? Date.now() - s.at : Infinity)),
+        ),
+      },
+      stats: {
+        ...stats,
+        cutPnl: round2(stats.cutPnl),
+        heldPnl: round2(stats.heldPnl),
+        netPnl: round2(stats.cutPnl + stats.heldPnl),
+      },
+      capital: {
+        committed: round2(committedUsdc()),
+        cap: maxActiveUsdc,
+        settling: settling.length,
+        orphans: orphans.size,
+      },
+      blocked: Object.fromEntries([...blockCounts.entries()].sort((a, b) => b[1] - a[1])),
+      settling: settling.map((p) => ({
+        slug: p.slug, outcome: p.outcome, shares: p.shares,
+        cost: round2(p.cost), waitingSec: Math.round((Date.now() - p.closedAt) / 1000),
+      })),
+      windows: wins,
+    });
+    if (rows.length) {
+      rotateSignals();
+      fs.appendFileSync(MM_SIGNALS_FILE, rows.join("\n") + "\n");
+    }
+  } catch (e) {
+    log("telemetry write failed:", e.message);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +751,7 @@ function freshLeg(token, outcome) {
     book: { bid: null, ask: null, at: 0 },
     reserved: 0,   // USDC committed by a placement currently in flight
     exited: false,
+    blockReason: null, // why we are not quoting right now (dashboard/telemetry)
   };
 }
 
@@ -562,7 +764,7 @@ async function rollWindow(s) {
   const w = {
     prefix: s.prefix, symbol: s.symbol, seconds: s.seconds, start,
     slug: `${s.prefix}-${start}`, market: null, strike: null, legs: new Map(),
-    lastReconcileAt: 0,
+    lastReconcileAt: 0, lastRestBookAt: 0,
   };
   windows.set(s.prefix, w);
 
@@ -742,14 +944,17 @@ function committedUsdc() {
 }
 
 /** Desired bid for a leg, or null when we shouldn't be quoting it.
- * `why` collects the reason when we decline, for MM_DEBUG. */
+ * `why` collects the reason when we decline, for MM_DEBUG. `why.code` is the
+ * same reason without the numbers, so telemetry can group by cause. */
 function desiredBid(leg, fair, top, why = {}) {
   const want = round2(fair - margin);
   if (!(want >= minPrice && want <= maxPrice)) {
+    why.code = "outside price band";
     why.reason = `want ${want} outside band ${minPrice}-${maxPrice}`;
     return null;
   }
   if (want * clipShares < 1) {
+    why.code = "under $1 minimum";
     why.reason = `want ${want} x ${clipShares} sh under $1 minimum`;
     return null; // exchange $1 marketable minimum
   }
@@ -761,6 +966,7 @@ function desiredBid(leg, fair, top, why = {}) {
   if (top.bid != null && top.ask != null) {
     const mid = (top.bid + top.ask) / 2;
     if (Math.abs(fair - mid) > maxDisagree) {
+      why.code = "book disagrees with model";
       why.reason =
         `book disagrees: fair ${fair.toFixed(3)} vs mid ${mid.toFixed(3)} ` +
         `(gap ${Math.abs(fair - mid).toFixed(3)} > ${maxDisagree})`;
@@ -772,6 +978,7 @@ function desiredBid(leg, fair, top, why = {}) {
   const cap = top.ask != null ? round2(top.ask - 0.01) : want;
   const px = Math.min(want, cap);
   if (!(px >= minPrice && px * clipShares >= 1)) {
+    why.code = "capped by ask";
     why.reason = `capped px ${px} (ask ${top.ask}) below floor/notional minimum`;
     return null;
   }
@@ -859,18 +1066,21 @@ async function manageQuote(w, leg, fair) {
     t >= quoteStart && t <= w.seconds * quoteEndFrac && tau > cancelBefore;
 
   if (!quoting) {
+    noteBlocked(leg, t < quoteStart ? "before quote window" : "after quote window");
     if (leg.order) await cancelBid(leg);
     return;
   }
   // inventory + capital caps
   const clips = leg.position ? leg.position.shares / clipShares : 0;
   if (clips >= maxClips || committedUsdc() >= maxActiveUsdc) {
+    noteBlocked(leg, clips >= maxClips ? "inventory cap" : "capital cap");
     if (leg.order) await cancelBid(leg);
     return;
   }
   const why = {};
   const want = desiredBid(leg, fair, leg.book, why);
   if (want == null) {
+    noteBlocked(leg, why.code, why.reason);
     if (debug)
       log(
         `[dbg] [${w.prefix}] no quote ${leg.outcome}: ${why.reason} ` +
@@ -879,6 +1089,7 @@ async function manageQuote(w, leg, fair) {
     if (leg.order) await cancelBid(leg);
     return;
   }
+  noteBlocked(leg, null); // quoting
   if (!leg.order) {
     leg.reserved = want * clipShares;
     try {
@@ -1100,17 +1311,23 @@ async function maybeExit(w, leg, fair) {
 // ---------------------------------------------------------------------------
 
 async function refreshBooks(w) {
-  // push path: the socket already holds a live book for every subscribed token
+  // push path: the socket already holds a live book for every subscribed token.
+  // A top only counts as fresh while it is still being UPDATED — a frozen ws
+  // book must fall through to REST rather than short-circuit it, or the
+  // fallback is disabled in exactly the case it exists for.
   if (clobWsOk) {
     let fresh = true;
     for (const leg of w.legs.values()) {
       const top = wsTop(leg.token);
-      if (top && top.at) leg.book = top;
+      if (top && top.at && Date.now() - top.at <= bookStaleMs) leg.book = top;
       else fresh = false;
     }
     if (fresh) return; // no REST needed
   }
-  // fallback / warm-up: REST snapshot
+  // fallback / warm-up: REST snapshot, rate-limited to the REST cadence so a
+  // quiet or broken socket cannot turn the 250ms quote loop into 4 req/s/token
+  if (Date.now() - w.lastRestBookAt < restLoopMs) return;
+  w.lastRestBookAt = Date.now();
   await Promise.all(
     [...w.legs.values()].map(async (leg) => {
       try {
@@ -1152,6 +1369,7 @@ async function tickSeries(s) {
       // a stale book is worse than no book: quoting off it is how a maker gets
       // picked off after the market has already moved
       if (!leg.book.at || Date.now() - leg.book.at > bookStaleMs) {
+        noteBlocked(leg, "book stale");
         if (leg.order) await cancelBid(leg);
         if (debug) log(`[dbg] [${w.prefix}] ${leg.outcome}: book stale — quote pulled`);
         return;
@@ -1178,6 +1396,7 @@ function syncSubscriptions() {
 async function tick() {
   await Promise.all(series.map((s) => tickSeries(s).catch((e) => log(`[${s.prefix}] tick error: ${e.message}`))));
   syncSubscriptions();
+  writeTelemetry(); // throttled internally; never on the quote path's critical section
   // settlement is slow (resolution lookups) and never time-critical — fire and
   // forget so it can never delay a quote
   if ((settling.length || orphans.size) && Date.now() - lastSettleAt > 15000) {

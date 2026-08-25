@@ -45,8 +45,8 @@ const {
   DELTA_SLUG_PREFIX = "btc-updown-5m",
   DELTA_SHARES = "5", // shares per take signal (CLOB limit-order minimum is 5)
   DELTA_EDGE = "0.06", // min (fair - ask) to fire, in probability points
-  DELTA_COOLDOWN_SEC = "15", // per market+side, between signals
-  DELTA_MAX_SIGNALS = "4", // per market window (both sides combined)
+  DELTA_COOLDOWN_SEC = "5", // per market+side, between signals
+  DELTA_MAX_SIGNALS = "60", // per market window (both sides combined)
   DELTA_MIN_TAU_SEC = "15", // stop signalling this close to the window end
   DELTA_ENTRY_START_SEC = "10", // no signals before this (strike just formed)
   DELTA_MIN_PRICE = "0.10", // only buy asks inside this band: cheaper means
