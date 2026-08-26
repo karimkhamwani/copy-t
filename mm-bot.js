@@ -56,9 +56,11 @@ const {
   MM_MAX_CLIPS_PER_SIDE = "2", // max open clips per token (inventory cap)
   MM_MIN_PRICE = "0.08", // never quote outside this band — too decided
   MM_MAX_PRICE = "0.92",
-  // sit out when the book disagrees with our fair by more than this: a big
-  // gap usually means the model is wrong, not that the market is mispriced
-  MM_MAX_DISAGREE = "0.15",
+  // Entry-side disagreement ceiling. 0 = disabled, which is now the default:
+  // scored against real resolutions the model beats the book, and the gap
+  // rows this used to reject are where nearly all the EV lives. See the long
+  // note in desiredBid(). Set > 0 to restore a ceiling.
+  MM_MAX_DISAGREE = "0",
   MM_DEBUG = "0", // log why a leg is not being quoted
   // Loop cadence: with the book websocket up, quoting reacts on push; the REST
   // fallback is deliberately slower so we do not hammer the API.
@@ -83,6 +85,14 @@ const {
   // 1 = a model-driven cut needs the book to corroborate it (see exitReason).
   // Set to 0 to get the old model-only exits back for comparison.
   MM_EXIT_REQUIRE_BOOK = "1",
+  // How far the book may sit from fair before a model-driven exit is held back.
+  // Separate from MM_MAX_DISAGREE on purpose — see the note in exitReason().
+  MM_EXIT_MAX_DISAGREE = "0.15",
+  // 1 = also cut whenever the BOOK alone prices the leg under the floor.
+  // Off by default: measured at -$71.23 across 35 cuts whose legs won 57% of
+  // the time — it exits good positions on the less accurate of the two
+  // forecasts. See the note in exitReason().
+  MM_EXIT_ON_BOOK_FLOOR = "0",
   // never quote a leg whose fair is already this close to the cut floor —
   // otherwise the fill and the cut land on the same tick and we just pay spread
   MM_EXIT_QUOTE_BUFFER = "0.05",
@@ -132,6 +142,9 @@ const exitMaxHold = Number(MM_EXIT_MAX_HOLD_SEC);
 const exitMinTau = Number(MM_EXIT_MIN_TAU_SEC);
 const exitRequireBook =
   MM_EXIT_REQUIRE_BOOK === "1" || MM_EXIT_REQUIRE_BOOK.toLowerCase() === "true";
+const exitMaxDisagree = Number(MM_EXIT_MAX_DISAGREE);
+const exitOnBookFloor =
+  MM_EXIT_ON_BOOK_FLOOR === "1" || MM_EXIT_ON_BOOK_FLOOR.toLowerCase() === "true";
 const exitQuoteBuffer = Number(MM_EXIT_QUOTE_BUFFER);
 const cutRequoteConfirmSec = Number(MM_CUT_REQUOTE_CONFIRM_SEC);
 const fairMinTau = Math.max(1, Number(MM_FAIR_MIN_TAU_SEC) || 1);
@@ -725,7 +738,7 @@ function writeTelemetry() {
         series: series.map((s) => s.prefix),
         clipShares, margin, requoteAt, maxClips, minPrice, maxPrice, maxDisagree,
         maxActiveUsdc, exitFairDrop, exitFairFloor, exitMaxHold, exitMinTau,
-        exitRequireBook, exitQuoteBuffer, fairMinTau,
+        exitRequireBook, exitMaxDisagree, exitOnBookFloor, exitQuoteBuffer, fairMinTau,
         quoteStart, quoteEndFrac, cancelBefore, loopMs: telemetryMs,
       },
       feeds: {
@@ -998,11 +1011,26 @@ function desiredBid(leg, fair, top, why = {}) {
     return null; // exchange $1 marketable minimum
   }
 
-  // Disagreement guard. When the book prices this leg far away from our fair
-  // value, the likelier explanation is that OUR MODEL is wrong — the crowd can
-  // see momentum the formula can't. Quoting into that is how a market maker
-  // ends up systematically buying the losing side. Sit out instead.
-  if (top.bid != null && top.ask != null) {
+  // Disagreement guard — DISABLED BY DEFAULT (MM_MAX_DISAGREE=0 turns it off).
+  //
+  // This used to sit out whenever the book priced a leg far from our fair,
+  // on the theory that a big gap means OUR model is wrong. Scored against
+  // actual resolutions (70 windows, outcome = final spot vs strike), that
+  // theory is backwards: the model beats the book at every horizon
+  // (Brier 0.157 vs 0.190), and its advantage is CONCENTRATED in exactly the
+  // rows this guard was rejecting:
+  //
+  //     gap > +0.25   model err 0.003  book err 0.346   EV +0.35/share
+  //     gap +0.15..25 model err 0.016  book err 0.177   EV +0.18/share
+  //     gap ~0        model err 0.016  book err 0.014   EV +0.01/share
+  //
+  // So the guard let through only the near-zero-EV middle and blocked every
+  // high-EV trade. (Checked for the obvious confound: books are no more
+  // frozen during large gaps than normal, so this is not stale-data illusion.)
+  //
+  // Left configurable rather than deleted — set MM_MAX_DISAGREE > 0 to
+  // restore a ceiling if live fills ever show the edge isn't capturable.
+  if (maxDisagree > 0 && top.bid != null && top.ask != null) {
     const mid = (top.bid + top.ask) / 2;
     if (Math.abs(fair - mid) > maxDisagree) {
       why.code = "book disagrees with model";
@@ -1098,13 +1126,19 @@ async function sweepOrphans() {
   );
 }
 
-/** True once a leg's price (model or book) has fallen into our own cut zone —
- * used both to stop quoting into it and to pull a resting order before it can
- * fill at a price we're about to reject anyway. */
+/** True once a leg has fallen into our own cut zone — used both to stop
+ * quoting into it and to pull a resting order before it can fill at a price
+ * we're about to reject anyway.
+ *
+ * The book half of this test is gated on exitOnBookFloor for the same reason
+ * the book-driven exit is: a cheap book against a confident model is the
+ * highest-EV setup we have (gap > +0.25 scored EV +0.35/share), and testing
+ * bookMid here would blocklist exactly those legs at entry — silently undoing
+ * the disagreement change on the quoting side. */
 function inCutTerritory(leg, fair) {
   const bookMid = midOf(leg.book);
   const cutFloor = exitFairFloor + exitQuoteBuffer;
-  return fair < cutFloor || (bookMid != null && bookMid < cutFloor);
+  return fair < cutFloor || (exitOnBookFloor && bookMid != null && bookMid < cutFloor);
 }
 
 async function manageQuote(w, leg, fair) {
@@ -1180,6 +1214,21 @@ async function manageQuote(w, leg, fair) {
           `(book ${leg.book.bid}/${leg.book.ask})`,
       );
     if (leg.order) await cancelBid(leg);
+    return;
+  }
+  // Every order is sized at a full clipShares (5) — the CLOB won't accept
+  // anything smaller, so there is no way to "top up" a partially filled clip
+  // with just the remainder. That means once any shares have landed on this
+  // leg, cancelling the resting remainder and replacing it with a FRESH full
+  // clip stacks a whole extra clip on top of what's already held — the
+  // inventory cap gate above only sees leg.position.shares as of the START
+  // of this tick, not what a brand-new order could add on top of it. A
+  // partial fill followed by a couple of fast requotes is exactly how a
+  // position ends up well past maxClips*clipShares. So: once this leg has
+  // ANY filled shares, leave the resting order (if any) alone — let it
+  // finish filling or get pulled by the cut logic — rather than replace it.
+  if (leg.position && leg.position.shares > 0) {
+    if (leg.order) noteBlocked(leg, "partial fill — holding resting order, not replacing");
     return;
   }
   noteBlocked(leg, null); // quoting
@@ -1329,12 +1378,24 @@ function exitReason(w, leg, fair) {
   const heldSec = (Date.now() - p.at) / 1000;
   const mid = midOf(leg.book);
 
-  // the market's own opinion needs no second source
-  if (mid != null && mid < exitFairFloor)
+  // The market's own opinion used to cut on its own authority here. Scored
+  // against actual resolutions it was the single most destructive rule in the
+  // bot: 35 such cuts turned a +$41.23 hold into a -$30.00 realised loss
+  // (-$71.23), and those legs went on to WIN 57% of the time. It cuts on the
+  // book, which is the less accurate of the two forecasts (Brier 0.190 vs the
+  // model's 0.157) — so it was exiting good positions on the worse signal.
+  // Off by default; MM_EXIT_ON_BOOK_FLOOR=1 restores it.
+  if (exitOnBookFloor && mid != null && mid < exitFairFloor)
     return `book ${mid.toFixed(3)} under floor ${exitFairFloor}`;
 
-  // ...but the model's does, when the two are far apart
-  if (exitRequireBook && mid != null && Math.abs(fair - mid) > maxDisagree) return null;
+  // Model-driven triggers still want the book to corroborate before firing.
+  // NOTE: this deliberately uses its own threshold, not the entry-side
+  // maxDisagree — that one is now 0 (guard disabled), and reusing it here
+  // would make |fair-mid| > 0 always true and silently disable every
+  // model-driven exit, including the one rule that measurably pays for
+  // itself ("fair fell from entry": +$41.76 over 60 cuts). Keeping the
+  // original 0.15 preserves that rule exactly as it was validated.
+  if (exitRequireBook && mid != null && Math.abs(fair - mid) > exitMaxDisagree) return null;
 
   if (fair < exitFairFloor) return `fair ${fair.toFixed(3)} under floor ${exitFairFloor}`;
   if (p.entryFair - fair >= exitFairDrop)
@@ -1573,8 +1634,10 @@ async function main() {
   log(
     `mm-bot starting: [${series.map((s) => s.prefix).join(", ")}] ` +
       `${clipShares} sh clips, quote at fair-${margin}, requote ${requoteAt}, ` +
-      `max ${maxClips} clips/side, cap $${maxActiveUsdc}, disagree>${maxDisagree} sits out, ` +
-      `exit floor ${exitFairFloor} / drop ${exitFairDrop} / hold ${exitMaxHold}s, ` +
+      `max ${maxClips} clips/side, cap $${maxActiveUsdc}, ` +
+      `${maxDisagree > 0 ? `disagree>${maxDisagree} sits out` : "disagreement guard OFF"}, ` +
+      `exit floor ${exitFairFloor} / drop ${exitFairDrop} / hold ${exitMaxHold}s` +
+      `${exitOnBookFloor ? "" : " (book-floor exit OFF)"}, ` +
       `books ${wsOk ? "WS push" : "REST poll"} @ ${cadence}ms, ` +
       `mode ${isDryRun ? "DRY (simulated fills)" : "LIVE"}`,
   );
